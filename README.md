@@ -68,7 +68,7 @@ Per-room (per generation)
 | Attacker pushing "approve" on A      | Defeated by code-entry flow: the 6-digit code lives on B's screen, so A has nothing to approve unless the real user types it |
 | Lost all devices, have phrase        | Enter phrase on new device → unwrap from `recovery_blobs` → identity restored. Old room blobs remain decryptable |
 | Lost all devices, no phrase          | No recovery. User resets; partners re-invite. Old room blobs permanently lost |
-| Removed group member                 | Can still decrypt past blobs they cached; cannot decrypt anything new (key rotated) |
+| Removed group member                 | Can still decrypt past blobs they cached; cannot decrypt anything new (key rotated). Only the room admin (creator) can remove someone. Other members can only leave themselves. |
 | Server-side abuse / CSAM scanning    | Not possible by design. Every image is re-encoded client-side (EXIF/GPS stripped) and encrypted under the room key before upload — the server stores opaque bytes. Accept this tradeoff before shipping to a general audience; Signal and iMessage do. |
 
 ## Core decisions (and why)
@@ -121,9 +121,12 @@ supabase/
     ├── 0004_room_delete.sql                   rooms_creator_delete policy
     ├── 0005_tighten_handoff_rls.sql           scopes device_link_handoffs
     │                                          to inviting_user_id = auth.uid()
-    └── 0006_attachments_bucket.sql            room-attachments Storage
-                                               bucket + RLS for encrypted
-                                               image attachments
+    ├── 0006_attachments_bucket.sql            room-attachments Storage
+    │                                          bucket + RLS for encrypted
+    │                                          image attachments
+    └── 0007_pair_cap_and_admin_delete.sql     pair rooms = 2 people (trigger)
+                                               + admin-only kick (tightened
+                                               room_members delete/insert RLS)
 ```
 
 ## Getting started

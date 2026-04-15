@@ -364,6 +364,26 @@ export async function getMyWrappedRoomKey(params: {
   return await fromBase64(data.wrapped_room_key);
 }
 
+/**
+ * All wrapped room keys the viewer holds for a room — one per generation
+ * they were ever a member at. Used by the room detail page to decrypt
+ * pre-rotation blobs after a kick/leave; the current-gen row is used for
+ * sending.
+ */
+export async function listMyRoomKeyRows(
+  roomId: string,
+  userId: string,
+): Promise<Array<{ generation: number; wrapped_room_key: string }>> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('room_members')
+    .select('generation, wrapped_room_key')
+    .eq('room_id', roomId)
+    .eq('user_id', userId);
+  if (error) throw error;
+  return data ?? [];
+}
+
 export async function createInvite(params: {
   roomId: string;
   invitedUserId: string;

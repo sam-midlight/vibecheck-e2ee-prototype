@@ -13,6 +13,7 @@ Copy these things verbatim:
 - `supabase/migrations/0004_room_delete.sql` — adds the `rooms_creator_delete` RLS policy so creators can tear a room down (cascades all children)
 - `supabase/migrations/0005_tighten_handoff_rls.sql` — replaces the permissive `handoffs_any_authed` policy with `handoffs_owner_all` so only the user whose device is linking can read/write/delete their `device_link_handoffs` rows. Blocks cross-account enumeration and DoS against the QR/approval-code linking flow. Must be applied alongside the initial schema.
 - `supabase/migrations/0006_attachments_bucket.sql` — creates the private `room-attachments` Storage bucket and RLS policies gating access by the `{roomId}/{blobId}.bin` path prefix. Current-gen members can INSERT; any-gen members can SELECT; room creator + current-gen members can DELETE. Required for encrypted image attachments — see §10 below.
+- `supabase/migrations/0007_pair_cap_and_admin_delete.sql` — two rules baked into the DB: (a) pair rooms are strictly 2 people, enforced by a trigger on `room_members` + `room_invites` that counts distinct users and rejects a 3rd. (b) only the room creator (admin) may delete OR insert other users' `room_members` rows — previously any current-gen member could, which let non-admins kick each other. Self-delete (a user leaving their own rows) stays open so the "leave" flow works. See §11 for the admin model.
 
 Install in V2:
 
@@ -135,6 +136,32 @@ V2 implications:
 - **Server-side moderation is fundamentally impossible** with this design. Decide in advance whether VibeCheck's audience accepts the Signal-style tradeoff, and put it in the product's Trust-and-Safety copy.
 
 /status in V2 should keep the "image attachment roundtrip" check — it uses a synthetic canvas-generated `File` so it works without any picker UI, and it catches regressions across the full encrypt/upload/download/decrypt pipeline.
+
+## 11. Admin model + room kinds
+
+**Pair rooms are strictly 2 people.** Groups have no cap in the prototype — pick one in V2 based on the UX (8? 50?) and encode it in the trigger. Either way, the enforcement lives in `0007_pair_cap_and_admin_delete.sql`: a BEFORE INSERT trigger on both `room_members` and `room_invites` counts distinct `user_id` values across both tables and rejects insertions that would exceed the cap. Existing users (re-wraps during rotation, invite-acceptance paths) short-circuit so the trigger never blocks legitimate churn.
+
+**The room creator is the admin.** That single bit — `rooms.created_by = auth.uid()` — is what determines who can:
+- kick other members (the "remove + rotate" button in `MemberList`),
+- delete the whole room (via `rooms_creator_delete` policy from 0004),
+- insert new members during rotation (via the tightened `room_members_insert` policy from 0007).
+
+**Everyone else can leave but not kick.** Non-admin members see a "leave" button on their own row. Under the hood it uses the same `rotateAndRemove` helper as admin-kick, just with `keep = members \ self` and `remove = [self]`. The tightened `room_members_delete` RLS policy lets them delete only their own rows.
+
+**Edge cases baked in:**
+- Creator cannot "leave" — they must delete the room. The MemberList UI shows no action on the creator's own row; the delete-room button above it is the intended escape hatch.
+- A rotation that ends with zero remaining members (last leaver in a solo room) skips the re-wrap step entirely and just deletes the leaver's rows. The room becomes an empty-shell owned by the original creator until they delete it.
+- In a pair room, both members can "leave" (non-creator ≥ creator — the creator must use "delete room" instead).
+
+**Client/server consistency:**
+- `listMyRoomKeyRows` returns *every* generation of `room_members` rows the viewer still has, unwrapped into a `Map<generation, RoomKey>`. `decodeAndVerify` picks the right key by `blob.generation`. `ImageAttachment` does the same lookup. This is what lets post-rotation members still read pre-rotation messages — the data was always there, the prototype just wasn't using it.
+- Sending always uses the current-gen key (`roomKey` state, mirrored in a ref for callbacks).
+- Rotation inserts new rows at `new_generation` for every remaining member **and** (separately) cascades old rows for the removed user. Old-gen `room_members` rows for remaining users are intentionally kept so the viewer retains the ability to decrypt historical blobs on this device and across future devices (re-sync from server).
+
+**V2 additions likely wanted:**
+- Admin transfer: allow the creator to hand off admin to another member before leaving. Minimum viable: add an `admin_user_id` column to `rooms`, default it to `created_by`, gate kick/delete on that column instead of `created_by`. An RPC `transfer_admin(room_id, new_admin_id)` with `SECURITY DEFINER` runs the swap atomically.
+- Named group size cap: change the trigger's hard-coded `2` into a per-room column (`member_cap int`) and have the pair kind default it to 2.
+- "You've been removed" banner: when the RLS kicks in (a leaver/kickee tries to read the room), show a graceful empty-state instead of the raw "not a current-gen member" error. The bones are already in `loadAll`.
 
 ## 8. Things to test on each port
 

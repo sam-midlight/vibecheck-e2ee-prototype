@@ -31,9 +31,9 @@ import {
   deleteRoom,
   downloadAttachment,
   fetchIdentity,
-  getMyWrappedRoomKey,
   insertBlob,
   listBlobs,
+  listMyRoomKeyRows,
   listRoomMembers,
   renameRoom,
   subscribeBlobs,
@@ -47,6 +47,7 @@ interface DecodedBlob {
   id: string;
   senderId: string;
   createdAt: string;
+  generation: number;
   payload: unknown;
   verified: boolean;
   error?: string;
@@ -71,6 +72,9 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [room, setRoom] = useState<RoomRow | null>(null);
   const [roomKey, setRoomKey] = useState<RoomKey | null>(null);
+  const [roomKeysByGen, setRoomKeysByGen] = useState<Map<number, RoomKey>>(
+    () => new Map(),
+  );
   const [roomName, setRoomName] = useState<string | null>(null);
   const [members, setMembers] = useState<RoomMemberRow[]>([]);
   const [blobs, setBlobs] = useState<DecodedBlob[]>([]);
@@ -79,6 +83,7 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const roomKeyRef = useRef<RoomKey | null>(null);
+  const roomKeysByGenRef = useRef<Map<number, RoomKey>>(new Map());
 
   const loadAll = useCallback(
     async (uid: string, id: Identity) => {
@@ -93,23 +98,37 @@ function RoomInner({ roomId }: { roomId: string }) {
       }
       setRoom(roomRow);
 
-      const wrapped = await getMyWrappedRoomKey({
-        roomId,
-        userId: uid,
-        generation: roomRow.current_generation,
-      });
-      if (!wrapped) {
+      // Unwrap every generation the viewer is a member of. The current-gen
+      // key is used for sending + rename; the full map lets us decrypt old
+      // blobs after a key rotation.
+      const myRows = await listMyRoomKeyRows(roomId, uid);
+      const byGen = new Map<number, RoomKey>();
+      for (const r of myRows) {
+        try {
+          const wrapped = await fromBase64(r.wrapped_room_key);
+          const rk = await unwrapRoomKey(
+            { wrapped, generation: r.generation },
+            id.x25519PublicKey,
+            id.x25519PrivateKey,
+          );
+          byGen.set(r.generation, rk);
+        } catch (err) {
+          console.error(
+            `unwrap failed for room ${roomId} gen ${r.generation}`,
+            errorMessage(err),
+          );
+        }
+      }
+      const current = byGen.get(roomRow.current_generation);
+      if (!current) {
         throw new Error(
           'you are not a current-generation member of this room (may need to be re-invited)',
         );
       }
-      const rk = await unwrapRoomKey(
-        { wrapped, generation: roomRow.current_generation },
-        id.x25519PublicKey,
-        id.x25519PrivateKey,
-      );
-      setRoomKey(rk);
-      roomKeyRef.current = rk;
+      setRoomKey(current);
+      roomKeyRef.current = current;
+      setRoomKeysByGen(byGen);
+      roomKeysByGenRef.current = byGen;
 
       if (roomRow.name_ciphertext && roomRow.name_nonce) {
         try {
@@ -117,7 +136,7 @@ function RoomInner({ roomId }: { roomId: string }) {
             ciphertext: await fromBase64(roomRow.name_ciphertext),
             nonce: await fromBase64(roomRow.name_nonce),
             roomId,
-            roomKey: rk,
+            roomKey: current,
           });
           setRoomName(name);
         } catch (e) {
@@ -133,7 +152,7 @@ function RoomInner({ roomId }: { roomId: string }) {
 
       const rows = await listBlobs(roomId);
       const decoded = await Promise.all(
-        rows.map((row) => decodeAndVerify(row, rk, id, uid)),
+        rows.map((row) => decodeAndVerify(row, byGen, id, uid)),
       );
       setBlobs(decoded);
     },
@@ -161,9 +180,9 @@ function RoomInner({ roomId }: { roomId: string }) {
 
   const ingestBlobRow = useCallback(
     async (row: BlobRow) => {
-      const rk = roomKeyRef.current;
-      if (!rk || !identity || !userId) return;
-      const decoded = await decodeAndVerify(row, rk, identity, userId);
+      const byGen = roomKeysByGenRef.current;
+      if (byGen.size === 0 || !identity || !userId) return;
+      const decoded = await decodeAndVerify(row, byGen, identity, userId);
       setBlobs((prev) => {
         if (prev.some((b) => b.id === decoded.id)) return prev;
         return [...prev, decoded];
@@ -275,13 +294,14 @@ function RoomInner({ roomId }: { roomId: string }) {
         identity={identity}
         roomKey={roomKey}
         onChange={() => void loadAll(userId, identity)}
+        onLeft={() => router.replace('/rooms')}
       />
 
       <BlobFeed
         blobs={blobs}
         selfUserId={userId}
         roomId={roomId}
-        roomKey={roomKey}
+        roomKeysByGen={roomKeysByGen}
       />
 
       <Composer
@@ -299,20 +319,22 @@ function RoomInner({ roomId }: { roomId: string }) {
 
 async function decodeAndVerify(
   row: BlobRow,
-  rk: RoomKey,
+  roomKeysByGen: Map<number, RoomKey>,
   viewerIdentity: Identity,
   viewerUserId: string,
 ): Promise<DecodedBlob> {
   try {
     const blob = await decodeBlobRow(row);
-    if (blob.generation !== rk.generation) {
+    const rk = roomKeysByGen.get(blob.generation);
+    if (!rk) {
       return {
         id: row.id,
         senderId: row.sender_id,
         createdAt: row.created_at,
+        generation: blob.generation,
         payload: null,
         verified: false,
-        error: `blob is at generation ${blob.generation}, current room key is gen ${rk.generation}`,
+        error: `no key for generation ${blob.generation} (you weren't a member at that time)`,
       };
     }
     // Need the sender's ed25519_pub. Fetch if not us.
@@ -340,6 +362,7 @@ async function decodeAndVerify(
       id: row.id,
       senderId: row.sender_id,
       createdAt: row.created_at,
+      generation: blob.generation,
       payload,
       verified: true,
     };
@@ -349,6 +372,7 @@ async function decodeAndVerify(
       id: row.id,
       senderId: row.sender_id,
       createdAt: row.created_at,
+      generation: row.generation,
       payload: null,
       verified: false,
       error: message,
@@ -365,6 +389,7 @@ function MemberList({
   identity,
   roomKey,
   onChange,
+  onLeft,
 }: {
   room: RoomRow;
   members: RoomMemberRow[];
@@ -372,20 +397,28 @@ function MemberList({
   identity: Identity;
   roomKey: RoomKey;
   onChange: () => void;
+  onLeft: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const isAdmin = room.created_by === selfUserId;
 
-  async function rotateOut(removedUserId: string) {
-    if (!confirm(`Remove ${removedUserId.slice(0, 8)}… and rotate the room key?`)) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const supabase = getSupabase();
-      const keepMembers = members.filter((m) => m.user_id !== removedUserId);
-      // Fetch each remaining member's X25519 pub.
+  /**
+   * Rotate the room key for `keepUserIds`, re-encrypt the room name under
+   * the new key, bump the generation pointer, and delete every row for
+   * `removeUserIds` across all generations. Shared between the admin
+   * "kick" path and the self-service "leave" path.
+   */
+  async function rotateAndRemove(params: {
+    keep: RoomMemberRow[];
+    removeUserIds: string[];
+  }) {
+    const supabase = getSupabase();
+    const { keep, removeUserIds } = params;
+
+    if (keep.length > 0) {
       const keepPubs = await Promise.all(
-        keepMembers.map(async (m) => {
+        keep.map(async (m) => {
           if (m.user_id === selfUserId) {
             return { userId: m.user_id, x25519Pub: identity.x25519PublicKey };
           }
@@ -395,12 +428,10 @@ function MemberList({
           return { userId: m.user_id, x25519Pub: pub.x25519PublicKey };
         }),
       );
-      // Generate next room key and wrap per remaining member.
       const { next, wraps } = await rotateRoomKey(
         roomKey.generation,
         keepPubs.map((k) => k.x25519Pub),
       );
-      // Insert new generation rows for each remaining member.
       for (let i = 0; i < keepPubs.length; i++) {
         await addRoomMember({
           roomId: room.id,
@@ -409,9 +440,6 @@ function MemberList({
           wrappedRoomKey: wraps[i].wrapped,
         });
       }
-      // If the room has an encrypted name, re-encrypt it under the new key so
-      // remaining members can still read it at the new generation. Decrypt
-      // with the old key first (AD is bound to generation).
       if (room.name_ciphertext && room.name_nonce) {
         try {
           const oldName = await decryptRoomName({
@@ -433,20 +461,51 @@ function MemberList({
             });
           }
         } catch (err) {
-          // Don't block rotation on a name-recrypt failure; clear the name instead.
           console.error('name re-encrypt failed, clearing', errorMessage(err));
           await renameRoom({ roomId: room.id, nameCiphertext: null, nameNonce: null });
         }
       }
-      // Bump generation pointer.
       await bumpRoomGeneration(room.id, next.generation);
-      // Delete removed user's rows (all generations for clean-up).
+    }
+    for (const uid of removeUserIds) {
       await supabase
         .from('room_members')
         .delete()
         .eq('room_id', room.id)
-        .eq('user_id', removedUserId);
+        .eq('user_id', uid);
+    }
+  }
+
+  async function kickMember(removedUserId: string) {
+    if (!confirm(`Remove ${removedUserId.slice(0, 8)}… and rotate the room key?`)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const keep = members.filter((m) => m.user_id !== removedUserId);
+      await rotateAndRemove({ keep, removeUserIds: [removedUserId] });
       onChange();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function leaveRoom() {
+    const label = room.kind === 'pair' ? 'leave this pair' : 'leave this group';
+    if (
+      !confirm(
+        `${label}?\n\nThe room key will be rotated so the remaining members' future messages stay private from you. Past messages you've already seen will still be readable on this device.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const remaining = members.filter((m) => m.user_id !== selfUserId);
+      await rotateAndRemove({ keep: remaining, removeUserIds: [selfUserId] });
+      onLeft();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -456,25 +515,55 @@ function MemberList({
 
   return (
     <section className="rounded border border-neutral-200 p-3 text-sm dark:border-neutral-800">
-      <h2 className="mb-2 text-sm font-semibold">Members (gen {room.current_generation})</h2>
+      <div className="mb-2 flex items-center justify-between">
+        <h2 className="text-sm font-semibold">
+          Members (gen {room.current_generation})
+        </h2>
+        <span className="text-[10px] uppercase tracking-wide text-neutral-500">
+          {isAdmin ? 'you are the admin' : `admin: ${room.created_by.slice(0, 8)}…`}
+        </span>
+      </div>
       <ul className="space-y-1">
-        {members.map((m) => (
-          <li key={`${m.user_id}-${m.generation}`} className="flex items-center justify-between">
-            <code className="font-mono text-xs text-neutral-500">
-              {m.user_id}{m.user_id === selfUserId ? ' (you)' : ''}
-            </code>
-            {m.user_id !== selfUserId && (
-              <button
-                onClick={() => void rotateOut(m.user_id)}
-                disabled={busy}
-                className="rounded border border-red-300 px-2 py-0.5 text-xs text-red-700 disabled:opacity-50 dark:border-red-800 dark:text-red-400"
-              >
-                remove + rotate
-              </button>
-            )}
-          </li>
-        ))}
+        {members.map((m) => {
+          const self = m.user_id === selfUserId;
+          return (
+            <li
+              key={`${m.user_id}-${m.generation}`}
+              className="flex items-center justify-between"
+            >
+              <code className="font-mono text-xs text-neutral-500">
+                {m.user_id}
+                {self ? ' (you)' : ''}
+                {m.user_id === room.created_by ? ' · admin' : ''}
+              </code>
+              {isAdmin && !self && (
+                <button
+                  onClick={() => void kickMember(m.user_id)}
+                  disabled={busy}
+                  className="rounded border border-red-300 px-2 py-0.5 text-xs text-red-700 disabled:opacity-50 dark:border-red-800 dark:text-red-400"
+                >
+                  remove + rotate
+                </button>
+              )}
+              {!isAdmin && self && (
+                <button
+                  onClick={() => void leaveRoom()}
+                  disabled={busy}
+                  className="rounded border border-amber-300 px-2 py-0.5 text-xs text-amber-800 disabled:opacity-50 dark:border-amber-800 dark:text-amber-300"
+                >
+                  leave
+                </button>
+              )}
+            </li>
+          );
+        })}
       </ul>
+      {!isAdmin && (
+        <p className="mt-2 text-[11px] text-neutral-500">
+          Only the room admin can remove other members. You can leave this
+          room yourself.
+        </p>
+      )}
       {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
     </section>
   );
@@ -486,12 +575,12 @@ function BlobFeed({
   blobs,
   selfUserId,
   roomId,
-  roomKey,
+  roomKeysByGen,
 }: {
   blobs: DecodedBlob[];
   selfUserId: string;
   roomId: string;
-  roomKey: RoomKey;
+  roomKeysByGen: Map<number, RoomKey>;
 }) {
   const [showSystem, setShowSystem] = useState(false);
   const sorted = useMemo(
@@ -550,8 +639,9 @@ function BlobFeed({
                 <ImageAttachment
                   roomId={roomId}
                   blobId={b.id}
+                  generation={b.generation}
                   header={imageHeader}
-                  roomKey={roomKey}
+                  roomKeysByGen={roomKeysByGen}
                 />
               ) : (
                 <pre className="whitespace-pre-wrap break-words font-mono text-xs">
@@ -581,13 +671,15 @@ function asImagePayload(p: unknown): ImageAttachmentHeader | null {
 function ImageAttachment({
   roomId,
   blobId,
+  generation,
   header,
-  roomKey,
+  roomKeysByGen,
 }: {
   roomId: string;
   blobId: string;
+  generation: number;
   header: ImageAttachmentHeader;
-  roomKey: RoomKey;
+  roomKeysByGen: Map<number, RoomKey>;
 }) {
   const [fullUrl, setFullUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -597,13 +689,19 @@ function ImageAttachment({
     let createdUrl: string | null = null;
     (async () => {
       try {
+        const rk = roomKeysByGen.get(generation);
+        if (!rk) {
+          throw new Error(
+            `no key for generation ${generation} (you weren't a member at that time)`,
+          );
+        }
         const encrypted = await downloadAttachment({ roomId, blobId });
         const plaintext = await decryptImageAttachment({
           encryptedBytes: encrypted,
-          roomKey,
+          roomKey: rk,
           roomId,
           blobId,
-          generation: roomKey.generation,
+          generation,
         });
         if (cancelled) return;
         const blob = new Blob([plaintext.slice().buffer as ArrayBuffer], { type: header.mime });
@@ -618,11 +716,10 @@ function ImageAttachment({
       cancelled = true;
       if (createdUrl) URL.revokeObjectURL(createdUrl);
     };
-    // Re-fetch only if the attachment identity changes. roomKey is stable per
-    // render thanks to the parent holding it in a ref; including it would
-    // retrigger spuriously on unrelated parent re-renders.
+    // roomKeysByGen identity is stable across renders (state Map) unless
+    // generations change; adding it to deps would retrigger spuriously.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, blobId, header.mime]);
+  }, [roomId, blobId, generation, header.mime]);
 
   // Reserve layout space so the feed doesn't jump when the full image lands.
   const aspect = header.w > 0 && header.h > 0 ? `${header.w} / ${header.h}` : '4 / 3';

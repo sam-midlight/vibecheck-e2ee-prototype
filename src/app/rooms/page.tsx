@@ -465,6 +465,48 @@ function InviteForm({
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [fullness, setFullness] = useState<Map<string, boolean>>(new Map());
+
+  // For each room, check whether it's already at capacity (only meaningful
+  // for kind='pair' — groups have no cap in this prototype). A room counts
+  // as "full" if members + pending invites >= 2. We compute this client-side
+  // so the UX can disable the pair row before the server trigger rejects it.
+  useEffect(() => {
+    if (!userId || rooms.length === 0) {
+      setFullness(new Map());
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const supabase = getSupabase();
+      const entries = await Promise.all(
+        rooms.map(async (r): Promise<[string, boolean]> => {
+          if (r.kind !== 'pair') return [r.id, false];
+          const [{ count: memberCount }, { count: inviteCount }] = await Promise.all([
+            supabase
+              .from('room_members')
+              .select('user_id', { count: 'exact', head: true })
+              .eq('room_id', r.id)
+              .eq('generation', r.current_generation),
+            supabase
+              .from('room_invites')
+              .select('id', { count: 'exact', head: true })
+              .eq('room_id', r.id),
+          ]);
+          const total = (memberCount ?? 0) + (inviteCount ?? 0);
+          return [r.id, total >= 2];
+        }),
+      );
+      if (cancelled) return;
+      setFullness(new Map(entries));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [userId, rooms]);
+
+  const currentRoom = rooms.find((r) => r.id === roomId);
+  const currentRoomFull = currentRoom ? fullness.get(currentRoom.id) ?? false : false;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -475,6 +517,11 @@ function InviteForm({
       if (!roomId || !inviteeId) throw new Error('pick a room and enter a user id');
       const room = rooms.find((r) => r.id === roomId);
       if (!room) throw new Error('room not found');
+      if (room.kind === 'pair' && fullness.get(room.id)) {
+        throw new Error(
+          'this pair room already has two people — pair rooms are capped at 2',
+        );
+      }
       // Fetch the invitee's public identity.
       const inviteePub = await fetchIdentity(inviteeId);
       if (!inviteePub) throw new Error('that user has no published identity');
@@ -531,14 +578,24 @@ function InviteForm({
         >
           {rooms.map((r) => {
             const name = names.get(r.id);
-            const label = name ? `${name} · ${r.kind}` : `${r.id.slice(0, 8)} · ${r.kind} · gen ${r.current_generation}`;
+            const full = fullness.get(r.id) ?? false;
+            const base = name
+              ? `${name} · ${r.kind}`
+              : `${r.id.slice(0, 8)} · ${r.kind} · gen ${r.current_generation}`;
+            const label = full ? `${base} · full` : base;
             return (
-              <option key={r.id} value={r.id}>
+              <option key={r.id} value={r.id} disabled={full}>
                 {label}
               </option>
             );
           })}
         </select>
+        {currentRoomFull && (
+          <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+            Pair rooms are capped at 2 people. Delete this one and create a
+            new room, or pick a different room to invite to.
+          </p>
+        )}
       </div>
       <div>
         <label className="text-xs text-neutral-500">
@@ -554,7 +611,7 @@ function InviteForm({
       </div>
       <button
         type="submit"
-        disabled={busy}
+        disabled={busy || currentRoomFull}
         className="rounded bg-neutral-900 px-3 py-1.5 text-sm text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
       >
         {busy ? 'sending…' : 'send invite'}
