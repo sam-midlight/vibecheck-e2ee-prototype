@@ -23,10 +23,15 @@ export async function POST(req: Request) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !serviceRoleKey) {
+    const missing = [
+      !url && 'NEXT_PUBLIC_SUPABASE_URL',
+      !serviceRoleKey && 'SUPABASE_SERVICE_ROLE_KEY',
+    ]
+      .filter(Boolean)
+      .join(', ');
     return NextResponse.json(
       {
-        error:
-          'server missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY — add to .env.local',
+        error: `server env missing ${missing}. Add in Vercel → Settings → Environment Variables (or .env.local for local dev), then redeploy.`,
       },
       { status: 500 },
     );
