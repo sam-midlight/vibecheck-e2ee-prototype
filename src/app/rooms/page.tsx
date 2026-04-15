@@ -27,6 +27,7 @@ import {
   listMyInvites,
   listMyRooms,
   renameRoom,
+  subscribeInvites,
   type RoomInviteRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
@@ -116,6 +117,18 @@ function RoomsInner() {
       setLoading(false);
     })();
   }, [reload]);
+
+  // Realtime: when someone invites me, pop the new invite into the list.
+  useEffect(() => {
+    if (!userId) return;
+    const unsub = subscribeInvites(userId, (row) => {
+      setInvites((prev) => {
+        if (prev.some((i) => i.id === row.id)) return prev;
+        return [row, ...prev];
+      });
+    });
+    return unsub;
+  }, [userId]);
 
   if (loading || !userId) {
     return <p className="text-sm text-neutral-500">loading…</p>;
@@ -219,6 +232,7 @@ function RoomsInner() {
               userId={userId}
               identity={identity}
               rooms={rooms}
+              names={names}
               onInvited={() => void reload(userId)}
             />
           )}
@@ -437,11 +451,13 @@ function InviteForm({
   userId,
   identity,
   rooms,
+  names,
   onInvited,
 }: {
   userId: string;
   identity: Identity;
   rooms: RoomRow[];
+  names: Map<string, string>;
   onInvited: () => void;
 }) {
   const [roomId, setRoomId] = useState(rooms[0]?.id ?? '');
@@ -513,11 +529,15 @@ function InviteForm({
           onChange={(e) => setRoomId(e.target.value)}
           className="mt-1 block w-full rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-900"
         >
-          {rooms.map((r) => (
-            <option key={r.id} value={r.id}>
-              {r.id.slice(0, 8)} · {r.kind} · gen {r.current_generation}
-            </option>
-          ))}
+          {rooms.map((r) => {
+            const name = names.get(r.id);
+            const label = name ? `${name} · ${r.kind}` : `${r.id.slice(0, 8)} · ${r.kind} · gen ${r.current_generation}`;
+            return (
+              <option key={r.id} value={r.id}>
+                {label}
+              </option>
+            );
+          })}
         </select>
       </div>
       <div>

@@ -4,11 +4,13 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 ## 1. Bring the core module across
 
-Copy these three things verbatim:
+Copy these things verbatim:
 
-- `src/lib/e2ee-core/` — the crypto module (approval + recovery included)
+- `src/lib/e2ee-core/` — the crypto module (approval + recovery + room-name sealing)
 - `supabase/migrations/0001_init.sql` — core schema + RLS
 - `supabase/migrations/0002_device_approval_and_recovery.sql` — device_approval_requests + recovery_blobs (needed for the code-approval device-sync UX and phrase-based account recovery)
+- `supabase/migrations/0003_room_name.sql` — adds `name_ciphertext` + `name_nonce` to `rooms` for encrypted display names (see §5)
+- `supabase/migrations/0004_room_delete.sql` — adds the `rooms_creator_delete` RLS policy so creators can tear a room down (cascades all children)
 
 Install in V2:
 
@@ -66,6 +68,15 @@ Use a discriminated union + a `zod` schema at the decrypt boundary to validate p
 
 Tip: keep the Therapy Session Report an aggregation *in the client* across many blobs, not a server-side query. That's how the zero-knowledge guarantee survives clinical tooling.
 
+### Encrypted room names
+
+`rooms` carries optional `name_ciphertext` + `name_nonce` columns (migration 0003). The name is sealed under the current-generation room key using XChaCha20-Poly1305 with AD bound to `(room_id, generation, "vibecheck:name:v1")` — so a name ciphertext cannot be swapped for a message blob even though they share the same key. Unsigned on purpose: any current member can rename.
+
+V2 implications:
+- On member removal / key rotation, re-encrypt the name under the new key (see the `rotateOut` flow in `src/app/rooms/[id]/page.tsx`). If the re-encrypt fails, clear the name rather than block the rotation.
+- Use `encryptRoomName` / `decryptRoomName` from `e2ee-core`; the server never sees plaintext.
+- This supersedes the earlier "consider a separate `room_meta` table" note — names live on the `rooms` row directly.
+
 ## 6. Features out-of-scope for prototype that V2 needs
 
 | Feature                      | Where to put it                                                 |
@@ -81,10 +92,22 @@ Tip: keep the Therapy Session Report an aggregation *in the client* across many 
 Anticipated, none yet mandatory:
 
 - Add `email text` to `identities` if you go the invite-by-email route.
-- Consider a `room_meta` blob-style table if you want encrypted room names/avatars.
+- If you want room avatars, extend the room-name sealing pattern (XChaCha20-Poly1305 under the current-gen room key, with a distinct AD field tag) rather than spinning up a separate table.
 - If you want to support file attachments, add a `blob_attachments` table mirroring `blobs` but referencing Supabase Storage object paths + per-object wrap keys.
 
 Everything else in the prototype's schema should survive untouched.
+
+## 9. Portable query + realtime helpers to copy
+
+`src/lib/supabase/queries.ts` grew a few helpers during prototyping that V2 will want as-is:
+
+- **`renameRoom` / `deleteRoom`** — mirror the `rooms_member_update` and `rooms_creator_delete` RLS policies.
+- **`nukeIdentityServer(userId)`** — the "nuclear reset" escape hatch used when a user is locked out with no other device and no recovery phrase. Wipes their `room_members`, `room_invites`, `device_approval_requests`, `devices`, and `recovery_blobs` rows so a fresh identity can be published in place. Blobs in rooms they were in are left behind as append-only ciphertext nobody can decrypt — the intended trust model. Surface it behind a typed-confirmation gate; see `src/app/auth/callback/page.tsx` for the copy + gating pattern.
+- **`subscribeInvites(userId, onRow, onStatus?)`** — realtime `INSERT` on `room_invites` filtered by `invited_user_id=eq.<uid>`. Use it so incoming invites land without a refresh; the callback signature matches `subscribeBlobs` and `subscribeApprovalRequests`.
+
+### Optimistic-append + realtime-dedupe pattern
+
+The room feed (`src/app/rooms/[id]/page.tsx`) demonstrates a pattern worth keeping in V2: on send, the composer passes the inserted row straight into the same ingest function the realtime subscription uses, and the ingest dedupes by row `id` before appending. This gives instant self-render without flicker when the realtime echo arrives. Apply the same shape to any feature that reads a table via realtime AND writes to it (typing indicators, presence, etc.).
 
 ## 8. Things to test on each port
 

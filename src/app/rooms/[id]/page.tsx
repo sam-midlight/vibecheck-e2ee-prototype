@@ -69,6 +69,7 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [members, setMembers] = useState<RoomMemberRow[]>([]);
   const [blobs, setBlobs] = useState<DecodedBlob[]>([]);
   const [renameOpen, setRenameOpen] = useState(false);
+  const [rtStatus, setRtStatus] = useState<string>('connecting');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const roomKeyRef = useRef<RoomKey | null>(null);
@@ -168,9 +169,13 @@ function RoomInner({ roomId }: { roomId: string }) {
   // Subscribe to realtime blobs for this room.
   useEffect(() => {
     if (!identity || !userId) return;
-    const unsub = subscribeBlobs(roomId, (row) => {
-      void ingestBlobRow(row);
-    });
+    const unsub = subscribeBlobs(
+      roomId,
+      (row) => {
+        void ingestBlobRow(row);
+      },
+      (status) => setRtStatus(status),
+    );
     return unsub;
   }, [roomId, identity, userId, ingestBlobRow]);
 
@@ -205,6 +210,8 @@ function RoomInner({ roomId }: { roomId: string }) {
                 <code className="font-mono">{room.id.slice(0, 8)}</code>
               </>
             )}
+            {' · '}
+            <RealtimeBadge status={rtStatus} />
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -465,18 +472,43 @@ function MemberList({
 // ---------------------------------------------------------------------------
 
 function BlobFeed({ blobs, selfUserId }: { blobs: DecodedBlob[]; selfUserId: string }) {
+  const [showSystem, setShowSystem] = useState(false);
   const sorted = useMemo(
     () => [...blobs].sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
     [blobs],
   );
+  const visible = useMemo(
+    () => (showSystem ? sorted : sorted.filter((b) => !isSystemPayload(b.payload))),
+    [sorted, showSystem],
+  );
+  const hiddenCount = sorted.length - visible.length;
+
   return (
     <section className="rounded border border-neutral-200 p-3 dark:border-neutral-800">
-      <h2 className="mb-2 text-sm font-semibold">Messages</h2>
-      {sorted.length === 0 && (
+      <div className="mb-2 flex items-center justify-between">
+        <h2 className="text-sm font-semibold">Messages</h2>
+        {hiddenCount > 0 && !showSystem && (
+          <button
+            onClick={() => setShowSystem(true)}
+            className="text-xs text-neutral-500 underline underline-offset-2 hover:text-neutral-700 dark:hover:text-neutral-300"
+          >
+            show {hiddenCount} system event{hiddenCount === 1 ? '' : 's'}
+          </button>
+        )}
+        {showSystem && (
+          <button
+            onClick={() => setShowSystem(false)}
+            className="text-xs text-neutral-500 underline underline-offset-2 hover:text-neutral-700 dark:hover:text-neutral-300"
+          >
+            hide system events
+          </button>
+        )}
+      </div>
+      {visible.length === 0 && (
         <p className="text-sm text-neutral-500">no messages yet</p>
       )}
       <ul className="space-y-2">
-        {sorted.map((b) => (
+        {visible.map((b) => (
           <li
             key={b.id}
             className={`rounded px-3 py-2 text-sm ${b.senderId === selfUserId ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900' : 'bg-neutral-100 dark:bg-neutral-900'}`}
@@ -500,6 +532,27 @@ function BlobFeed({ blobs, selfUserId }: { blobs: DecodedBlob[]; selfUserId: str
       </ul>
     </section>
   );
+}
+
+function RealtimeBadge({ status }: { status: string }) {
+  const live = status === 'SUBSCRIBED';
+  const color = live
+    ? 'text-emerald-600 dark:text-emerald-400'
+    : 'text-amber-600 dark:text-amber-400';
+  const dot = live ? '●' : '○';
+  const label = live ? 'live' : status.toLowerCase();
+  return (
+    <span className={color} title={`realtime channel: ${status}`}>
+      {dot} {label}
+    </span>
+  );
+}
+
+/** System noise emitted by /status (health probes). Not user content. */
+function isSystemPayload(p: unknown): boolean {
+  if (typeof p !== 'object' || p === null) return false;
+  const kind = (p as { kind?: unknown }).kind;
+  return typeof kind === 'string' && kind.startsWith('status-');
 }
 
 function safeStringify(p: unknown): string {

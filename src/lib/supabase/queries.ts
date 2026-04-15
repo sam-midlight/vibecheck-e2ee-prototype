@@ -403,6 +403,31 @@ export async function deleteInvite(inviteId: string): Promise<void> {
   if (error) throw error;
 }
 
+/** Realtime: new invites addressed to this user. */
+export function subscribeInvites(
+  userId: string,
+  onRow: (row: RoomInviteRow) => void,
+  onStatus?: (status: string) => void,
+): () => void {
+  const supabase = getSupabase();
+  const channel = supabase
+    .channel(`invites:${userId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'room_invites',
+        filter: `invited_user_id=eq.${userId}`,
+      },
+      (payload) => onRow(payload.new as RoomInviteRow),
+    )
+    .subscribe((status) => onStatus?.(status));
+  return () => {
+    void supabase.removeChannel(channel);
+  };
+}
+
 /**
  * Delete a room and everything in it. Only the creator can do this
  * (enforced by the `rooms_creator_delete` RLS policy). Child rows in
