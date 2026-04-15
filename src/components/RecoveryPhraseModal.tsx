@@ -112,9 +112,16 @@ function IntroStage({
       </p>
       <p className="text-sm text-neutral-700 dark:text-neutral-300">
         A 24-word recovery phrase is your emergency escape hatch. Anyone with
-        this phrase can sign in as you from anywhere, so write it down and
-        store it somewhere safe — <strong>not in this app, and not in your email</strong>.
+        this phrase can sign in as you from anywhere, so save it somewhere
+        safe — <strong>not in this app, and not in your email</strong>.
       </p>
+      {!hideSkip && (
+        <p className="text-sm text-amber-800 dark:text-amber-300">
+          Skipping is possible but <strong>not recommended</strong>. Without a
+          phrase, losing your devices means losing the account and everything
+          in it — permanently.
+        </p>
+      )}
       <div className="flex flex-wrap gap-2 pt-2">
         <button
           onClick={onStart}
@@ -125,9 +132,9 @@ function IntroStage({
         {!hideSkip && (
           <button
             onClick={onSkip}
-            className="rounded border border-neutral-300 px-4 py-2 text-sm dark:border-neutral-700"
+            className="rounded border border-neutral-300 px-4 py-2 text-sm text-neutral-500 dark:border-neutral-700"
           >
-            Skip for now
+            Skip (not recommended)
           </button>
         )}
       </div>
@@ -158,10 +165,16 @@ function DisplayStage({ phrase, onContinue }: { phrase: string; onContinue: () =
   return (
     <div className="space-y-4">
       <h2 className="text-lg font-semibold">Your 24-word recovery phrase</h2>
-      <p className="text-sm text-neutral-700 dark:text-neutral-300">
-        Write these down, in order, on paper. Do not screenshot. Do not paste
-        into a note app synced to the cloud. Do not email them.
-      </p>
+      <div className="rounded-md border-2 border-red-400 bg-red-50 p-3 text-sm dark:border-red-700 dark:bg-red-950">
+        <p className="font-semibold text-red-900 dark:text-red-100">
+          Save this now. You will never see it again.
+        </p>
+        <p className="mt-1 text-xs text-red-800 dark:text-red-200">
+          The phrase is never stored on our server — only your encrypted data
+          is. If you leave this screen without saving it, and you later lose
+          your devices, your account and everything in it is gone for good.
+        </p>
+      </div>
       <ol className="grid grid-cols-2 gap-x-4 gap-y-1 rounded border border-neutral-300 bg-neutral-50 p-4 font-mono text-sm dark:border-neutral-700 dark:bg-neutral-950 sm:grid-cols-3">
         {words.map((w, i) => (
           <li key={i} className="tabular-nums">
@@ -173,22 +186,24 @@ function DisplayStage({ phrase, onContinue }: { phrase: string; onContinue: () =
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
+          onClick={handleSavePdf}
+          className="rounded bg-neutral-900 px-4 py-2 text-sm font-medium text-white dark:bg-white dark:text-neutral-900"
+        >
+          Save as PDF
+        </button>
+        <button
+          type="button"
           onClick={() => void handleCopy()}
           className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
         >
           {copied ? 'copied ✓' : 'copy phrase'}
         </button>
-        <button
-          type="button"
-          onClick={handleSavePdf}
-          className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
-        >
-          save as PDF
-        </button>
-        <span className="text-xs text-neutral-500">
-          In the print dialog, pick &ldquo;Save as PDF&rdquo; as the destination.
-        </span>
       </div>
+      <p className="text-xs text-neutral-500">
+        Do not screenshot. Do not paste into a cloud-synced note app. Do not
+        email it to yourself. The PDF dialog includes the option to save to
+        Files / Drive — or pick a real printer.
+      </p>
       <label className="flex items-start gap-2 text-sm">
         <input
           type="checkbox"
@@ -196,7 +211,10 @@ function DisplayStage({ phrase, onContinue }: { phrase: string; onContinue: () =
           onChange={(e) => setAck(e.target.checked)}
           className="mt-1"
         />
-        <span>I&apos;ve written these down somewhere safe.</span>
+        <span>
+          I&apos;ve saved this phrase somewhere I can get to it later (PDF,
+          password manager, or written down).
+        </span>
       </label>
       <div className="flex gap-2 pt-1">
         <button
