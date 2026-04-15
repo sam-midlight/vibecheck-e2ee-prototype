@@ -8,6 +8,7 @@
 import type { RealtimeChannel } from '@supabase/supabase-js';
 import { errorMessage } from '@/lib/errors';
 import {
+  attachmentStorageKey,
   fromBase64,
   toBase64,
   type Bytes,
@@ -15,6 +16,9 @@ import {
   type PublicIdentity,
 } from '@/lib/e2ee-core';
 import { getSupabase } from './client';
+
+/** Bucket holding encrypted image attachments. Path convention: `{roomId}/{blobId}.bin`. */
+const ATTACHMENTS_BUCKET = 'room-attachments';
 
 // ---------------------------------------------------------------------------
 // Row shapes (matching supabase/migrations/0001_init.sql)
@@ -326,7 +330,10 @@ export async function listMyRooms(userId: string): Promise<RoomRow[]> {
     .in('id', roomIds)
     .order('created_at', { ascending: false });
   if (error) throw error;
-  return (data ?? []) as RoomRow[];
+  // Hide status-probe rooms (marked by `parent_room_id = id` self-reference)
+  // from the user-facing feed. See `findOrCreateTestRoom` in /status for
+  // where the marker is set.
+  return ((data ?? []) as RoomRow[]).filter((r) => r.parent_room_id !== r.id);
 }
 
 export async function listRoomMembers(roomId: string): Promise<RoomMemberRow[]> {
@@ -432,9 +439,17 @@ export function subscribeInvites(
  * Delete a room and everything in it. Only the creator can do this
  * (enforced by the `rooms_creator_delete` RLS policy). Child rows in
  * room_members, room_invites, and blobs cascade automatically.
+ *
+ * Storage objects (encrypted image attachments) are NOT cascaded by the DB
+ * — Postgres has no FK into Supabase Storage. We best-effort delete them
+ * before dropping the rooms row. Any failure is swallowed; the DB cascade
+ * is the authoritative delete.
  */
 export async function deleteRoom(roomId: string): Promise<void> {
   const supabase = getSupabase();
+  await deleteAttachmentsForRoom(roomId).catch((err) => {
+    console.warn('deleteRoom: attachment cleanup failed', errorMessage(err));
+  });
   const { error } = await supabase.from('rooms').delete().eq('id', roomId);
   if (error) throw error;
 }
@@ -459,9 +474,13 @@ export async function insertBlob(params: {
   roomId: string;
   senderId: string;
   blob: EncryptedBlob;
+  /** Optional client-generated UUID. Required when the blob has an attachment
+   *  so the storage-object path `{roomId}/{blobId}.bin` can be computed before
+   *  the row is inserted. */
+  id?: string;
 }): Promise<BlobRow> {
   const supabase = getSupabase();
-  const row = {
+  const row: Record<string, unknown> = {
     room_id: params.roomId,
     sender_id: params.senderId,
     generation: params.blob.generation,
@@ -469,6 +488,7 @@ export async function insertBlob(params: {
     ciphertext: await toBase64(params.blob.ciphertext),
     signature: await toBase64(params.blob.signature),
   };
+  if (params.id) row.id = params.id;
   const { data, error } = await supabase
     .from('blobs')
     .insert(row)
@@ -525,6 +545,78 @@ export async function decodeBlobRow(row: BlobRow): Promise<EncryptedBlob> {
     signature: await fromBase64(row.signature),
     generation: row.generation,
   };
+}
+
+// ---------------------------------------------------------------------------
+// image attachments (Supabase Storage)
+//
+// Objects are uploaded/downloaded as `nonce || ciphertext` raw bytes, with
+// no content-type hint — the server sees opaque bytes. Path convention is
+// `{roomId}/{blobId}.bin`; RLS on the bucket gates by the first segment
+// (see migration 0006_attachments_bucket.sql).
+// ---------------------------------------------------------------------------
+
+/** Upload an attachment's encrypted bytes to Storage. */
+export async function uploadAttachment(params: {
+  roomId: string;
+  blobId: string;
+  encryptedBytes: Bytes;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const path = attachmentStorageKey(params.roomId, params.blobId);
+  const { error } = await supabase.storage
+    .from(ATTACHMENTS_BUCKET)
+    .upload(path, params.encryptedBytes, {
+      contentType: 'application/octet-stream',
+      cacheControl: '3600',
+      upsert: false,
+    });
+  if (error) throw error;
+}
+
+/** Download an attachment's encrypted bytes. Caller then decrypts via e2ee-core. */
+export async function downloadAttachment(params: {
+  roomId: string;
+  blobId: string;
+}): Promise<Bytes> {
+  const supabase = getSupabase();
+  const path = attachmentStorageKey(params.roomId, params.blobId);
+  const { data, error } = await supabase.storage.from(ATTACHMENTS_BUCKET).download(path);
+  if (error) throw error;
+  return new Uint8Array(await data.arrayBuffer());
+}
+
+/** Remove a single attachment (used to roll back a failed send). */
+export async function deleteAttachment(params: {
+  roomId: string;
+  blobId: string;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const path = attachmentStorageKey(params.roomId, params.blobId);
+  const { error } = await supabase.storage.from(ATTACHMENTS_BUCKET).remove([path]);
+  if (error) throw error;
+}
+
+/**
+ * Enumerate all attachment object paths under a room (recursive=false since
+ * we use a flat single-level prefix `{roomId}/`).
+ */
+async function listAttachmentsForRoom(roomId: string): Promise<string[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.storage
+    .from(ATTACHMENTS_BUCKET)
+    .list(roomId, { limit: 1000 });
+  if (error) throw error;
+  return (data ?? []).map((entry) => `${roomId}/${entry.name}`);
+}
+
+/** Bulk-delete every attachment under a room. Called by `deleteRoom`. */
+export async function deleteAttachmentsForRoom(roomId: string): Promise<void> {
+  const paths = await listAttachmentsForRoom(roomId);
+  if (paths.length === 0) return;
+  const supabase = getSupabase();
+  const { error } = await supabase.storage.from(ATTACHMENTS_BUCKET).remove(paths);
+  if (error) throw error;
 }
 
 // ---------------------------------------------------------------------------

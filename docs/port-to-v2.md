@@ -6,12 +6,13 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 Copy these things verbatim:
 
-- `src/lib/e2ee-core/` — the crypto module (approval + recovery + room-name sealing)
+- `src/lib/e2ee-core/` — the crypto module (approval + recovery + room-name sealing + image attachments)
 - `supabase/migrations/0001_init.sql` — core schema + RLS
 - `supabase/migrations/0002_device_approval_and_recovery.sql` — device_approval_requests + recovery_blobs (needed for the code-approval device-sync UX and phrase-based account recovery)
 - `supabase/migrations/0003_room_name.sql` — adds `name_ciphertext` + `name_nonce` to `rooms` for encrypted display names (see §5)
 - `supabase/migrations/0004_room_delete.sql` — adds the `rooms_creator_delete` RLS policy so creators can tear a room down (cascades all children)
 - `supabase/migrations/0005_tighten_handoff_rls.sql` — replaces the permissive `handoffs_any_authed` policy with `handoffs_owner_all` so only the user whose device is linking can read/write/delete their `device_link_handoffs` rows. Blocks cross-account enumeration and DoS against the QR/approval-code linking flow. Must be applied alongside the initial schema.
+- `supabase/migrations/0006_attachments_bucket.sql` — creates the private `room-attachments` Storage bucket and RLS policies gating access by the `{roomId}/{blobId}.bin` path prefix. Current-gen members can INSERT; any-gen members can SELECT; room creator + current-gen members can DELETE. Required for encrypted image attachments — see §10 below.
 
 Install in V2:
 
@@ -109,6 +110,31 @@ Everything else in the prototype's schema should survive untouched.
 ### Optimistic-append + realtime-dedupe pattern
 
 The room feed (`src/app/rooms/[id]/page.tsx`) demonstrates a pattern worth keeping in V2: on send, the composer passes the inserted row straight into the same ingest function the realtime subscription uses, and the ingest dedupes by row `id` before appending. This gives instant self-render without flicker when the realtime echo arrives. Apply the same shape to any feature that reads a table via realtime AND writes to it (typing indicators, presence, etc.).
+
+## 10. Image attachments (portable path)
+
+The prototype ships a full encrypted-image pipeline; V2 should copy it wholesale and only rewrite the composer/feed UI.
+
+Portable pieces (copy verbatim):
+
+- `supabase/migrations/0006_attachments_bucket.sql` — the `room-attachments` bucket + RLS.
+- `src/lib/e2ee-core/attachment.ts` — `prepareImageForUpload`, `decryptImageAttachment`, `ImageAttachmentHeader`, `attachmentStorageKey`, the AD helper.
+- `src/lib/supabase/queries.ts` → `uploadAttachment`, `downloadAttachment`, `deleteAttachment`, `deleteAttachmentsForRoom`. Also keep the `insertBlob({ id? })` overload — image sends need to know the blob id *before* insert so the storage path can be computed.
+
+Encryption shape:
+
+- Re-encode client-side via `createImageBitmap(file, { imageOrientation: 'from-image', resizeWidth: 1600 })` → `OffscreenCanvas.convertToBlob({ type: 'image/webp', quality: 0.82 })`. This automatically strips EXIF (including GPS).
+- Encrypt bytes with `crypto_aead_xchacha20poly1305_ietf_encrypt`, AD = `uuid(roomId) || uuid(blobId) || u32be(generation) || "vibecheck:attachment:v1"`. The distinct AD tag and `blobId` inclusion prevent cross-room, cross-generation, and cross-attachment swap attacks even if the server misbehaves.
+- Upload the resulting `nonce || ciphertext` to `{roomId}/{blobId}.bin` in the bucket.
+- The outer `blobs` row carries a small JSON payload: `{type:'image', mime, w, h, byteLen, placeholder}` where `placeholder` is a tiny blurred WebP base64 data URL for instant feed rendering.
+
+V2 implications:
+
+- **Key rotation** does not require re-encrypting attachments. Old members keep access to pre-rotation images (same as pre-rotation text blobs — append-only trust model). `deleteRoom` calls `deleteAttachmentsForRoom` before the row cascade because Storage has no FK relationship.
+- **Larger files** (video, PDFs) should switch from `crypto_aead_xchacha20poly1305_ietf_*` to `crypto_secretstream_xchacha20poly1305_*` so you can encrypt/decrypt in chunks without holding the whole plaintext in memory. The bucket, RLS, and header-in-blob pattern stay the same.
+- **Server-side moderation is fundamentally impossible** with this design. Decide in advance whether VibeCheck's audience accepts the Signal-style tradeoff, and put it in the product's Trust-and-Safety copy.
+
+/status in V2 should keep the "image attachment roundtrip" check — it uses a synthetic canvas-generated `File` so it works without any picker UI, and it catches regressions across the full encrypt/upload/download/decrypt pipeline.
 
 ## 8. Things to test on each port
 

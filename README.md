@@ -34,6 +34,8 @@ A standalone prototype proving a **zero-knowledge, Signal/Bitwarden-style encryp
         │  • device_approval_requests (ephemeral)        │
         │  • recovery_blobs   (phrase-wrapped priv keys) │
         │  + Realtime pushes new rows to subscribers     │
+        │  Storage bucket                                │
+        │  • room-attachments (encrypted image blobs)    │
         └─────────────────────────────────────────────────┘
 ```
 
@@ -67,6 +69,7 @@ Per-room (per generation)
 | Lost all devices, have phrase        | Enter phrase on new device → unwrap from `recovery_blobs` → identity restored. Old room blobs remain decryptable |
 | Lost all devices, no phrase          | No recovery. User resets; partners re-invite. Old room blobs permanently lost |
 | Removed group member                 | Can still decrypt past blobs they cached; cannot decrypt anything new (key rotated) |
+| Server-side abuse / CSAM scanning    | Not possible by design. Every image is re-encoded client-side (EXIF/GPS stripped) and encrypted under the room key before upload — the server stores opaque bytes. Accept this tradeoff before shipping to a general audience; Signal and iMessage do. |
 
 ## Core decisions (and why)
 
@@ -110,10 +113,17 @@ supabase/
     │                                          room_members, room_invites,
     │                                          blobs, device_link_handoffs
     │                                          + RLS + Realtime publication
-    └── 0002_device_approval_and_recovery.sql  device_approval_requests
-                                               (code-based device linking)
-                                               + recovery_blobs (phrase-
-                                               wrapped identity escrow)
+    ├── 0002_device_approval_and_recovery.sql  device_approval_requests
+    │                                          (code-based device linking)
+    │                                          + recovery_blobs (phrase-
+    │                                          wrapped identity escrow)
+    ├── 0003_room_name.sql                     encrypted room display names
+    ├── 0004_room_delete.sql                   rooms_creator_delete policy
+    ├── 0005_tighten_handoff_rls.sql           scopes device_link_handoffs
+    │                                          to inviting_user_id = auth.uid()
+    └── 0006_attachments_bucket.sql            room-attachments Storage
+                                               bucket + RLS for encrypted
+                                               image attachments
 ```
 
 ## Getting started
@@ -130,7 +140,7 @@ npm run dev                   # http://localhost:3000
 2. Settings → API → copy project URL and anon key into `.env.local`.
 3. Authentication → Providers → enable Email (leave password optional / unused).
 4. Authentication → URL Configuration → add `http://localhost:3000/auth/callback` to allowed redirect URLs.
-5. SQL Editor → paste `supabase/migrations/0001_init.sql` → Run. Then paste `supabase/migrations/0002_device_approval_and_recovery.sql` → Run.
+5. SQL Editor → paste every file in `supabase/migrations/` in numeric order and run each.
 6. Database → Replication → ensure Realtime is enabled for `blobs`, `room_invites`, `device_link_handoffs`, `room_members`, and `device_approval_requests` (the migrations attempt to do this automatically).
 
 ### Verification walkthrough
@@ -158,5 +168,5 @@ After signup:
 - **No server-side Ed25519 signature verification** — signatures are checked on read. A pgsodium trigger on `blobs.insert` could reject forged writes server-side too. Skipped to keep the prototype portable.
 - **Invite by user_id, not email** — inviting by email requires either an RPC function or an email column on `identities`. Left for V2 to choose.
 - **No message history beyond the current generation after rotation** — old blobs can still be decrypted by anyone who holds the old key (e.g. the removed member), but new members won't be able to read pre-rotation blobs. This is expected.
-- **No file/attachment encryption** — envelope-encrypt blobs in Supabase Storage using the room key; straightforward addition.
+- ~~**No file/attachment encryption**~~ — images are supported via `src/lib/e2ee-core/attachment.ts`: re-encoded to WebP client-side (EXIF auto-stripped by `createImageBitmap`), encrypted under the current room key with a distinct AD tag (`vibecheck:attachment:v1`) bound to `roomId + blobId + generation`, uploaded to the `room-attachments` Storage bucket. The outer `blobs` row carries only the small encrypted header (mime + dimensions + tiny blur placeholder). Streaming AEAD (`crypto_secretstream_*`) is the V2 upgrade if/when you add video or large files.
 - **Single-device crypto ops** — libsodium is WASM in-browser. If V2 adds native mobile, mirror the primitives with the platform's preferred library.

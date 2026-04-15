@@ -9,11 +9,14 @@ import {
   addRoomMember,
   createRoom,
   decodeBlobRow,
+  deleteAttachment,
+  downloadAttachment,
   fetchIdentity,
   getMyWrappedRoomKey,
   insertBlob,
   listDevices,
   subscribeBlobs,
+  uploadAttachment,
   type BlobRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
@@ -21,6 +24,7 @@ import {
   bytesEqual,
   CryptoError,
   decryptBlob,
+  decryptImageAttachment,
   encryptBlob,
   fromBase64,
   generateApprovalCode,
@@ -31,6 +35,7 @@ import {
   getSodium,
   hashApprovalCode,
   isPhraseValid,
+  prepareImageForUpload,
   randomBytes,
   signMessage,
   toBase64,
@@ -60,6 +65,7 @@ const CHECK_NAMES = [
   'Devices linked to this account',
   'Approval code hash round-trip',
   'Recovery phrase wrap + unwrap (local)',
+  'Image attachment roundtrip (encrypt → upload → download → decrypt)',
 ] as const;
 
 type CheckName = (typeof CHECK_NAMES)[number];
@@ -72,7 +78,12 @@ interface Context {
   lastBlobRow?: BlobRow;
 }
 
-const TEST_ROOM_TAG = '__status__';
+// Status-probe rooms are tagged at the DB level by setting `parent_room_id`
+// equal to the room's own `id`. This marker is:
+//   - durable (survives tab close, cache clear, new device),
+//   - unique (no real room should self-reference),
+//   - free (uses an existing nullable column),
+//   - and filterable client-side in `listMyRooms` so probes don't clutter the feed.
 
 export default function StatusPage() {
   const [checks, setChecks] = useState<Record<CheckName, CheckState>>(
@@ -380,6 +391,47 @@ export default function StatusPage() {
       };
     });
 
+    await runStep(CHECK_NAMES[14], async () => {
+      const syntheticFile = await buildSyntheticImage(200);
+      const probeBlobId = crypto.randomUUID();
+      try {
+        const { encryptedBytes, header } = await prepareImageForUpload({
+          file: syntheticFile,
+          roomKey: ctx.roomKey!,
+          roomId: ctx.roomId!,
+          blobId: probeBlobId,
+        });
+        await uploadAttachment({
+          roomId: ctx.roomId!,
+          blobId: probeBlobId,
+          encryptedBytes,
+        });
+        const downloaded = await downloadAttachment({
+          roomId: ctx.roomId!,
+          blobId: probeBlobId,
+        });
+        const plaintext = await decryptImageAttachment({
+          encryptedBytes: downloaded,
+          roomKey: ctx.roomKey!,
+          roomId: ctx.roomId!,
+          blobId: probeBlobId,
+          generation: ctx.roomKey!.generation,
+        });
+        // Re-decode the plaintext to confirm it's still a valid image after the roundtrip.
+        const reBlob = new Blob([plaintext.slice().buffer as ArrayBuffer], { type: header.mime });
+        const bitmap = await createImageBitmap(reBlob);
+        const dims = `${bitmap.width}x${bitmap.height}`;
+        bitmap.close();
+        return {
+          detail: `${header.mime} · ${dims} · ${header.byteLen}B ciphertext · placeholder ${header.placeholder.length}B data URL`,
+        };
+      } finally {
+        await deleteAttachment({ roomId: ctx.roomId!, blobId: probeBlobId }).catch(
+          () => undefined,
+        );
+      }
+    });
+
     finish(allOk);
 
     function finish(ok: boolean) {
@@ -431,42 +483,57 @@ export default function StatusPage() {
 /**
  * Find (or create) this user's solo test room for /status probes.
  *
- * We use `parent_room_id` to mark it in a single place via a deterministic
- * marker: a self-reference. Actually simpler — we list the user's rooms and
- * find one of kind 'group' created by self with exactly one member (self).
- * On first call we create one. Returns unwrapped room key.
+ * Strategy: look up ALL rooms the user created where `parent_room_id = id`
+ * (our self-reference marker for status probes). If any exist, keep the
+ * newest one and delete the rest — this cleans up orphans spawned by the
+ * previous sessionStorage-based implementation, which created a new room
+ * on every fresh tab. If none exist, create one and stamp it with the
+ * self-reference marker.
  */
 async function findOrCreateTestRoom(
   userId: string,
   identity: Identity,
 ): Promise<{ roomId: string; roomKey: RoomKey }> {
   const supabase = getSupabase();
-  // Look for an existing test room marked in our local state.
-  // We store the test room id in sessionStorage to avoid re-querying.
-  const cached = sessionStorage.getItem(TEST_ROOM_TAG);
-  if (cached) {
-    const { data: existingRoom, error } = await supabase
-      .from('rooms')
-      .select('*')
-      .eq('id', cached)
-      .maybeSingle<RoomRow>();
-    if (!error && existingRoom) {
-      const wrapped = await getMyWrappedRoomKey({
-        roomId: existingRoom.id,
-        userId,
-        generation: existingRoom.current_generation,
-      });
-      if (wrapped) {
-        const roomKey = await unwrapRoomKey(
-          { wrapped, generation: existingRoom.current_generation },
-          identity.x25519PublicKey,
-          identity.x25519PrivateKey,
-        );
-        return { roomId: existingRoom.id, roomKey };
-      }
+
+  const { data: candidates, error: listErr } = await supabase
+    .from('rooms')
+    .select('*')
+    .eq('created_by', userId)
+    .order('created_at', { ascending: false });
+  if (listErr) throw listErr;
+
+  const selfRef = (candidates ?? []).filter(
+    (r) => r.parent_room_id === r.id,
+  ) as RoomRow[];
+
+  if (selfRef.length > 0) {
+    const keep = selfRef[0];
+    // Delete any extra self-ref rooms the old bug left behind. Best-effort —
+    // ignore errors so a stuck one doesn't block health checks.
+    for (const extra of selfRef.slice(1)) {
+      await supabase.from('rooms').delete().eq('id', extra.id).then(
+        () => undefined,
+        (err) => console.warn('orphan status-room cleanup failed', err),
+      );
     }
+    const wrapped = await getMyWrappedRoomKey({
+      roomId: keep.id,
+      userId,
+      generation: keep.current_generation,
+    });
+    if (wrapped) {
+      const roomKey = await unwrapRoomKey(
+        { wrapped, generation: keep.current_generation },
+        identity.x25519PublicKey,
+        identity.x25519PrivateKey,
+      );
+      return { roomId: keep.id, roomKey };
+    }
+    // We own the row but lost access to its current-gen key — fall through
+    // and rebuild from scratch.
   }
-  // Create a new solo room.
+
   const room = await createRoom({ kind: 'group', createdBy: userId });
   const roomKey = await generateRoomKey(room.current_generation);
   const wrapped = await wrapRoomKeyFor(roomKey, identity.x25519PublicKey);
@@ -476,6 +543,42 @@ async function findOrCreateTestRoom(
     generation: room.current_generation,
     wrappedRoomKey: wrapped.wrapped,
   });
-  sessionStorage.setItem(TEST_ROOM_TAG, room.id);
+  // Stamp the self-reference marker. Uses the existing `rooms_member_update`
+  // policy — we just added ourselves as a current-gen member above.
+  const { error: updErr } = await supabase
+    .from('rooms')
+    .update({ parent_room_id: room.id })
+    .eq('id', room.id);
+  if (updErr) throw updErr;
   return { roomId: room.id, roomKey };
+}
+
+/**
+ * Paint a deterministic test pattern to a canvas and return a PNG File so
+ * the attachment round-trip doesn't depend on the user having any picker UI
+ * or real image available.
+ */
+async function buildSyntheticImage(size: number): Promise<File> {
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('2d canvas unavailable');
+  const gradient = ctx.createLinearGradient(0, 0, size, size);
+  gradient.addColorStop(0, '#6366f1');
+  gradient.addColorStop(1, '#ec4899');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.font = `${Math.round(size / 6)}px ui-sans-serif, system-ui`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('vibe', size / 2, size / 2);
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error('canvas.toBlob returned null'))),
+      'image/png',
+    );
+  });
+  return new File([blob], 'status-probe.png', { type: 'image/png' });
 }

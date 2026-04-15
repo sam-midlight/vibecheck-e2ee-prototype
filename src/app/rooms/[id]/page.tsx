@@ -9,14 +9,17 @@ import { getSupabase } from '@/lib/supabase/client';
 import {
   CryptoError,
   decryptBlob,
+  decryptImageAttachment,
   decryptRoomName,
   encryptBlob,
   encryptRoomName,
   fromBase64,
   getIdentity,
   observeContact,
+  prepareImageForUpload,
   rotateRoomKey,
   unwrapRoomKey,
+  type ImageAttachmentHeader,
   type Identity,
   type RoomKey,
 } from '@/lib/e2ee-core';
@@ -24,7 +27,9 @@ import {
   addRoomMember,
   bumpRoomGeneration,
   decodeBlobRow,
+  deleteAttachment,
   deleteRoom,
+  downloadAttachment,
   fetchIdentity,
   getMyWrappedRoomKey,
   insertBlob,
@@ -32,6 +37,7 @@ import {
   listRoomMembers,
   renameRoom,
   subscribeBlobs,
+  uploadAttachment,
   type BlobRow,
   type RoomMemberRow,
   type RoomRow,
@@ -271,7 +277,12 @@ function RoomInner({ roomId }: { roomId: string }) {
         onChange={() => void loadAll(userId, identity)}
       />
 
-      <BlobFeed blobs={blobs} selfUserId={userId} />
+      <BlobFeed
+        blobs={blobs}
+        selfUserId={userId}
+        roomId={roomId}
+        roomKey={roomKey}
+      />
 
       <Composer
         roomId={roomId}
@@ -471,7 +482,17 @@ function MemberList({
 
 // ---------------------------------------------------------------------------
 
-function BlobFeed({ blobs, selfUserId }: { blobs: DecodedBlob[]; selfUserId: string }) {
+function BlobFeed({
+  blobs,
+  selfUserId,
+  roomId,
+  roomKey,
+}: {
+  blobs: DecodedBlob[];
+  selfUserId: string;
+  roomId: string;
+  roomKey: RoomKey;
+}) {
   const [showSystem, setShowSystem] = useState(false);
   const sorted = useMemo(
     () => [...blobs].sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
@@ -508,29 +529,124 @@ function BlobFeed({ blobs, selfUserId }: { blobs: DecodedBlob[]; selfUserId: str
         <p className="text-sm text-neutral-500">no messages yet</p>
       )}
       <ul className="space-y-2">
-        {visible.map((b) => (
-          <li
-            key={b.id}
-            className={`rounded px-3 py-2 text-sm ${b.senderId === selfUserId ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900' : 'bg-neutral-100 dark:bg-neutral-900'}`}
-          >
-            <div className="mb-1 flex items-center justify-between gap-2 text-[10px] uppercase tracking-wide opacity-70">
-              <span>
-                {b.senderId === selfUserId ? 'you' : `${b.senderId.slice(0, 8)}…`}
-                {b.verified ? ' · ✓ signed' : ' · ✗ invalid'}
-              </span>
-              <span>{new Date(b.createdAt).toLocaleTimeString()}</span>
-            </div>
-            {b.verified ? (
-              <pre className="whitespace-pre-wrap break-words font-mono text-xs">
-                {safeStringify(b.payload)}
-              </pre>
-            ) : (
-              <p className="text-xs text-red-500">error: {b.error}</p>
-            )}
-          </li>
-        ))}
+        {visible.map((b) => {
+          const selfBubble =
+            b.senderId === selfUserId
+              ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900'
+              : 'bg-neutral-100 dark:bg-neutral-900';
+          const imageHeader = b.verified ? asImagePayload(b.payload) : null;
+          return (
+            <li key={b.id} className={`rounded px-3 py-2 text-sm ${selfBubble}`}>
+              <div className="mb-1 flex items-center justify-between gap-2 text-[10px] uppercase tracking-wide opacity-70">
+                <span>
+                  {b.senderId === selfUserId ? 'you' : `${b.senderId.slice(0, 8)}…`}
+                  {b.verified ? ' · ✓ signed' : ' · ✗ invalid'}
+                </span>
+                <span>{new Date(b.createdAt).toLocaleTimeString()}</span>
+              </div>
+              {!b.verified ? (
+                <p className="text-xs text-red-500">error: {b.error}</p>
+              ) : imageHeader ? (
+                <ImageAttachment
+                  roomId={roomId}
+                  blobId={b.id}
+                  header={imageHeader}
+                  roomKey={roomKey}
+                />
+              ) : (
+                <pre className="whitespace-pre-wrap break-words font-mono text-xs">
+                  {safeStringify(b.payload)}
+                </pre>
+              )}
+            </li>
+          );
+        })}
       </ul>
     </section>
+  );
+}
+
+/** Type-narrow a decoded blob payload to an image attachment header. */
+function asImagePayload(p: unknown): ImageAttachmentHeader | null {
+  if (typeof p !== 'object' || p === null) return null;
+  const obj = p as Record<string, unknown>;
+  if (obj.type !== 'image') return null;
+  if (typeof obj.mime !== 'string') return null;
+  if (typeof obj.w !== 'number' || typeof obj.h !== 'number') return null;
+  if (typeof obj.placeholder !== 'string') return null;
+  if (typeof obj.byteLen !== 'number') return null;
+  return obj as unknown as ImageAttachmentHeader;
+}
+
+function ImageAttachment({
+  roomId,
+  blobId,
+  header,
+  roomKey,
+}: {
+  roomId: string;
+  blobId: string;
+  header: ImageAttachmentHeader;
+  roomKey: RoomKey;
+}) {
+  const [fullUrl, setFullUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let createdUrl: string | null = null;
+    (async () => {
+      try {
+        const encrypted = await downloadAttachment({ roomId, blobId });
+        const plaintext = await decryptImageAttachment({
+          encryptedBytes: encrypted,
+          roomKey,
+          roomId,
+          blobId,
+          generation: roomKey.generation,
+        });
+        if (cancelled) return;
+        const blob = new Blob([plaintext.slice().buffer as ArrayBuffer], { type: header.mime });
+        createdUrl = URL.createObjectURL(blob);
+        setFullUrl(createdUrl);
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+    };
+    // Re-fetch only if the attachment identity changes. roomKey is stable per
+    // render thanks to the parent holding it in a ref; including it would
+    // retrigger spuriously on unrelated parent re-renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, blobId, header.mime]);
+
+  // Reserve layout space so the feed doesn't jump when the full image lands.
+  const aspect = header.w > 0 && header.h > 0 ? `${header.w} / ${header.h}` : '4 / 3';
+  const src = fullUrl ?? header.placeholder;
+
+  return (
+    <div
+      className="relative max-w-full overflow-hidden rounded"
+      style={{ aspectRatio: aspect, maxWidth: Math.min(header.w, 520) }}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={src}
+        alt=""
+        width={header.w}
+        height={header.h}
+        className={`h-full w-full object-cover transition ${fullUrl ? '' : 'scale-105 blur-lg'}`}
+      />
+      {error && (
+        <div className="absolute inset-x-0 bottom-0 bg-red-700/85 px-2 py-1 text-[10px] text-white">
+          failed to load image: {error}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -666,25 +782,80 @@ function Composer({
   onSent: (row: BlobRow) => void;
 }) {
   const [text, setText] = useState('');
+  const [pendingImage, setPendingImage] = useState<File | null>(null);
+  const [pendingImagePreview, setPendingImagePreview] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  async function send(e: React.FormEvent) {
-    e.preventDefault();
-    if (!text.trim()) return;
-    setBusy(true);
-    setError(null);
+  function choosePendingImage(file: File | null) {
+    if (pendingImagePreview) URL.revokeObjectURL(pendingImagePreview);
+    setPendingImage(file);
+    setPendingImagePreview(file ? URL.createObjectURL(file) : null);
+  }
+
+  useEffect(() => {
+    return () => {
+      if (pendingImagePreview) URL.revokeObjectURL(pendingImagePreview);
+    };
+  }, [pendingImagePreview]);
+
+  async function sendImage() {
+    if (!pendingImage) return;
+    const blobId = crypto.randomUUID();
+    let uploaded = false;
     try {
+      const { encryptedBytes, header } = await prepareImageForUpload({
+        file: pendingImage,
+        roomKey,
+        roomId,
+        blobId,
+      });
+      await uploadAttachment({ roomId, blobId, encryptedBytes });
+      uploaded = true;
       const blob = await encryptBlob({
-        payload: { text, ts: Date.now() },
+        payload: header,
         roomId,
         roomKey,
         senderEd25519PrivateKey: identity.ed25519PrivateKey,
       });
-      const row = await insertBlob({ roomId, senderId: userId, blob });
-      setText('');
-      // Render immediately; the realtime echo will dedupe (rows keyed by id).
+      const row = await insertBlob({ roomId, senderId: userId, blob, id: blobId });
+      choosePendingImage(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
       onSent(row);
+    } catch (e) {
+      // Roll back the storage object if the blobs-row insert failed after upload.
+      if (uploaded) {
+        await deleteAttachment({ roomId, blobId }).catch((err) => {
+          console.warn('rollback delete failed', errorMessage(err));
+        });
+      }
+      throw e;
+    }
+  }
+
+  async function sendText() {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const blob = await encryptBlob({
+      payload: { text: trimmed, ts: Date.now() },
+      roomId,
+      roomKey,
+      senderEd25519PrivateKey: identity.ed25519PrivateKey,
+    });
+    const row = await insertBlob({ roomId, senderId: userId, blob });
+    setText('');
+    onSent(row);
+  }
+
+  async function send(e: React.FormEvent) {
+    e.preventDefault();
+    if (!pendingImage && !text.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (pendingImage) await sendImage();
+      if (text.trim()) await sendText();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -693,21 +864,62 @@ function Composer({
   }
 
   return (
-    <form onSubmit={send} className="flex gap-2">
-      <input
-        type="text"
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder="type a message…"
-        className="flex-1 rounded border border-neutral-300 px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-900"
-      />
-      <button
-        type="submit"
-        disabled={busy}
-        className="rounded bg-neutral-900 px-4 py-2 text-sm text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
-      >
-        send
-      </button>
+    <form onSubmit={send} className="space-y-2">
+      {pendingImagePreview && pendingImage && (
+        <div className="flex items-center gap-3 rounded border border-neutral-300 bg-neutral-50 p-2 text-xs dark:border-neutral-700 dark:bg-neutral-950">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={pendingImagePreview}
+            alt=""
+            className="h-16 w-16 shrink-0 rounded object-cover"
+          />
+          <div className="min-w-0 flex-1">
+            <div className="truncate font-medium">{pendingImage.name}</div>
+            <div className="text-[11px] text-neutral-500">
+              {(pendingImage.size / 1024).toFixed(0)} KB · will be re-encoded + encrypted before upload
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => choosePendingImage(null)}
+            className="rounded border border-neutral-300 px-2 py-1 text-[11px] dark:border-neutral-700"
+          >
+            remove
+          </button>
+        </div>
+      )}
+      <div className="flex items-stretch gap-2">
+        <label
+          title="attach image"
+          className="flex cursor-pointer items-center rounded border border-neutral-300 px-3 text-sm hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-900"
+        >
+          📎
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0] ?? null;
+              choosePendingImage(f);
+            }}
+          />
+        </label>
+        <input
+          type="text"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder={pendingImage ? 'add a caption (optional)…' : 'type a message…'}
+          className="flex-1 rounded border border-neutral-300 px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-900"
+        />
+        <button
+          type="submit"
+          disabled={busy || (!pendingImage && !text.trim())}
+          className="rounded bg-neutral-900 px-4 py-2 text-sm text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+        >
+          {busy ? 'sending…' : 'send'}
+        </button>
+      </div>
       {error && <p className="text-xs text-red-600">{error}</p>}
     </form>
   );

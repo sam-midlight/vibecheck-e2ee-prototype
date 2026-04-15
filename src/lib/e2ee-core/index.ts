@@ -47,3 +47,4 @@ export * from './approval';
 export * from './recovery';
 export * from './storage';
 export * from './tofu';
+export * from './attachment';
