@@ -747,16 +747,53 @@ function ImageAttachment({
   );
 }
 
+// Supabase Realtime tenants on free tier sleep when idle and cold-start on the
+// next subscribe. That handshake can flash CHANNEL_ERROR / TIMED_OUT for a few
+// seconds before flipping to SUBSCRIBED. Showing the raw amber "channel_error"
+// immediately makes the app look broken when it's actually just waking up, so
+// we hold a neutral "connecting…" state for the first GRACE_MS and only
+// escalate to the amber warning if the channel is still unhealthy after that.
+const REALTIME_WARNING_GRACE_MS = 5000;
+
 function RealtimeBadge({ status }: { status: string }) {
-  const live = status === 'SUBSCRIBED';
-  const color = live
-    ? 'text-emerald-600 dark:text-emerald-400'
-    : 'text-amber-600 dark:text-amber-400';
-  const dot = live ? '●' : '○';
-  const label = live ? 'live' : status.toLowerCase();
+  const [pastGrace, setPastGrace] = useState(false);
+
+  useEffect(() => {
+    if (status === 'SUBSCRIBED') {
+      setPastGrace(false);
+      return;
+    }
+    setPastGrace(false);
+    const t = setTimeout(() => setPastGrace(true), REALTIME_WARNING_GRACE_MS);
+    return () => clearTimeout(t);
+  }, [status]);
+
+  if (status === 'SUBSCRIBED') {
+    return (
+      <span
+        className="text-emerald-600 dark:text-emerald-400"
+        title="realtime channel: SUBSCRIBED"
+      >
+        ● live
+      </span>
+    );
+  }
+  if (!pastGrace) {
+    return (
+      <span
+        className="text-neutral-500"
+        title={`realtime channel: ${status} (waking up — free-tier tenants cold-start on first subscribe)`}
+      >
+        ○ connecting…
+      </span>
+    );
+  }
   return (
-    <span className={color} title={`realtime channel: ${status}`}>
-      {dot} {label}
+    <span
+      className="text-amber-600 dark:text-amber-400"
+      title={`realtime channel: ${status}`}
+    >
+      ○ {status.toLowerCase()}
     </span>
   );
 }
