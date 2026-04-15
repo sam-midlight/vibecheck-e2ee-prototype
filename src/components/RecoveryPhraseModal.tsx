@@ -151,6 +151,10 @@ function DisplayStage({ phrase, onContinue }: { phrase: string; onContinue: () =
     }
   }
 
+  function handleSavePdf() {
+    printPhrase(words);
+  }
+
   return (
     <div className="space-y-4">
       <h2 className="text-lg font-semibold">Your 24-word recovery phrase</h2>
@@ -166,7 +170,7 @@ function DisplayStage({ phrase, onContinue }: { phrase: string; onContinue: () =
           </li>
         ))}
       </ol>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
           onClick={() => void handleCopy()}
@@ -174,8 +178,15 @@ function DisplayStage({ phrase, onContinue }: { phrase: string; onContinue: () =
         >
           {copied ? 'copied ✓' : 'copy phrase'}
         </button>
+        <button
+          type="button"
+          onClick={handleSavePdf}
+          className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
+        >
+          save as PDF
+        </button>
         <span className="text-xs text-neutral-500">
-          Space-separated, ready to paste into recovery.
+          In the print dialog, pick &ldquo;Save as PDF&rdquo; as the destination.
         </span>
       </div>
       <label className="flex items-start gap-2 text-sm">
@@ -198,6 +209,111 @@ function DisplayStage({ phrase, onContinue }: { phrase: string; onContinue: () =
       </div>
     </div>
   );
+}
+
+/**
+ * Render the phrase into a hidden iframe and trigger the browser's print
+ * dialog. The user picks "Save as PDF" (or a real printer) as the destination.
+ * Staying in an iframe rather than a new window avoids popup-blocker prompts
+ * and keeps the modal open in the background.
+ */
+function printPhrase(words: string[]) {
+  const wordListHtml = words
+    .map(
+      (w, i) =>
+        `<li><span class="n">${i + 1}.</span><span class="w">${escapeHtml(w)}</span></li>`,
+    )
+    .join('');
+  const generatedAt = new Date().toLocaleString();
+
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Recovery phrase</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #111; margin: 0; padding: 2rem; }
+  h1 { font-size: 20pt; margin: 0 0 0.25rem; }
+  .sub { font-size: 9pt; color: #666; margin-bottom: 1.5rem; }
+  .warn { border: 1px solid #c00; background: #fff5f5; padding: 0.75rem 1rem; font-size: 10pt; margin-bottom: 1.5rem; border-radius: 4px; }
+  ol { list-style: none; padding: 0; margin: 0 0 1.5rem; display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.35rem 1.5rem; border: 1px solid #999; padding: 1rem; border-radius: 4px; }
+  ol li { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12pt; }
+  ol .n { display: inline-block; width: 2.2rem; color: #888; }
+  ol .w { font-weight: 600; }
+  .meta { font-size: 9pt; color: #666; border-top: 1px solid #ccc; padding-top: 0.75rem; }
+  .meta div { margin: 0.25rem 0; }
+  .meta .fillable { display: inline-block; min-width: 12rem; border-bottom: 1px solid #888; height: 1em; }
+  @media print { body { padding: 1.25rem; } }
+</style>
+</head>
+<body>
+  <h1>VibeCheck — Recovery phrase</h1>
+  <div class="sub">Generated ${escapeHtml(generatedAt)}</div>
+  <div class="warn">
+    <strong>Treat this page like cash.</strong> Anyone who has these 24 words and your email can sign in as you. Store it offline. Do not photograph, email, or upload. If lost, nobody can help you get back in.
+  </div>
+  <ol>${wordListHtml}</ol>
+  <div class="meta">
+    <div>Account email: <span class="fillable"></span></div>
+    <div>Stored at: <span class="fillable"></span></div>
+    <div>Date written: <span class="fillable"></span></div>
+  </div>
+</body>
+</html>`;
+
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute('aria-hidden', 'true');
+  iframe.style.position = 'fixed';
+  iframe.style.right = '0';
+  iframe.style.bottom = '0';
+  iframe.style.width = '0';
+  iframe.style.height = '0';
+  iframe.style.border = '0';
+  document.body.appendChild(iframe);
+
+  const doc = iframe.contentDocument;
+  if (!doc) {
+    iframe.remove();
+    return;
+  }
+  doc.open();
+  doc.write(html);
+  doc.close();
+
+  // Wait for the iframe to finish parsing before printing; some browsers
+  // (notably Safari) print a blank page otherwise.
+  const fire = () => {
+    iframe.contentWindow?.focus();
+    iframe.contentWindow?.print();
+    // The print dialog is modal; once it closes we can tear the iframe down.
+    // Give it a generous delay — canceling a dialog on mobile can take a beat.
+    setTimeout(() => iframe.remove(), 2000);
+  };
+  if (iframe.contentDocument?.readyState === 'complete') {
+    fire();
+  } else {
+    iframe.addEventListener('load', fire, { once: true });
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => {
+    switch (c) {
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      case "'":
+        return '&#39;';
+      default:
+        return c;
+    }
+  });
 }
 
 function VerifyStage({
