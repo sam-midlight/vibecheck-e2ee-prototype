@@ -7,6 +7,7 @@ import { RecoveryPhraseEntry } from '@/components/RecoveryPhraseEntry';
 import { getSupabase } from '@/lib/supabase/client';
 import {
   buildLinkPayload,
+  clearIdentity,
   generateApprovalCode,
   generateApprovalSalt,
   generateIdentity,
@@ -27,6 +28,7 @@ import {
   fetchIdentity,
   fetchLinkHandoff,
   hasRecoveryBlob,
+  nukeIdentityServer,
   publishIdentity,
   registerDevice,
   subscribeLinkHandoff,
@@ -42,6 +44,8 @@ type Step =
   | 'device-linking-chooser'
   | 'awaiting-approval'
   | 'entering-recovery'
+  | 'confirm-nuclear'
+  | 'nuking'
   | 'done'
   | 'error';
 
@@ -153,6 +157,31 @@ export default function AuthCallbackPage() {
     [router],
   );
 
+  const handleNuclearConfirmed = useCallback(async () => {
+    if (!userId) return;
+    setStep('nuking');
+    setError(null);
+    try {
+      // Wipe any stale local state first (TOFU cache, orphan device record).
+      await clearIdentity(userId);
+      // Server-side: leave rooms, cancel invites/approvals, drop devices + recovery blob.
+      await nukeIdentityServer(userId);
+      // Fresh identity.
+      const fresh = await generateIdentity();
+      await putIdentity(userId, fresh);
+      await publishIdentity(userId, await toPublicIdentity(fresh));
+      await ensureDeviceRegistered(userId, fresh);
+      // Clear the "I dismissed the recovery prompt" flag so it offers again —
+      // they just learned what losing it means.
+      localStorage.removeItem(`recovery_skipped_${userId}`);
+      setIdentity(fresh);
+      setStep('offer-recovery-setup');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setStep('error');
+    }
+  }, [userId]);
+
   return (
     <main className="mx-auto max-w-xl p-8">
       <h1 className="text-xl font-semibold">Signing you in…</h1>
@@ -194,7 +223,24 @@ export default function AuthCallbackPage() {
           recoveryBlobExists={recoveryBlobExists}
           onChooseApproval={() => setStep('awaiting-approval')}
           onChooseRecovery={() => setStep('entering-recovery')}
+          onChooseNuclear={() => setStep('confirm-nuclear')}
         />
+      )}
+
+      {step === 'confirm-nuclear' && userId && (
+        <NuclearConfirm
+          onConfirm={() => void handleNuclearConfirmed()}
+          onBack={() => setStep('device-linking-chooser')}
+        />
+      )}
+
+      {step === 'nuking' && (
+        <div className="mt-6 rounded-md border border-red-300 bg-red-50 p-4 text-sm dark:border-red-800 dark:bg-red-950">
+          <p className="font-medium">Resetting your identity…</p>
+          <p className="mt-1 text-xs text-neutral-600 dark:text-neutral-400">
+            Leaving rooms, revoking devices, generating new keys.
+          </p>
+        </div>
       )}
 
       {step === 'awaiting-approval' && userId && (
@@ -228,11 +274,13 @@ function LinkingChooser({
   recoveryBlobExists,
   onChooseApproval,
   onChooseRecovery,
+  onChooseNuclear,
 }: {
   userId: string;
   recoveryBlobExists: boolean;
   onChooseApproval: () => void;
   onChooseRecovery: () => void;
+  onChooseNuclear: () => void;
 }) {
   return (
     <div className="mt-6 space-y-4 rounded-md border border-amber-300 bg-amber-50 p-4 text-sm dark:border-amber-800 dark:bg-amber-950">
@@ -269,6 +317,125 @@ function LinkingChooser({
             enter phrase →
           </button>
         </div>
+      </div>
+
+      <div className="mt-4 border-t border-amber-300 pt-3 dark:border-amber-800">
+        <p className="text-xs text-neutral-600 dark:text-neutral-400">
+          Locked out for good? Neither of the above will work if you have no
+          other signed-in device <em>and</em> no recovery phrase.
+        </p>
+        <button
+          onClick={onChooseNuclear}
+          className="mt-2 text-xs font-medium text-red-700 underline underline-offset-2 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300"
+        >
+          Reset identity (start over) →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function NuclearConfirm({
+  onConfirm,
+  onBack,
+}: {
+  onConfirm: () => void;
+  onBack: () => void;
+}) {
+  const CONFIRM_PHRASE = 'RESET MY IDENTITY';
+  const [typed, setTyped] = useState('');
+  const [acknowledged, setAcknowledged] = useState(false);
+  const ready = typed === CONFIRM_PHRASE && acknowledged;
+
+  return (
+    <div className="mt-6 space-y-4 rounded-md border-2 border-red-400 bg-red-50 p-4 text-sm dark:border-red-700 dark:bg-red-950">
+      <div className="flex items-start gap-2">
+        <span aria-hidden className="text-xl leading-none">⚠</span>
+        <div>
+          <p className="font-semibold text-red-900 dark:text-red-100">
+            Nuclear option: reset your encryption identity
+          </p>
+          <p className="mt-1 text-xs text-red-800 dark:text-red-200">
+            This is irreversible. Read carefully before continuing.
+          </p>
+        </div>
+      </div>
+
+      <div className="rounded bg-white p-3 text-xs dark:bg-neutral-900">
+        <p className="font-medium">What will be destroyed</p>
+        <ul className="mt-1 list-disc space-y-0.5 pl-5 text-neutral-700 dark:text-neutral-300">
+          <li>
+            Your old encryption keys (gone forever). Every encrypted message
+            you ever received will become permanently unreadable to you.
+          </li>
+          <li>Your membership in every room you were in.</li>
+          <li>All invites currently waiting for you.</li>
+          <li>Your recovery phrase (if any) will no longer work.</li>
+          <li>Every device registered to you is revoked.</li>
+        </ul>
+      </div>
+
+      <div className="rounded bg-white p-3 text-xs dark:bg-neutral-900">
+        <p className="font-medium">What your contacts will see</p>
+        <p className="mt-1 text-neutral-700 dark:text-neutral-300">
+          A red &ldquo;key changed&rdquo; banner next to your name — identical
+          to what they&apos;d see if an attacker stole your account. They must
+          re-trust you out of band (ask you in person / on another channel
+          that this was really you) and re-invite you to any shared rooms.
+        </p>
+      </div>
+
+      <div className="rounded bg-white p-3 text-xs dark:bg-neutral-900">
+        <p className="font-medium">What you keep</p>
+        <p className="mt-1 text-neutral-700 dark:text-neutral-300">
+          Your login (magic link to your email still works), your user ID, and
+          your email address. You just get new encryption keys and an empty
+          rooms list.
+        </p>
+      </div>
+
+      <label className="flex items-start gap-2 text-xs text-neutral-800 dark:text-neutral-200">
+        <input
+          type="checkbox"
+          checked={acknowledged}
+          onChange={(e) => setAcknowledged(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          I understand that past encrypted messages will be permanently
+          unreadable to me, and my contacts will see a security warning next
+          to my name.
+        </span>
+      </label>
+
+      <div>
+        <label className="block text-xs text-neutral-800 dark:text-neutral-200">
+          Type <code className="rounded bg-neutral-200 px-1 font-mono dark:bg-neutral-800">{CONFIRM_PHRASE}</code> to continue:
+        </label>
+        <input
+          type="text"
+          value={typed}
+          onChange={(e) => setTyped(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+          className="mt-1 w-full rounded border border-neutral-300 bg-white px-2 py-1 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-900"
+        />
+      </div>
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={onBack}
+          className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
+        >
+          back
+        </button>
+        <button
+          onClick={onConfirm}
+          disabled={!ready}
+          className="rounded bg-red-700 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40 hover:bg-red-800"
+        >
+          Reset identity now
+        </button>
       </div>
     </div>
   );
@@ -432,6 +599,8 @@ const POST_REGISTRATION_BRANCHES: Step[] = [
   'device-linking-chooser',
   'awaiting-approval',
   'entering-recovery',
+  'confirm-nuclear',
+  'nuking',
 ];
 
 function after(step: Step, current: Step): boolean {

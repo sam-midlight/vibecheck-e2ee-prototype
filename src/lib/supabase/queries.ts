@@ -622,3 +622,38 @@ export async function deleteRecoveryBlob(userId: string): Promise<void> {
     .eq('user_id', userId);
   if (error) throw error;
 }
+
+// ---------------------------------------------------------------------------
+// nuclear reset
+// ---------------------------------------------------------------------------
+
+/**
+ * Destroy everything linking the current E2EE identity to this user account,
+ * so a brand-new identity can take its place.
+ *
+ * Irreversible. Leaves the `auth.users` row and the `identities` row alone —
+ * the caller overwrites `identities` by upserting fresh keys right after.
+ * Blobs in rooms we were in stay in the DB as ciphertext nobody on the client
+ * can decrypt anymore; they are append-only and there's no policy to delete
+ * them, which is the intended trust model.
+ */
+export async function nukeIdentityServer(userId: string): Promise<void> {
+  const supabase = getSupabase();
+
+  const steps: Array<[label: string, column: string, table: string]> = [
+    ['room_members', 'user_id', 'room_members'],
+    ['room_invites', 'invited_user_id', 'room_invites'],
+    ['device_approval_requests', 'user_id', 'device_approval_requests'],
+    ['devices', 'user_id', 'devices'],
+    ['recovery_blobs', 'user_id', 'recovery_blobs'],
+  ];
+
+  for (const [label, column, table] of steps) {
+    const { error } = await supabase.from(table).delete().eq(column, userId);
+    if (error) {
+      throw new Error(
+        `nuclear reset failed at ${label}: ${errorMessage(error)}`,
+      );
+    }
+  }
+}
