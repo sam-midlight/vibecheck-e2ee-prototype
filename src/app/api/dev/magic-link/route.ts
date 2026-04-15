@@ -1,13 +1,17 @@
 /**
- * TEMP DEV SHORTCUT — do not ship.
+ * ⚠ TEMP OPEN SIGN-IN — KNOWN VULNERABILITY, INTENTIONAL ⚠
  *
  * Generates a Supabase magic-link URL server-side using the service-role key
- * and returns it to the client, instead of emailing it. Lets us click-through
- * the sign-in flow without waiting for SMTP.
+ * and returns it to any caller. There is NO rate-limit, auth, or env gate on
+ * this route. Anyone who can reach this URL can mint a sign-in link for ANY
+ * email address and take over that account.
  *
- * Guarded to `NODE_ENV !== 'production'` so this can't accidentally go live.
- * Requires `SUPABASE_SERVICE_ROLE_KEY` in .env.local (never exposed to the
- * client — it only exists in the server-side bundle).
+ * This is in place so friends can test the prototype without the real email
+ * flow being set up. Before any real-audience deploy: delete this route +
+ * revert MagicLinkForm to `supabase.auth.signInWithOtp`.
+ *
+ * Requires `SUPABASE_SERVICE_ROLE_KEY` in the env (server-only, never bundled
+ * to the client).
  */
 import { createClient } from '@supabase/supabase-js';
 import { NextResponse } from 'next/server';
@@ -15,12 +19,6 @@ import { NextResponse } from 'next/server';
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: Request) {
-  if (process.env.NODE_ENV === 'production') {
-    return NextResponse.json(
-      { error: 'dev-only endpoint' },
-      { status: 404 },
-    );
-  }
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
