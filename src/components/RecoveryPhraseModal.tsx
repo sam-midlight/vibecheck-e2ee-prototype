@@ -16,14 +16,14 @@ import {
   encodeRecoveryBlob,
   generateRecoveryPhrase,
   splitPhrase,
-  wrapIdentityWithPhrase,
-  type Identity,
+  wrapUserMasterKeyWithPhrase,
+  type UserMasterKey,
 } from '@/lib/e2ee-core';
 import { putRecoveryBlob } from '@/lib/supabase/queries';
 
 interface Props {
   userId: string;
-  identity: Identity;
+  umk: UserMasterKey;
   onDone: (result: 'saved' | 'skipped') => void;
   /** If true, no "skip" button — used when rotating (must commit or cancel the rotate). */
   hideSkip?: boolean;
@@ -31,7 +31,7 @@ interface Props {
 
 type Stage = 'intro' | 'display' | 'verify' | 'uploading' | 'error';
 
-export function RecoveryPhraseModal({ userId, identity, onDone, hideSkip }: Props) {
+export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip }: Props) {
   const [stage, setStage] = useState<Stage>('intro');
   const [phrase, setPhrase] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,7 +46,7 @@ export function RecoveryPhraseModal({ userId, identity, onDone, hideSkip }: Prop
     setStage('uploading');
     setError(null);
     try {
-      const blob = await wrapIdentityWithPhrase(identity, phrase, userId);
+      const blob = await wrapUserMasterKeyWithPhrase(umk, phrase, userId);
       const encoded = await encodeRecoveryBlob(blob);
       await putRecoveryBlob({ userId, ...encoded });
       onDone('saved');

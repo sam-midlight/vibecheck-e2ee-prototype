@@ -14,24 +14,28 @@ import {
   encryptBlob,
   encryptRoomName,
   fromBase64,
-  getIdentity,
   observeContact,
   prepareImageForUpload,
   rotateRoomKey,
+  signMembershipWrap,
   unwrapRoomKey,
+  verifyMembershipWrap,
+  verifyPublicDevice,
+  wrapRoomKeyFor,
+  type DeviceKeyBundle,
   type ImageAttachmentHeader,
-  type Identity,
+  type PublicDevice,
   type RoomKey,
 } from '@/lib/e2ee-core';
 import {
-  addRoomMember,
-  bumpRoomGeneration,
   decodeBlobRow,
   deleteAttachment,
   deleteRoom,
   downloadAttachment,
-  fetchIdentity,
+  fetchPublicDevices,
+  fetchUserMasterKeyPub,
   insertBlob,
+  kickAndRotate,
   listBlobs,
   listMyRoomKeyRows,
   listRoomMembers,
@@ -42,6 +46,7 @@ import {
   type RoomMemberRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
+import { loadEnrolledDevice } from '@/lib/bootstrap';
 
 interface DecodedBlob {
   id: string;
@@ -69,7 +74,7 @@ export default function RoomDetailPage({
 function RoomInner({ roomId }: { roomId: string }) {
   const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
-  const [identity, setIdentity] = useState<Identity | null>(null);
+  const [device, setDevice] = useState<DeviceKeyBundle | null>(null);
   const [room, setRoom] = useState<RoomRow | null>(null);
   const [roomKey, setRoomKey] = useState<RoomKey | null>(null);
   const [roomKeysByGen, setRoomKeysByGen] = useState<Map<number, RoomKey>>(
@@ -86,7 +91,7 @@ function RoomInner({ roomId }: { roomId: string }) {
   const roomKeysByGenRef = useRef<Map<number, RoomKey>>(new Map());
 
   const loadAll = useCallback(
-    async (uid: string, id: Identity) => {
+    async (uid: string, dev: DeviceKeyBundle) => {
       const supabase = getSupabase();
       const { data: roomRow, error: roomErr } = await supabase
         .from('rooms')
@@ -98,18 +103,16 @@ function RoomInner({ roomId }: { roomId: string }) {
       }
       setRoom(roomRow);
 
-      // Unwrap every generation the viewer is a member of. The current-gen
-      // key is used for sending + rename; the full map lets us decrypt old
-      // blobs after a key rotation.
-      const myRows = await listMyRoomKeyRows(roomId, uid);
+      // Unwrap every generation this DEVICE is a member of.
+      const myRows = await listMyRoomKeyRows(roomId, dev.deviceId);
       const byGen = new Map<number, RoomKey>();
       for (const r of myRows) {
         try {
           const wrapped = await fromBase64(r.wrapped_room_key);
           const rk = await unwrapRoomKey(
             { wrapped, generation: r.generation },
-            id.x25519PublicKey,
-            id.x25519PrivateKey,
+            dev.x25519PublicKey,
+            dev.x25519PrivateKey,
           );
           byGen.set(r.generation, rk);
         } catch (err) {
@@ -122,7 +125,7 @@ function RoomInner({ roomId }: { roomId: string }) {
       const current = byGen.get(roomRow.current_generation);
       if (!current) {
         throw new Error(
-          'you are not a current-generation member of this room (may need to be re-invited)',
+          'this device is not a current-generation member (may need re-invite or rewrap from another of your devices)',
         );
       }
       setRoomKey(current);
@@ -152,7 +155,7 @@ function RoomInner({ roomId }: { roomId: string }) {
 
       const rows = await listBlobs(roomId);
       const decoded = await Promise.all(
-        rows.map((row) => decodeAndVerify(row, byGen, id, uid)),
+        rows.map((row) => decodeAndVerify(row, byGen, uid)),
       );
       setBlobs(decoded);
     },
@@ -166,10 +169,10 @@ function RoomInner({ roomId }: { roomId: string }) {
         const { data } = await supabase.auth.getUser();
         if (!data.user) return;
         setUserId(data.user.id);
-        const id = await getIdentity(data.user.id);
-        if (!id) throw new Error('no local identity');
-        setIdentity(id);
-        await loadAll(data.user.id, id);
+        const enrolled = await loadEnrolledDevice(data.user.id);
+        if (!enrolled) throw new Error('no device bundle on this browser — re-link first');
+        setDevice(enrolled.deviceBundle);
+        await loadAll(data.user.id, enrolled.deviceBundle);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -181,19 +184,18 @@ function RoomInner({ roomId }: { roomId: string }) {
   const ingestBlobRow = useCallback(
     async (row: BlobRow) => {
       const byGen = roomKeysByGenRef.current;
-      if (byGen.size === 0 || !identity || !userId) return;
-      const decoded = await decodeAndVerify(row, byGen, identity, userId);
+      if (byGen.size === 0 || !device || !userId) return;
+      const decoded = await decodeAndVerify(row, byGen, userId);
       setBlobs((prev) => {
         if (prev.some((b) => b.id === decoded.id)) return prev;
         return [...prev, decoded];
       });
     },
-    [identity, userId],
+    [device, userId],
   );
 
-  // Subscribe to realtime blobs for this room.
   useEffect(() => {
-    if (!identity || !userId) return;
+    if (!device || !userId) return;
     const unsub = subscribeBlobs(
       roomId,
       (row) => {
@@ -202,7 +204,7 @@ function RoomInner({ roomId }: { roomId: string }) {
       (status) => setRtStatus(status),
     );
     return unsub;
-  }, [roomId, identity, userId, ingestBlobRow]);
+  }, [roomId, device, userId, ingestBlobRow]);
 
   if (loading) return <p className="text-sm text-neutral-500">loading…</p>;
   if (error) {
@@ -212,7 +214,7 @@ function RoomInner({ roomId }: { roomId: string }) {
       </div>
     );
   }
-  if (!room || !identity || !userId || !roomKey) return null;
+  if (!room || !device || !userId || !roomKey) return null;
 
   return (
     <div className="mx-auto max-w-2xl space-y-4">
@@ -281,8 +283,7 @@ function RoomInner({ roomId }: { roomId: string }) {
           onSaved={(newName) => {
             setRoomName(newName);
             setRenameOpen(false);
-            // Also refresh the room row so name_ciphertext is current in state.
-            void loadAll(userId, identity);
+            void loadAll(userId, device);
           }}
         />
       )}
@@ -291,9 +292,9 @@ function RoomInner({ roomId }: { roomId: string }) {
         room={room}
         members={members.filter((m) => m.generation === room.current_generation)}
         selfUserId={userId}
-        identity={identity}
+        device={device}
         roomKey={roomKey}
-        onChange={() => void loadAll(userId, identity)}
+        onChange={() => void loadAll(userId, device)}
         onLeft={() => router.replace('/rooms')}
       />
 
@@ -307,7 +308,7 @@ function RoomInner({ roomId }: { roomId: string }) {
       <Composer
         roomId={roomId}
         userId={userId}
-        identity={identity}
+        device={device}
         roomKey={roomKey}
         onSent={ingestBlobRow}
       />
@@ -317,12 +318,59 @@ function RoomInner({ roomId }: { roomId: string }) {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolver cache: (userId, deviceId) -> verified device's ed25519 pub.
+ * Built lazily as we decrypt blobs. Device certs are verified against the
+ * user's UMK once per session; revoked/unverifiable devices are skipped.
+ */
+const deviceKeyCache: Map<string, Uint8Array | null> = new Map();
+function cacheKey(userId: string, deviceId: string) {
+  return `${userId}:${deviceId}`;
+}
+
+async function resolveSenderDeviceEd(
+  userId: string,
+  deviceId: string,
+): Promise<Uint8Array | null> {
+  const k = cacheKey(userId, deviceId);
+  if (deviceKeyCache.has(k)) return deviceKeyCache.get(k) ?? null;
+  const umk = await fetchUserMasterKeyPub(userId);
+  if (!umk) {
+    deviceKeyCache.set(k, null);
+    return null;
+  }
+  const devices = await fetchPublicDevices(userId);
+  const dev = devices.find((d) => d.deviceId === deviceId);
+  if (!dev) {
+    deviceKeyCache.set(k, null);
+    return null;
+  }
+  try {
+    await verifyPublicDevice(dev, umk.ed25519PublicKey);
+  } catch {
+    deviceKeyCache.set(k, null);
+    return null;
+  }
+  // TOFU the UMK pub for this user.
+  try {
+    await observeContact(userId, {
+      ed25519PublicKey: umk.ed25519PublicKey,
+      x25519PublicKey: dev.x25519PublicKey,
+      selfSignature: new Uint8Array(0),
+    });
+  } catch (err) {
+    console.error('observeContact failed for', userId, errorMessage(err));
+  }
+  deviceKeyCache.set(k, dev.ed25519PublicKey);
+  return dev.ed25519PublicKey;
+}
+
 async function decodeAndVerify(
   row: BlobRow,
   roomKeysByGen: Map<number, RoomKey>,
-  viewerIdentity: Identity,
   viewerUserId: string,
 ): Promise<DecodedBlob> {
+  void viewerUserId;
   try {
     const blob = await decodeBlobRow(row);
     const rk = roomKeysByGen.get(blob.generation);
@@ -337,33 +385,18 @@ async function decodeAndVerify(
         error: `no key for generation ${blob.generation} (you weren't a member at that time)`,
       };
     }
-    // Need the sender's ed25519_pub. Fetch if not us.
-    let senderEd: Uint8Array;
-    if (row.sender_id === viewerUserId) {
-      senderEd = viewerIdentity.ed25519PublicKey;
-    } else {
-      const pub = await fetchIdentity(row.sender_id);
-      if (!pub) throw new Error('sender has no published identity');
-      // TOFU is best-effort: a key-change banner shouldn't fail the decode.
-      try {
-        await observeContact(row.sender_id, pub);
-      } catch (err) {
-        console.error('observeContact failed for', row.sender_id, errorMessage(err));
-      }
-      senderEd = pub.ed25519PublicKey;
-    }
-    const payload = await decryptBlob<unknown>({
+    const decoded = await decryptBlob<unknown>({
       blob,
       roomId: row.room_id,
       roomKey: rk,
-      senderEd25519PublicKey: senderEd,
+      resolveSenderDeviceEd25519Pub: resolveSenderDeviceEd,
     });
     return {
       id: row.id,
-      senderId: row.sender_id,
+      senderId: decoded.senderUserId ?? row.sender_id,
       createdAt: row.created_at,
       generation: blob.generation,
-      payload,
+      payload: decoded.payload,
       verified: true,
     };
   } catch (e) {
@@ -386,7 +419,7 @@ function MemberList({
   room,
   members,
   selfUserId,
-  identity,
+  device,
   roomKey,
   onChange,
   onLeft,
@@ -394,7 +427,7 @@ function MemberList({
   room: RoomRow;
   members: RoomMemberRow[];
   selfUserId: string;
-  identity: Identity;
+  device: DeviceKeyBundle;
   roomKey: RoomKey;
   onChange: () => void;
   onLeft: () => void;
@@ -404,76 +437,142 @@ function MemberList({
   const isAdmin = room.created_by === selfUserId;
 
   /**
-   * Rotate the room key for `keepUserIds`, re-encrypt the room name under
-   * the new key, bump the generation pointer, and delete every row for
-   * `removeUserIds` across all generations. Shared between the admin
-   * "kick" path and the self-service "leave" path.
+   * Rotate the room key for all keepers' devices, sign each wrap with our
+   * device's ed25519 priv, call the atomic RPC.
    */
   async function rotateAndRemove(params: {
-    keep: RoomMemberRow[];
+    keeperMembers: RoomMemberRow[];
     removeUserIds: string[];
   }) {
-    const supabase = getSupabase();
-    const { keep, removeUserIds } = params;
+    const { keeperMembers, removeUserIds } = params;
 
-    if (keep.length > 0) {
-      const keepPubs = await Promise.all(
-        keep.map(async (m) => {
-          if (m.user_id === selfUserId) {
-            return { userId: m.user_id, x25519Pub: identity.x25519PublicKey };
-          }
-          const pub = await fetchIdentity(m.user_id);
-          if (!pub) throw new Error(`no identity for ${m.user_id}`);
-          await observeContact(m.user_id, pub);
-          return { userId: m.user_id, x25519Pub: pub.x25519PublicKey };
-        }),
-      );
-      const { next, wraps } = await rotateRoomKey(
-        roomKey.generation,
-        keepPubs.map((k) => k.x25519Pub),
-      );
-      for (let i = 0; i < keepPubs.length; i++) {
-        await addRoomMember({
-          roomId: room.id,
-          userId: keepPubs[i].userId,
-          generation: next.generation,
-          wrappedRoomKey: wraps[i].wrapped,
+    const keeperUserIds = Array.from(new Set(keeperMembers.map((m) => m.user_id)));
+
+    if (keeperUserIds.length === 0) {
+      // Solo departing from what would become an empty room; clear self row.
+      const supabase = getSupabase();
+      for (const uid of removeUserIds) {
+        await supabase
+          .from('room_members')
+          .delete()
+          .eq('room_id', room.id)
+          .eq('user_id', uid);
+      }
+      return;
+    }
+
+    // For each keeper user, verify UMK + pull the active device list.
+    // Each device of a keeper gets its own wrap row at new gen.
+    type Target = { userId: string; device: PublicDevice };
+    const targets: Target[] = [];
+    for (const uid of keeperUserIds) {
+      if (uid === selfUserId) {
+        targets.push({
+          userId: uid,
+          device: {
+            userId: uid,
+            deviceId: device.deviceId,
+            ed25519PublicKey: device.ed25519PublicKey,
+            x25519PublicKey: device.x25519PublicKey,
+            createdAtMs: 0,
+            issuanceSignature: new Uint8Array(0),
+            revocation: null,
+          },
         });
+        continue;
       }
-      if (room.name_ciphertext && room.name_nonce) {
+      const umk = await fetchUserMasterKeyPub(uid);
+      if (!umk) throw new Error(`no published UMK for keeper ${uid.slice(0, 8)}`);
+      const devices = await fetchPublicDevices(uid);
+      let added = 0;
+      for (const d of devices) {
         try {
-          const oldName = await decryptRoomName({
-            ciphertext: await fromBase64(room.name_ciphertext),
-            nonce: await fromBase64(room.name_nonce),
-            roomId: room.id,
-            roomKey,
-          });
-          if (oldName) {
-            const enc = await encryptRoomName({
-              name: oldName,
-              roomId: room.id,
-              roomKey: next,
-            });
-            await renameRoom({
-              roomId: room.id,
-              nameCiphertext: enc.ciphertext,
-              nameNonce: enc.nonce,
-            });
-          }
-        } catch (err) {
-          console.error('name re-encrypt failed, clearing', errorMessage(err));
-          await renameRoom({ roomId: room.id, nameCiphertext: null, nameNonce: null });
+          await verifyPublicDevice(d, umk.ed25519PublicKey);
+        } catch {
+          continue;
         }
+        targets.push({ userId: uid, device: d });
+        added += 1;
       }
-      await bumpRoomGeneration(room.id, next.generation);
+      if (added === 0) {
+        throw new Error(`keeper ${uid.slice(0, 8)} has no active signed devices`);
+      }
     }
-    for (const uid of removeUserIds) {
-      await supabase
-        .from('room_members')
-        .delete()
-        .eq('room_id', room.id)
-        .eq('user_id', uid);
+
+    // Trust for keepers is established at membership-change time (invite
+    // accept cryptographically verifies the envelope against the signer
+    // device's cert chain). We don't need to re-verify the keeper's current
+    // wrap at rotation — but we DO refuse to proceed if we can't resolve
+    // the keeper's devices (done above via fetchPublicDevices + verifyPublicDevice).
+    void verifyMembershipWrap;
+
+    const { next, wraps } = await rotateRoomKey(
+      roomKey.generation,
+      targets.map((t) => t.device.x25519PublicKey),
+    );
+    void wrapRoomKeyFor; // rotateRoomKey already wraps per recipient
+
+    const wrapSigs = await Promise.all(
+      targets.map((t, i) =>
+        signMembershipWrap(
+          {
+            roomId: room.id,
+            generation: next.generation,
+            memberUserId: t.userId,
+            memberDeviceId: t.device.deviceId,
+            wrappedRoomKey: wraps[i].wrapped,
+            signerDeviceId: device.deviceId,
+          },
+          device.ed25519PrivateKey,
+        ),
+      ),
+    );
+
+    // Re-encrypt the room name under the new key (if one is set). If decrypt
+    // fails we fall through with null ciphertext, mirroring the pre-RPC
+    // behavior of clearing the name rather than wedging the rotation.
+    let newNameCiphertext: Uint8Array | null = null;
+    let newNameNonce: Uint8Array | null = null;
+    if (room.name_ciphertext && room.name_nonce) {
+      try {
+        const oldName = await decryptRoomName({
+          ciphertext: await fromBase64(room.name_ciphertext),
+          nonce: await fromBase64(room.name_nonce),
+          roomId: room.id,
+          roomKey,
+        });
+        if (oldName) {
+          const enc = await encryptRoomName({
+            name: oldName,
+            roomId: room.id,
+            roomKey: next,
+          });
+          newNameCiphertext = enc.ciphertext;
+          newNameNonce = enc.nonce;
+        }
+      } catch (err) {
+        console.error('name re-encrypt failed, clearing', errorMessage(err));
+      }
     }
+
+    // Atomic: RLS-safe evictee delete + new-gen inserts + gen bump + name,
+    // all inside a single SECURITY DEFINER RPC. Concurrent rotations fail
+    // fast via the conditional `current_generation` match.
+    await kickAndRotate({
+      roomId: room.id,
+      evicteeUserIds: removeUserIds,
+      oldGeneration: roomKey.generation,
+      newGeneration: next.generation,
+      wraps: targets.map((t, i) => ({
+        userId: t.userId,
+        deviceId: t.device.deviceId,
+        wrappedRoomKey: wraps[i].wrapped,
+        wrapSignature: wrapSigs[i],
+      })),
+      signerDeviceId: device.deviceId,
+      nameCiphertext: newNameCiphertext,
+      nameNonce: newNameNonce,
+    });
   }
 
   async function kickMember(removedUserId: string) {
@@ -481,8 +580,36 @@ function MemberList({
     setBusy(true);
     setError(null);
     try {
-      const keep = members.filter((m) => m.user_id !== removedUserId);
-      await rotateAndRemove({ keep, removeUserIds: [removedUserId] });
+      const keeperMembers = members.filter((m) => m.user_id !== removedUserId);
+      await rotateAndRemove({ keeperMembers, removeUserIds: [removedUserId] });
+      onChange();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rotateNow() {
+    if (!isAdmin) return;
+    const daysOld = room.last_rotated_at
+      ? Math.floor((Date.now() - new Date(room.last_rotated_at).getTime()) / 86_400_000)
+      : null;
+    const note =
+      daysOld != null
+        ? `Last rotated ${daysOld} day(s) ago. `
+        : '';
+    if (
+      !confirm(
+        `${note}Rotate the room key now?\n\nThis bumps the generation, re-wraps the key for every current member, and forgets the previous key server-side — old messages stay readable on devices that have them cached, but an attacker who later steals the old ciphertext cannot decrypt history.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await rotateAndRemove({ keeperMembers: members, removeUserIds: [] });
       onChange();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -504,7 +631,7 @@ function MemberList({
     setError(null);
     try {
       const remaining = members.filter((m) => m.user_id !== selfUserId);
-      await rotateAndRemove({ keep: remaining, removeUserIds: [selfUserId] });
+      await rotateAndRemove({ keeperMembers: remaining, removeUserIds: [selfUserId] });
       onLeft();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -523,6 +650,23 @@ function MemberList({
           {isAdmin ? 'you are the admin' : `admin: ${room.created_by.slice(0, 8)}…`}
         </span>
       </div>
+      {isAdmin && (
+        <div className="mb-2 flex items-center justify-between text-xs text-neutral-500">
+          <span>
+            {room.last_rotated_at
+              ? `last rotated ${new Date(room.last_rotated_at).toLocaleDateString()}`
+              : 'never rotated'}
+          </span>
+          <button
+            onClick={() => void rotateNow()}
+            disabled={busy}
+            className="rounded border border-neutral-300 px-2 py-0.5 text-[11px] disabled:opacity-50 dark:border-neutral-700"
+            title="Bump the key generation, re-wrap for all members, and purge older server-side wraps."
+          >
+            rotate now
+          </button>
+        </div>
+      )}
       <ul className="space-y-1">
         {members.map((m) => {
           const self = m.user_id === selfUserId;
@@ -756,18 +900,6 @@ function ImageAttachment({
 const REALTIME_WARNING_GRACE_MS = 5000;
 
 function RealtimeBadge({ status }: { status: string }) {
-  const [pastGrace, setPastGrace] = useState(false);
-
-  useEffect(() => {
-    if (status === 'SUBSCRIBED') {
-      setPastGrace(false);
-      return;
-    }
-    setPastGrace(false);
-    const t = setTimeout(() => setPastGrace(true), REALTIME_WARNING_GRACE_MS);
-    return () => clearTimeout(t);
-  }, [status]);
-
   if (status === 'SUBSCRIBED') {
     return (
       <span
@@ -778,6 +910,20 @@ function RealtimeBadge({ status }: { status: string }) {
       </span>
     );
   }
+  // Remount per status change via the `key` prop — that starts pastGrace
+  // fresh and restarts the grace timer without a synchronous setState
+  // reset inside the effect.
+  return <NonLiveBadge key={status} status={status} />;
+}
+
+function NonLiveBadge({ status }: { status: string }) {
+  const [pastGrace, setPastGrace] = useState(false);
+
+  useEffect(() => {
+    const t = setTimeout(() => setPastGrace(true), REALTIME_WARNING_GRACE_MS);
+    return () => clearTimeout(t);
+  }, []);
+
   if (!pastGrace) {
     return (
       <span
@@ -905,13 +1051,13 @@ function RenameRoomDialog({
 function Composer({
   roomId,
   userId,
-  identity,
+  device,
   roomKey,
   onSent,
 }: {
   roomId: string;
   userId: string;
-  identity: Identity;
+  device: DeviceKeyBundle;
   roomKey: RoomKey;
   onSent: (row: BlobRow) => void;
 }) {
@@ -951,9 +1097,17 @@ function Composer({
         payload: header,
         roomId,
         roomKey,
-        senderEd25519PrivateKey: identity.ed25519PrivateKey,
+        senderUserId: userId,
+        senderDeviceId: device.deviceId,
+        senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
       });
-      const row = await insertBlob({ roomId, senderId: userId, blob, id: blobId });
+      const row = await insertBlob({
+        roomId,
+        senderId: userId,
+        senderDeviceId: device.deviceId,
+        blob,
+        id: blobId,
+      });
       choosePendingImage(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
       onSent(row);
@@ -975,9 +1129,16 @@ function Composer({
       payload: { text: trimmed, ts: Date.now() },
       roomId,
       roomKey,
-      senderEd25519PrivateKey: identity.ed25519PrivateKey,
+      senderUserId: userId,
+      senderDeviceId: device.deviceId,
+      senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
     });
-    const row = await insertBlob({ roomId, senderId: userId, blob });
+    const row = await insertBlob({
+      roomId,
+      senderId: userId,
+      senderDeviceId: device.deviceId,
+      blob,
+    });
     setText('');
     onSent(row);
   }

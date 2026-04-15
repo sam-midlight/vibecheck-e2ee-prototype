@@ -1,32 +1,49 @@
 /**
- * IndexedDB storage for device-local secrets.
+ * IndexedDB storage for device-local secrets (v2, per-device).
  *
- * Browser-only. Holds three stores:
- *   - `identity`   — a single row keyed by userId, holding this device's copy
- *                    of the user's identity keypairs.
- *   - `device`     — a single row keyed by userId, holding this device's id +
- *                    display name as recorded in the `devices` table.
- *   - `knownContacts` — TOFU cache: for each contact userId, the last-seen
- *                    pubkeys. Used to detect key changes.
+ * Browser-only. Holds:
+ *   - `deviceBundle`   — one row per userId: this device's key bundle
+ *                        (ed25519 + x25519, both privs + pubs) plus its
+ *                        deviceId. Generated once per browser/profile.
+ *   - `userMasterKey`  — one row per userId: UMK priv+pub. Present only on
+ *                        the device that created the account (or a recovery-
+ *                        restored device). NOT present on approval-linked
+ *                        secondary devices.
+ *   - `device`         — registration metadata (deviceId + displayName). The
+ *                        deviceId also appears in the deviceBundle; this row
+ *                        is the canonical source for display_name.
+ *   - `knownContacts`  — TOFU cache of contact UMK pubs.
+ *   - `wrappedIdentity`— optional: passphrase-wrapped blob carrying the
+ *                        deviceBundle + optional UMK. Present when lock is on.
  *
- * Anything stored here is device-local and survives reload, but not clearing
- * site data. Since we explicitly chose a no-recovery design, that's the
- * expected behavior.
+ * Nothing persisted here ever leaves the device under normal operation.
  */
 
 import { openDB, type IDBPDatabase } from 'idb';
-import type { Identity, KnownContact } from './types';
+import type { DeviceKeyBundle, KnownContact, UserMasterKey } from './types';
+import type { PinWrappedIdentity } from './pin-lock';
 
 const DB_NAME = 'e2ee-core';
-const DB_VERSION = 1;
+// v3: restructured stores for per-device identities.
+const DB_VERSION = 3;
 
-const STORE_IDENTITY = 'identity';
+const STORE_DEVICE_BUNDLE = 'deviceBundle';
+const STORE_USER_MASTER_KEY = 'userMasterKey';
 const STORE_DEVICE = 'device';
 const STORE_KNOWN_CONTACTS = 'knownContacts';
+const STORE_WRAPPED_IDENTITY = 'wrappedIdentity';
+// Legacy (v1/v2) store name, still recognized so we can delete it on upgrade.
+const LEGACY_STORE_IDENTITY = 'identity';
 
-interface IdentityRow {
+interface DeviceBundleRow {
   userId: string;
-  identity: Identity;
+  bundle: DeviceKeyBundle;
+  createdAt: number;
+}
+
+interface UserMasterKeyRow {
+  userId: string;
+  umk: UserMasterKey;
   createdAt: number;
 }
 
@@ -34,6 +51,12 @@ interface DeviceRow {
   userId: string;
   deviceId: string;
   displayName: string;
+}
+
+interface WrappedIdentityRow {
+  userId: string;
+  blob: PinWrappedIdentity;
+  createdAt: number;
 }
 
 let dbPromise: Promise<IDBPDatabase> | null = null;
@@ -44,9 +67,20 @@ function getDb(): Promise<IDBPDatabase> {
   }
   if (!dbPromise) {
     dbPromise = openDB(DB_NAME, DB_VERSION, {
-      upgrade(db) {
-        if (!db.objectStoreNames.contains(STORE_IDENTITY)) {
-          db.createObjectStore(STORE_IDENTITY, { keyPath: 'userId' });
+      upgrade(db, oldVersion) {
+        if (oldVersion < 1) {
+          // fresh install; create everything below
+        }
+        // Delete legacy v1/v2 `identity` store on upgrade to v3. The old shape
+        // (combined root identity) is incompatible with per-device identities.
+        if (db.objectStoreNames.contains(LEGACY_STORE_IDENTITY)) {
+          db.deleteObjectStore(LEGACY_STORE_IDENTITY);
+        }
+        if (!db.objectStoreNames.contains(STORE_DEVICE_BUNDLE)) {
+          db.createObjectStore(STORE_DEVICE_BUNDLE, { keyPath: 'userId' });
+        }
+        if (!db.objectStoreNames.contains(STORE_USER_MASTER_KEY)) {
+          db.createObjectStore(STORE_USER_MASTER_KEY, { keyPath: 'userId' });
         }
         if (!db.objectStoreNames.contains(STORE_DEVICE)) {
           db.createObjectStore(STORE_DEVICE, { keyPath: 'userId' });
@@ -54,33 +88,75 @@ function getDb(): Promise<IDBPDatabase> {
         if (!db.objectStoreNames.contains(STORE_KNOWN_CONTACTS)) {
           db.createObjectStore(STORE_KNOWN_CONTACTS, { keyPath: 'userId' });
         }
+        if (!db.objectStoreNames.contains(STORE_WRAPPED_IDENTITY)) {
+          db.createObjectStore(STORE_WRAPPED_IDENTITY, { keyPath: 'userId' });
+        }
       },
     });
   }
   return dbPromise;
 }
 
-/** Save this device's copy of the user's identity. Overwrites any prior row. */
-export async function putIdentity(userId: string, identity: Identity): Promise<void> {
+// ---------------------------------------------------------------------------
+// Device bundle (per-device ed+x keypair)
+// ---------------------------------------------------------------------------
+
+export async function putDeviceBundle(
+  userId: string,
+  bundle: DeviceKeyBundle,
+): Promise<void> {
   const db = await getDb();
-  const row: IdentityRow = { userId, identity, createdAt: Date.now() };
-  await db.put(STORE_IDENTITY, row);
+  const row: DeviceBundleRow = { userId, bundle, createdAt: Date.now() };
+  await db.put(STORE_DEVICE_BUNDLE, row);
 }
 
-/** Load the stored identity for a given user, or null if none exists here. */
-export async function getIdentity(userId: string): Promise<Identity | null> {
+export async function getDeviceBundle(
+  userId: string,
+): Promise<DeviceKeyBundle | null> {
   const db = await getDb();
-  const row = (await db.get(STORE_IDENTITY, userId)) as IdentityRow | undefined;
-  return row?.identity ?? null;
+  const row = (await db.get(STORE_DEVICE_BUNDLE, userId)) as
+    | DeviceBundleRow
+    | undefined;
+  return row?.bundle ?? null;
 }
 
-/** Remove a user's identity from this device (logout / account reset). */
-export async function clearIdentity(userId: string): Promise<void> {
+export async function clearDeviceBundle(userId: string): Promise<void> {
   const db = await getDb();
-  await db.delete(STORE_IDENTITY, userId);
+  await db.delete(STORE_DEVICE_BUNDLE, userId);
 }
 
-/** Save this device's registration record. */
+// ---------------------------------------------------------------------------
+// User Master Key (optional per device; present on primary / recovery-holder)
+// ---------------------------------------------------------------------------
+
+export async function putUserMasterKey(
+  userId: string,
+  umk: UserMasterKey,
+): Promise<void> {
+  const db = await getDb();
+  const row: UserMasterKeyRow = { userId, umk, createdAt: Date.now() };
+  await db.put(STORE_USER_MASTER_KEY, row);
+}
+
+export async function getUserMasterKey(
+  userId: string,
+): Promise<UserMasterKey | null> {
+  const db = await getDb();
+  const row = (await db.get(STORE_USER_MASTER_KEY, userId)) as
+    | UserMasterKeyRow
+    | undefined;
+  return row?.umk ?? null;
+}
+
+export async function clearUserMasterKey(userId: string): Promise<void> {
+  const db = await getDb();
+  await db.delete(STORE_USER_MASTER_KEY, userId);
+}
+
+// ---------------------------------------------------------------------------
+// Device registration metadata
+// ---------------------------------------------------------------------------
+
 export async function putDeviceRecord(
   userId: string,
   deviceId: string,
@@ -91,7 +167,6 @@ export async function putDeviceRecord(
   await db.put(STORE_DEVICE, row);
 }
 
-/** Load this device's registration record. */
 export async function getDeviceRecord(
   userId: string,
 ): Promise<{ deviceId: string; displayName: string } | null> {
@@ -100,13 +175,83 @@ export async function getDeviceRecord(
   return row ? { deviceId: row.deviceId, displayName: row.displayName } : null;
 }
 
-/** Store or update the known-pubkeys cache for a contact. */
+// ---------------------------------------------------------------------------
+// Back-compat shim: `getIdentity` / `clearIdentity` / `putIdentity`
+//
+// Several app-layer call sites still use the legacy name. In v2, "identity"
+// used to mean the combined root-identity. In v3 it has no canonical
+// equivalent — callers need EITHER the device bundle OR the UMK depending
+// on what they're doing. These shims return the device bundle shape when
+// possible (most callers want device keys), so legacy code that only needs
+// to detect "do we have keys on this device" keeps working.
+// ---------------------------------------------------------------------------
+
+/**
+ * @deprecated Use `getDeviceBundle` or `getUserMasterKey`. This shim returns
+ * a deprecated Identity-shaped object (device ed + device x) for back-compat
+ * with code that still reads `identity.ed25519PrivateKey` / `.x25519PublicKey`.
+ */
+export async function getIdentity(userId: string): Promise<{
+  ed25519PublicKey: Uint8Array;
+  ed25519PrivateKey: Uint8Array;
+  x25519PublicKey: Uint8Array;
+  x25519PrivateKey: Uint8Array;
+} | null> {
+  const bundle = await getDeviceBundle(userId);
+  if (!bundle) return null;
+  return {
+    ed25519PublicKey: bundle.ed25519PublicKey,
+    ed25519PrivateKey: bundle.ed25519PrivateKey,
+    x25519PublicKey: bundle.x25519PublicKey,
+    x25519PrivateKey: bundle.x25519PrivateKey,
+  };
+}
+
+/** @deprecated Clears the device bundle. UMK (if any) is NOT cleared. */
+export async function clearIdentity(userId: string): Promise<void> {
+  await clearDeviceBundle(userId);
+}
+
+/**
+ * @deprecated Back-compat: extract the device halves from an Identity shape
+ * and store them in the device-bundle slot. Caller is responsible for
+ * having generated a deviceId UUID for this bundle.
+ */
+export async function putIdentity(
+  userId: string,
+  identity: {
+    ed25519PublicKey: Uint8Array;
+    ed25519PrivateKey: Uint8Array;
+    x25519PublicKey: Uint8Array;
+    x25519PrivateKey: Uint8Array;
+  },
+  deviceId?: string,
+): Promise<void> {
+  const existing = await getDeviceBundle(userId);
+  const id = deviceId ?? existing?.deviceId;
+  if (!id) {
+    throw new Error(
+      'putIdentity (legacy): deviceId required when no device bundle exists yet',
+    );
+  }
+  await putDeviceBundle(userId, {
+    deviceId: id,
+    ed25519PublicKey: identity.ed25519PublicKey,
+    ed25519PrivateKey: identity.ed25519PrivateKey,
+    x25519PublicKey: identity.x25519PublicKey,
+    x25519PrivateKey: identity.x25519PrivateKey,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// TOFU cache (unchanged shape; tracks UMK pub for users in v3)
+// ---------------------------------------------------------------------------
+
 export async function putKnownContact(contact: KnownContact): Promise<void> {
   const db = await getDb();
   await db.put(STORE_KNOWN_CONTACTS, contact);
 }
 
-/** Look up the TOFU cache for a given contact. */
 export async function getKnownContact(userId: string): Promise<KnownContact | null> {
   const db = await getDb();
   const row = (await db.get(STORE_KNOWN_CONTACTS, userId)) as
@@ -115,18 +260,54 @@ export async function getKnownContact(userId: string): Promise<KnownContact | nu
   return row ?? null;
 }
 
-/** List every known contact. Useful for debug / /status / audit UIs. */
 export async function listKnownContacts(): Promise<KnownContact[]> {
   const db = await getDb();
   return (await db.getAll(STORE_KNOWN_CONTACTS)) as KnownContact[];
 }
 
-/** Fully wipe everything (for "reset this device" UX or tests). */
+// ---------------------------------------------------------------------------
+// Wipe everything (device reset)
+// ---------------------------------------------------------------------------
+
 export async function wipeAll(): Promise<void> {
   const db = await getDb();
   await Promise.all([
-    db.clear(STORE_IDENTITY),
+    db.clear(STORE_DEVICE_BUNDLE),
+    db.clear(STORE_USER_MASTER_KEY),
     db.clear(STORE_DEVICE),
     db.clear(STORE_KNOWN_CONTACTS),
+    db.clear(STORE_WRAPPED_IDENTITY),
   ]);
+}
+
+// ---------------------------------------------------------------------------
+// Passphrase-wrapped state (opt-in)
+// ---------------------------------------------------------------------------
+
+export async function putWrappedIdentity(
+  userId: string,
+  blob: PinWrappedIdentity,
+): Promise<void> {
+  const db = await getDb();
+  const row: WrappedIdentityRow = { userId, blob, createdAt: Date.now() };
+  await db.put(STORE_WRAPPED_IDENTITY, row);
+}
+
+export async function getWrappedIdentity(
+  userId: string,
+): Promise<PinWrappedIdentity | null> {
+  const db = await getDb();
+  const row = (await db.get(STORE_WRAPPED_IDENTITY, userId)) as
+    | WrappedIdentityRow
+    | undefined;
+  return row?.blob ?? null;
+}
+
+export async function hasWrappedIdentity(userId: string): Promise<boolean> {
+  return (await getWrappedIdentity(userId)) != null;
+}
+
+export async function clearWrappedIdentity(userId: string): Promise<void> {
+  const db = await getDb();
+  await db.delete(STORE_WRAPPED_IDENTITY, userId);
 }

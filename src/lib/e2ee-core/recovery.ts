@@ -19,9 +19,8 @@
 
 import { generateMnemonic, mnemonicToEntropy, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
-import { CryptoError, type Bytes, type Identity } from './types';
+import { CryptoError, type Bytes, type UserMasterKey } from './types';
 import {
-  concatBytes,
   fromBase64,
   getSodium,
   randomBytes,
@@ -112,19 +111,16 @@ async function mnemonicToEntropyBytes(phrase: string): Promise<Bytes> {
   return mnemonicToEntropy(normalized, wordlist);
 }
 
-/** Pack an Identity's two private halves (ed25519 + x25519) for wrapping. */
-function packIdentityPrivate(identity: Identity): Bytes {
-  // Format: [64 bytes ed priv][32 bytes x priv]. Public halves are not stored
-  // here — they can be re-derived from the privs, or re-fetched from `identities`.
-  return concatBytes(identity.ed25519PrivateKey, identity.x25519PrivateKey);
-}
-
 /**
- * Wrap the caller's identity privkeys under the given phrase. Returns an
- * opaque blob safe to upload to `recovery_blobs`.
+ * Wrap the caller's UMK priv under the given phrase. Returns an opaque blob
+ * safe to upload to `recovery_blobs`.
+ *
+ * v2 (per-device) note: recovery now targets the user master key, not a full
+ * combined identity. Device key bundles are per-device and regenerated on
+ * recovery. The restored UMK lets the new device sign its own device cert.
  */
-export async function wrapIdentityWithPhrase(
-  identity: Identity,
+export async function wrapUserMasterKeyWithPhrase(
+  umk: UserMasterKey,
   phrase: string,
   userId: string,
   opts?: { opslimit?: number; memlimit?: number },
@@ -136,9 +132,9 @@ export async function wrapIdentityWithPhrase(
   const wrappingKey = await deriveWrappingKey(phrase, kdfSalt, opslimit, memlimit);
   try {
     const nonce = await randomBytes(RECOVERY_NONCE_BYTES);
-    const packed = packIdentityPrivate(identity);
-    // AD binds the ciphertext to the user_id to prevent cross-account blob swap.
-    const ad = new TextEncoder().encode(userId);
+    // 64 bytes: the full Ed25519 secret key. Pub can be re-derived from it.
+    const packed = new Uint8Array(umk.ed25519PrivateKey);
+    const ad = new TextEncoder().encode(`vibecheck:recovery:v2:${userId}`);
     const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
       packed,
       ad,
@@ -154,15 +150,15 @@ export async function wrapIdentityWithPhrase(
 }
 
 /**
- * Open a recovery blob with the given phrase. Returns the identity's private
- * halves; callers combine those with the published public halves (ed/x pubs
- * + selfSignature from `identities`) to reconstruct the full Identity.
+ * Open a recovery blob with the given phrase. Returns the UMK priv bytes;
+ * caller derives the pub via `crypto_sign_ed25519_sk_to_pk` and confirms it
+ * matches the server's published UMK pub before installing.
  */
-export async function unwrapIdentityWithPhrase(
+export async function unwrapUserMasterKeyWithPhrase(
   blob: RecoveryBlob,
   phrase: string,
   userId: string,
-): Promise<{ ed25519PrivateKey: Bytes; x25519PrivateKey: Bytes }> {
+): Promise<{ ed25519PrivateKey: Bytes }> {
   const sodium = await getSodium();
   const wrappingKey = await deriveWrappingKey(
     phrase,
@@ -172,7 +168,7 @@ export async function unwrapIdentityWithPhrase(
   );
   let packed: Bytes;
   try {
-    const ad = new TextEncoder().encode(userId);
+    const ad = new TextEncoder().encode(`vibecheck:recovery:v2:${userId}`);
     try {
       packed = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
         null,
@@ -190,18 +186,14 @@ export async function unwrapIdentityWithPhrase(
   } finally {
     sodium.memzero(wrappingKey);
   }
-  if (packed.byteLength !== 64 + 32) {
+  if (packed.byteLength !== 64) {
     sodium.memzero(packed);
     throw new CryptoError(
-      `recovery blob has unexpected length ${packed.byteLength}`,
+      `recovery blob has unexpected length ${packed.byteLength} (expected 64)`,
       'BAD_KEY_LENGTH',
     );
   }
-  // .slice() returns copies; the per-key copies are the long-lived result.
-  const result = {
-    ed25519PrivateKey: packed.slice(0, 64),
-    x25519PrivateKey: packed.slice(64, 96),
-  };
+  const result = { ed25519PrivateKey: packed.slice(0, 64) };
   sodium.memzero(packed);
   return result;
 }
@@ -242,17 +234,36 @@ export async function decodeRecoveryBlob(row: {
 
 /**
  * Pick N random 1-based positions from a phrase for a verification step.
- * Deterministic given `rngBytes` so tests can pin the positions.
+ * Deterministic given `rngBytes` so tests can pin the positions. Uses
+ * rejection sampling from 16-bit windows of `rngBytes` to get a uniform
+ * index in `[0, i+1)` — avoids the modulo bias of `byte % (i+1)` when
+ * `i+1` doesn't divide 256.
  */
 export function pickVerificationIndices(
   phraseLength: number,
   count: number,
   rngBytes: Bytes,
 ): number[] {
-  // Fisher-Yates shuffle of [1..phraseLength] using rngBytes as the RNG source.
   const indices = Array.from({ length: phraseLength }, (_, i) => i);
+  let cursor = 0;
+  const nextUniform = (ceiling: number): number => {
+    // Read 16 bits at a time from rngBytes (wrapping). Rejection-sample to
+    // eliminate bias: only accept values < floor(65536 / ceiling) * ceiling.
+    const limit = Math.floor(65536 / ceiling) * ceiling;
+    // Budget loops to avoid runaway if rngBytes is adversarial/too short.
+    for (let attempts = 0; attempts < 256; attempts++) {
+      const hi = rngBytes[cursor % rngBytes.length];
+      const lo = rngBytes[(cursor + 1) % rngBytes.length];
+      cursor += 2;
+      const r = (hi << 8) | lo;
+      if (r < limit) return r % ceiling;
+    }
+    // Last resort (should be unreachable for ceiling <= phraseLength <= 256):
+    // fall back to plain modulo to guarantee termination.
+    return rngBytes[cursor++ % rngBytes.length] % ceiling;
+  };
   for (let i = phraseLength - 1; i > 0; i--) {
-    const j = rngBytes[i % rngBytes.length] % (i + 1);
+    const j = nextUniform(i + 1);
     [indices[i], indices[j]] = [indices[j], indices[i]];
   }
   return indices.slice(0, count).sort((a, b) => a - b).map((i) => i + 1);

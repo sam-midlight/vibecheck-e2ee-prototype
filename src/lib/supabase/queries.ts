@@ -13,7 +13,8 @@ import {
   toBase64,
   type Bytes,
   type EncryptedBlob,
-  type PublicIdentity,
+  type PublicDevice,
+  type PublicUserMasterKey,
 } from '@/lib/e2ee-core';
 import { getSupabase } from './client';
 
@@ -26,17 +27,29 @@ const ATTACHMENTS_BUCKET = 'room-attachments';
 
 export interface IdentityRow {
   user_id: string;
+  /** User Master Key (UMK) Ed25519 pub. Only signs device certs + revocations. */
   ed25519_pub: string;
-  x25519_pub: string;
-  self_signature: string;
+  /** LEGACY (pre-0015). Null going forward. */
+  x25519_pub: string | null;
+  /** LEGACY (pre-0015). Null going forward. */
+  self_signature: string | null;
+  identity_epoch: number;
   created_at: string;
 }
 
 export interface DeviceRow {
   id: string;
   user_id: string;
-  device_pub: string;
-  display_name: string;
+  /** LEGACY pre-0016 plaintext label. Null on new inserts. */
+  display_name: string | null;
+  /** crypto_box_seal of display_name to the device's own X25519 pub. */
+  display_name_ciphertext: string | null;
+  device_ed25519_pub: string;
+  device_x25519_pub: string;
+  issuance_created_at_ms: number;
+  issuance_signature: string;
+  revoked_at_ms: number | null;
+  revocation_signature: string | null;
   created_at: string;
   last_seen_at: string;
 }
@@ -55,6 +68,7 @@ export interface RoomRow {
   current_generation: number;
   created_by: string;
   created_at: string;
+  last_rotated_at: string | null;
   name_ciphertext: string | null;
   name_nonce: string | null;
 }
@@ -62,31 +76,46 @@ export interface RoomRow {
 export interface RoomMemberRow {
   room_id: string;
   user_id: string;
+  /** The device this wrap is addressed to. */
+  device_id: string;
   generation: number;
   wrapped_room_key: string;
   joined_at: string;
+  /** The device that wrote this row (signed wrap_signature). NOT NULL since 0016. */
+  signer_device_id: string;
+  wrap_signature: string;
 }
 
 export interface RoomInviteRow {
   id: string;
   room_id: string;
   invited_user_id: string;
+  invited_device_id: string;
   invited_x25519_pub: string;
+  /** NOT NULL since 0016. */
+  invited_ed25519_pub: string;
   generation: number;
   wrapped_room_key: string;
   created_by: string;
+  inviter_device_id: string;
   created_at: string;
   expires_at: string | null;
+  /** NOT NULL since 0016. */
+  expires_at_ms: number;
+  /** NOT NULL since 0016. */
+  inviter_signature: string;
 }
 
 export interface BlobRow {
   id: string;
   room_id: string;
   sender_id: string;
+  /** Device that signed the blob (v3 only). */
+  sender_device_id: string | null;
   generation: number;
   nonce: string;
   ciphertext: string;
-  signature: string;
+  signature: string | null;
   created_at: string;
 }
 
@@ -94,53 +123,71 @@ export interface BlobRow {
 // identities
 // ---------------------------------------------------------------------------
 
-/** Publish this user's own identity (upsert). */
-export async function publishIdentity(
+/** Publish this user's UMK pub (upsert). */
+export async function publishUserMasterKey(
   userId: string,
-  pub: PublicIdentity,
+  umkPub: PublicUserMasterKey,
 ): Promise<void> {
   const supabase = getSupabase();
   const row = {
     user_id: userId,
-    ed25519_pub: await toBase64(pub.ed25519PublicKey),
-    x25519_pub: await toBase64(pub.x25519PublicKey),
-    self_signature: await toBase64(pub.selfSignature),
+    ed25519_pub: await toBase64(umkPub.ed25519PublicKey),
+    x25519_pub: null,
+    self_signature: null,
   };
   const { error } = await supabase.from('identities').upsert(row);
   if (error) throw error;
 }
 
-/** Fetch a user's published identity. Returns null if not found. */
-export async function fetchIdentity(userId: string): Promise<PublicIdentity | null> {
+/** Fetch a user's UMK pub. Returns null if the user has no identity row. */
+export async function fetchUserMasterKeyPub(
+  userId: string,
+): Promise<PublicUserMasterKey | null> {
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from('identities')
-    .select('*')
+    .select('ed25519_pub')
     .eq('user_id', userId)
-    .maybeSingle<IdentityRow>();
+    .maybeSingle<Pick<IdentityRow, 'ed25519_pub'>>();
   if (error) throw error;
   if (!data) return null;
-  return {
-    ed25519PublicKey: await fromBase64(data.ed25519_pub),
-    x25519PublicKey: await fromBase64(data.x25519_pub),
-    selfSignature: await fromBase64(data.self_signature),
-  };
+  return { ed25519PublicKey: await fromBase64(data.ed25519_pub) };
 }
 
 // ---------------------------------------------------------------------------
 // devices
 // ---------------------------------------------------------------------------
 
+/**
+ * Register a device row. Callers generate the device id client-side so the
+ * issuance cert (which binds device_id) can be signed before the row is
+ * inserted. The display name is stored as a sealed-to-self ciphertext
+ * when the writer holds the target device's x25519 priv (the owning
+ * device's bootstrap path). When the primary (A) signs a cert for a
+ * secondary (B) during approval, A cannot seal B's display name — B
+ * updates the row itself via `setDeviceDisplayNameCiphertext` after enrollment.
+ */
 export async function registerDevice(params: {
   userId: string;
-  devicePublicKey: Bytes;
-  displayName: string;
+  deviceId: string;
+  deviceEd25519Pub: Bytes;
+  deviceX25519Pub: Bytes;
+  issuanceCreatedAtMs: number;
+  issuanceSignature: Bytes;
+  displayNameCiphertext?: Bytes | null;
 }): Promise<string> {
   const supabase = getSupabase();
-  const row = {
+  const row: Record<string, unknown> = {
+    id: params.deviceId,
     user_id: params.userId,
-    device_pub: await toBase64(params.devicePublicKey),
-    display_name: params.displayName,
+    device_ed25519_pub: await toBase64(params.deviceEd25519Pub),
+    device_x25519_pub: await toBase64(params.deviceX25519Pub),
+    issuance_created_at_ms: params.issuanceCreatedAtMs,
+    issuance_signature: await toBase64(params.issuanceSignature),
+    display_name: null,
+    display_name_ciphertext: params.displayNameCiphertext
+      ? await toBase64(params.displayNameCiphertext)
+      : null,
   };
   const { data, error } = await supabase
     .from('devices')
@@ -151,7 +198,27 @@ export async function registerDevice(params: {
   return data.id;
 }
 
-export async function listDevices(userId: string): Promise<DeviceRow[]> {
+/**
+ * Update a device row's display-name ciphertext. The owning device calls
+ * this after its bundle is enrolled, so other co-devices see only the
+ * encrypted label in the DB and only this device can decrypt.
+ */
+export async function setDeviceDisplayNameCiphertext(params: {
+  deviceId: string;
+  displayNameCiphertext: Bytes;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from('devices')
+    .update({
+      display_name_ciphertext: await toBase64(params.displayNameCiphertext),
+      display_name: null,
+    })
+    .eq('id', params.deviceId);
+  if (error) throw error;
+}
+
+export async function listDeviceRows(userId: string): Promise<DeviceRow[]> {
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from('devices')
@@ -160,6 +227,48 @@ export async function listDevices(userId: string): Promise<DeviceRow[]> {
     .order('created_at', { ascending: true });
   if (error) throw error;
   return (data ?? []) as DeviceRow[];
+}
+
+/** Back-compat shim — older callers used this name + shape. */
+export const listDevices = listDeviceRows;
+
+/** Fetch + decode a user's device list into PublicDevice records. */
+export async function fetchPublicDevices(userId: string): Promise<PublicDevice[]> {
+  const rows = await listDeviceRows(userId);
+  return Promise.all(
+    rows.map(async (r): Promise<PublicDevice> => ({
+      deviceId: r.id,
+      userId: r.user_id,
+      ed25519PublicKey: await fromBase64(r.device_ed25519_pub),
+      x25519PublicKey: await fromBase64(r.device_x25519_pub),
+      createdAtMs: r.issuance_created_at_ms,
+      issuanceSignature: await fromBase64(r.issuance_signature),
+      revocation:
+        r.revoked_at_ms != null && r.revocation_signature != null
+          ? {
+              revokedAtMs: r.revoked_at_ms,
+              signature: await fromBase64(r.revocation_signature),
+            }
+          : null,
+    })),
+  );
+}
+
+/** Write a UMK-signed revocation to an existing device row. */
+export async function revokeDevice(params: {
+  deviceId: string;
+  revokedAtMs: number;
+  revocationSignature: Bytes;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from('devices')
+    .update({
+      revoked_at_ms: params.revokedAtMs,
+      revocation_signature: await toBase64(params.revocationSignature),
+    })
+    .eq('id', params.deviceId);
+  if (error) throw error;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,15 +410,21 @@ export async function renameRoom(params: {
 export async function addRoomMember(params: {
   roomId: string;
   userId: string;
+  deviceId: string;
   generation: number;
   wrappedRoomKey: Bytes;
+  signerDeviceId: string;
+  wrapSignature: Bytes;
 }): Promise<void> {
   const supabase = getSupabase();
   const row = {
     room_id: params.roomId,
     user_id: params.userId,
+    device_id: params.deviceId,
     generation: params.generation,
     wrapped_room_key: await toBase64(params.wrappedRoomKey),
+    signer_device_id: params.signerDeviceId,
+    wrap_signature: await toBase64(params.wrapSignature),
   };
   const { error } = await supabase.from('room_members').insert(row);
   if (error) throw error;
@@ -346,9 +461,10 @@ export async function listRoomMembers(roomId: string): Promise<RoomMemberRow[]> 
   return (data ?? []) as RoomMemberRow[];
 }
 
+/** Fetch THIS device's wrapped room key for a specific generation. */
 export async function getMyWrappedRoomKey(params: {
   roomId: string;
-  userId: string;
+  deviceId: string;
   generation: number;
 }): Promise<Bytes | null> {
   const supabase = getSupabase();
@@ -356,7 +472,7 @@ export async function getMyWrappedRoomKey(params: {
     .from('room_members')
     .select('wrapped_room_key')
     .eq('room_id', params.roomId)
-    .eq('user_id', params.userId)
+    .eq('device_id', params.deviceId)
     .eq('generation', params.generation)
     .maybeSingle<{ wrapped_room_key: string }>();
   if (error) throw error;
@@ -365,21 +481,19 @@ export async function getMyWrappedRoomKey(params: {
 }
 
 /**
- * All wrapped room keys the viewer holds for a room — one per generation
- * they were ever a member at. Used by the room detail page to decrypt
- * pre-rotation blobs after a kick/leave; the current-gen row is used for
- * sending.
+ * All wrapped room keys THIS DEVICE holds for a room — one per generation.
+ * Used by the room detail page to decrypt pre-rotation blobs.
  */
 export async function listMyRoomKeyRows(
   roomId: string,
-  userId: string,
+  deviceId: string,
 ): Promise<Array<{ generation: number; wrapped_room_key: string }>> {
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from('room_members')
     .select('generation, wrapped_room_key')
     .eq('room_id', roomId)
-    .eq('user_id', userId);
+    .eq('device_id', deviceId);
   if (error) throw error;
   return data ?? [];
 }
@@ -387,22 +501,30 @@ export async function listMyRoomKeyRows(
 export async function createInvite(params: {
   roomId: string;
   invitedUserId: string;
+  invitedDeviceId: string;
+  invitedEd25519Pub: Bytes;
   invitedX25519Pub: Bytes;
   generation: number;
   wrappedRoomKey: Bytes;
   createdBy: string;
-  ttlSeconds?: number;
+  inviterDeviceId: string;
+  inviterSignature: Bytes;
+  expiresAtMs: number;
 }): Promise<string> {
   const supabase = getSupabase();
-  const ttl = params.ttlSeconds ?? 60 * 60 * 24 * 7;
   const row = {
     room_id: params.roomId,
     invited_user_id: params.invitedUserId,
+    invited_device_id: params.invitedDeviceId,
     invited_x25519_pub: await toBase64(params.invitedX25519Pub),
+    invited_ed25519_pub: await toBase64(params.invitedEd25519Pub),
     generation: params.generation,
     wrapped_room_key: await toBase64(params.wrappedRoomKey),
     created_by: params.createdBy,
-    expires_at: new Date(Date.now() + ttl * 1000).toISOString(),
+    inviter_device_id: params.inviterDeviceId,
+    expires_at: new Date(params.expiresAtMs).toISOString(),
+    expires_at_ms: params.expiresAtMs,
+    inviter_signature: await toBase64(params.inviterSignature),
   };
   const { data, error } = await supabase
     .from('room_invites')
@@ -486,6 +608,60 @@ export async function bumpRoomGeneration(
   if (error) throw error;
 }
 
+/**
+ * Atomic kick + rotate. Calls the `kick_and_rotate` SECURITY DEFINER RPC,
+ * which:
+ *   - authorizes the caller (room creator, or self-leave)
+ *   - row-locks `rooms` and rejects if `oldGeneration` doesn't match
+ *   - deletes non-self evictees FIRST (closes RLS window)
+ *   - inserts all new-generation wraps
+ *   - bumps current_generation + updates room name ciphertext
+ *   - deletes self last if this was a self-leave
+ *
+ * Replaces the old client-orchestrated 6-step sequence. Wraps shape is a plain
+ * array of `{user_id, wrapped_room_key}`; we base64-encode the wrapped key
+ * here so callers keep dealing in `Bytes`.
+ */
+export async function kickAndRotate(params: {
+  roomId: string;
+  /** user_ids to evict. Empty array for a pure rotate. */
+  evicteeUserIds: string[];
+  oldGeneration: number;
+  newGeneration: number;
+  /** One entry per recipient DEVICE. */
+  wraps: Array<{
+    userId: string;
+    deviceId: string;
+    wrappedRoomKey: Bytes;
+    wrapSignature: Bytes;
+  }>;
+  /** The caller's device id (whose Ed25519 key signed each wrap_signature). */
+  signerDeviceId: string;
+  nameCiphertext: Bytes | null;
+  nameNonce: Bytes | null;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const p_wraps = await Promise.all(
+    params.wraps.map(async (w) => ({
+      user_id: w.userId,
+      device_id: w.deviceId,
+      wrapped_room_key: await toBase64(w.wrappedRoomKey),
+      wrap_signature: await toBase64(w.wrapSignature),
+    })),
+  );
+  const { error } = await supabase.rpc('kick_and_rotate', {
+    p_room_id: params.roomId,
+    p_evictee_user_ids: params.evicteeUserIds,
+    p_old_gen: params.oldGeneration,
+    p_new_gen: params.newGeneration,
+    p_wraps,
+    p_signer_device_id: params.signerDeviceId,
+    p_name_ciphertext: params.nameCiphertext ? await toBase64(params.nameCiphertext) : null,
+    p_name_nonce: params.nameNonce ? await toBase64(params.nameNonce) : null,
+  });
+  if (error) throw error;
+}
+
 // ---------------------------------------------------------------------------
 // blobs
 // ---------------------------------------------------------------------------
@@ -493,20 +669,23 @@ export async function bumpRoomGeneration(
 export async function insertBlob(params: {
   roomId: string;
   senderId: string;
+  /** Sender device id. New (v3) blobs always carry this; legacy readers tolerate null. */
+  senderDeviceId: string;
   blob: EncryptedBlob;
-  /** Optional client-generated UUID. Required when the blob has an attachment
-   *  so the storage-object path `{roomId}/{blobId}.bin` can be computed before
-   *  the row is inserted. */
   id?: string;
 }): Promise<BlobRow> {
   const supabase = getSupabase();
   const row: Record<string, unknown> = {
     room_id: params.roomId,
     sender_id: params.senderId,
+    sender_device_id: params.senderDeviceId,
     generation: params.blob.generation,
     nonce: await toBase64(params.blob.nonce),
     ciphertext: await toBase64(params.blob.ciphertext),
-    signature: await toBase64(params.blob.signature),
+    signature:
+      params.blob.signature && params.blob.signature.byteLength > 0
+        ? await toBase64(params.blob.signature)
+        : null,
   };
   if (params.id) row.id = params.id;
   const { data, error } = await supabase
@@ -562,7 +741,7 @@ export async function decodeBlobRow(row: BlobRow): Promise<EncryptedBlob> {
   return {
     nonce: await fromBase64(row.nonce),
     ciphertext: await fromBase64(row.ciphertext),
-    signature: await fromBase64(row.signature),
+    signature: row.signature ? await fromBase64(row.signature) : new Uint8Array(0),
     generation: row.generation,
   };
 }
@@ -650,28 +829,52 @@ export async function deleteAttachmentsForRoom(roomId: string): Promise<void> {
 export interface DeviceApprovalRequestRow {
   id: string;
   user_id: string;
-  linking_pubkey: string;
   code_hash: string;
   code_salt: string;
+  /** LEGACY pre-0015 — kept for back-compat column shape. */
+  linking_pubkey: string | null;
   link_nonce: string;
+  /** v3: the new device's own bundle, so primary can sign its cert. */
+  device_id: string | null;
+  device_ed25519_pub: string | null;
+  device_x25519_pub: string | null;
+  created_at_ms: number | null;
+  identity_epoch: number | null;
+  failed_attempts: number;
   created_at: string;
   expires_at: string;
 }
 
 export async function createApprovalRequest(params: {
   userId: string;
-  linkingPubkey: Bytes;
+  /** New device's generated bundle pubkeys + id. */
+  deviceId: string;
+  deviceEd25519Pub: Bytes;
+  deviceX25519Pub: Bytes;
+  createdAtMs: number;
   codeHash: string;
   codeSalt: string;
   linkNonce: Bytes;
 }): Promise<DeviceApprovalRequestRow> {
   const supabase = getSupabase();
+  // Snapshot the current identity_epoch so a master-key rotation mid-flight
+  // invalidates this row server-side (verify_approval_code rejects mismatch).
+  const { data: idRow, error: idErr } = await supabase
+    .from('identities')
+    .select('identity_epoch')
+    .eq('user_id', params.userId)
+    .maybeSingle<{ identity_epoch: number }>();
+  if (idErr) throw idErr;
   const row = {
     user_id: params.userId,
-    linking_pubkey: await toBase64(params.linkingPubkey),
+    device_id: params.deviceId,
+    device_ed25519_pub: await toBase64(params.deviceEd25519Pub),
+    device_x25519_pub: await toBase64(params.deviceX25519Pub),
+    created_at_ms: params.createdAtMs,
     code_hash: params.codeHash,
     code_salt: params.codeSalt,
     link_nonce: await toBase64(params.linkNonce),
+    identity_epoch: idRow?.identity_epoch ?? null,
   };
   const { data, error } = await supabase
     .from('device_approval_requests')
@@ -703,6 +906,25 @@ export async function deleteApprovalRequest(id: string): Promise<void> {
     .delete()
     .eq('id', id);
   if (error) throw error;
+}
+
+/**
+ * Atomically verify a candidate code hash against a pending approval row.
+ * Server-side: increments failed_attempts on miss and deletes the row on the
+ * 5th miss, so a compromised A-session cannot brute-force the 20-bit code
+ * client-side. Returns true on match.
+ */
+export async function verifyApprovalCode(
+  requestId: string,
+  candidateHash: string,
+): Promise<boolean> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.rpc('verify_approval_code', {
+    p_request_id: requestId,
+    p_candidate_hash: candidateHash,
+  });
+  if (error) throw error;
+  return Boolean(data);
 }
 
 /** Realtime: A-side listener for any new approval requests for this user. */

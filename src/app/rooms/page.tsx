@@ -7,22 +7,27 @@ import { KeyChangeBanner } from '@/components/KeyChangeBanner';
 import { errorMessage } from '@/lib/errors';
 import { getSupabase } from '@/lib/supabase/client';
 import {
+  CryptoError,
   decryptRoomName,
   encryptRoomName,
   fromBase64,
   generateRoomKey,
-  getIdentity,
   observeContact,
+  signInviteEnvelope,
+  signMembershipWrap,
   unwrapRoomKey,
+  verifyInviteEnvelope,
   wrapRoomKeyFor,
-  type Identity,
+  type DeviceKeyBundle,
+  type PublicDevice,
 } from '@/lib/e2ee-core';
 import {
   addRoomMember,
   createInvite,
   createRoom,
   deleteInvite,
-  fetchIdentity,
+  fetchPublicDevices,
+  fetchUserMasterKeyPub,
   getMyWrappedRoomKey,
   listMyInvites,
   listMyRooms,
@@ -31,6 +36,14 @@ import {
   type RoomInviteRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
+import { loadEnrolledDevice } from '@/lib/bootstrap';
+import { publicIdentityFingerprint, verifyPublicDevice as verifyPublicDeviceChain } from '@/lib/e2ee-core';
+
+function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
 
 export default function RoomsPage() {
   return (
@@ -42,7 +55,7 @@ export default function RoomsPage() {
 
 function RoomsInner() {
   const [userId, setUserId] = useState<string | null>(null);
-  const [identity, setIdentity] = useState<Identity | null>(null);
+  const [device, setDevice] = useState<DeviceKeyBundle | null>(null);
   const [rooms, setRooms] = useState<RoomRow[]>([]);
   const [invites, setInvites] = useState<RoomInviteRow[]>([]);
   const [names, setNames] = useState<Map<string, string>>(new Map());
@@ -50,10 +63,7 @@ function RoomsInner() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!userId || !identity || rooms.length === 0) {
-      setNames(new Map());
-      return;
-    }
+    if (!userId || !device || rooms.length === 0) return;
     let cancelled = false;
     (async () => {
       const pairs = await Promise.all(
@@ -62,14 +72,14 @@ function RoomsInner() {
           try {
             const wrapped = await getMyWrappedRoomKey({
               roomId: r.id,
-              userId,
+              deviceId: device.deviceId,
               generation: r.current_generation,
             });
             if (!wrapped) return null;
             const roomKey = await unwrapRoomKey(
               { wrapped, generation: r.current_generation },
-              identity.x25519PublicKey,
-              identity.x25519PrivateKey,
+              device.x25519PublicKey,
+              device.x25519PrivateKey,
             );
             const name = await decryptRoomName({
               ciphertext: await fromBase64(r.name_ciphertext),
@@ -90,7 +100,7 @@ function RoomsInner() {
     return () => {
       cancelled = true;
     };
-  }, [userId, identity, rooms]);
+  }, [userId, device, rooms]);
 
   const reload = useCallback(
     async (uid: string) => {
@@ -111,8 +121,8 @@ function RoomsInner() {
       const { data } = await supabase.auth.getUser();
       if (!data.user) return;
       setUserId(data.user.id);
-      const id = await getIdentity(data.user.id);
-      setIdentity(id);
+      const enrolled = await loadEnrolledDevice(data.user.id);
+      setDevice(enrolled?.deviceBundle ?? null);
       await reload(data.user.id);
       setLoading(false);
     })();
@@ -157,7 +167,7 @@ function RoomsInner() {
         </div>
       </section>
 
-      {invites.length > 0 && identity && (
+      {invites.length > 0 && device && (
         <section className="space-y-2">
           <h2 className="text-base font-semibold">Pending invites</h2>
           {invites.map((invite) => (
@@ -165,7 +175,7 @@ function RoomsInner() {
               key={invite.id}
               invite={invite}
               userId={userId}
-              identity={identity}
+              device={device}
               onDone={() => void reload(userId)}
             />
           ))}
@@ -219,20 +229,19 @@ function RoomsInner() {
         </ul>
       </section>
 
-      {identity && (
+      {device && (
         <>
           <CreateRoomForm
             userId={userId}
-            identity={identity}
+            device={device}
             rooms={rooms}
             onCreated={() => void reload(userId)}
           />
           {rooms.length > 0 && (
             <InviteForm
               userId={userId}
-              identity={identity}
+              device={device}
               rooms={rooms}
-              names={names}
               onInvited={() => void reload(userId)}
             />
           )}
@@ -247,35 +256,152 @@ function RoomsInner() {
 function InviteCard({
   invite,
   userId,
-  identity,
+  device,
   onDone,
 }: {
   invite: RoomInviteRow;
   userId: string;
-  identity: Identity;
+  device: DeviceKeyBundle;
   onDone: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [inviterFingerprint, setInviterFingerprint] = useState<string | null>(null);
+
+  // Show the inviter's UMK fingerprint (the stable root identity anchor).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const umkPub = await fetchUserMasterKeyPub(invite.created_by);
+        if (cancelled || !umkPub) return;
+        // Reuse the fingerprint helper with UMK pub as both halves — stable hash.
+        setInviterFingerprint(
+          await publicIdentityFingerprint({
+            ed25519PublicKey: umkPub.ed25519PublicKey,
+            x25519PublicKey: umkPub.ed25519PublicKey,
+            selfSignature: new Uint8Array(0),
+          }),
+        );
+      } catch {
+        // non-fatal
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [invite.created_by]);
 
   async function accept() {
     setBusy(true);
     setError(null);
     try {
-      // Unwrap the room key using our own X25519 keypair.
+      // 0016 made these columns NOT NULL in the schema, so the legacy
+      // "unsigned invite" path is no longer reachable from normal inserts.
+      // Must be addressed to THIS device.
+      if (invite.invited_device_id !== device.deviceId) {
+        throw new Error(
+          'invite is addressed to a different device of yours — open the app on that device to accept',
+        );
+      }
+
+      // Fetch inviter's UMK pub and device list; find the signing device
+      // and verify its cert.
+      const inviterUmk = await fetchUserMasterKeyPub(invite.created_by);
+      if (!inviterUmk) throw new Error('inviter has no published UMK');
+      const inviterDevices = await fetchPublicDevices(invite.created_by);
+      const inviterDev = inviterDevices.find(
+        (d) => d.deviceId === invite.inviter_device_id,
+      );
+      if (!inviterDev) {
+        throw new Error('inviter device not found in published device list');
+      }
+      try {
+        await verifyPublicDeviceChain(inviterDev, inviterUmk.ed25519PublicKey);
+      } catch {
+        throw new Error(
+          'inviter device cert did not verify against their UMK — refusing',
+        );
+      }
+
+      const tofuContact = {
+        ed25519PublicKey: inviterUmk.ed25519PublicKey,
+        x25519PublicKey: inviterDev.x25519PublicKey,
+        selfSignature: new Uint8Array(0),
+      };
+      const tofu = await observeContact(invite.created_by, tofuContact);
+      if (tofu.status === 'changed') {
+        throw new Error(
+          'inviter\'s UMK has changed — acknowledge the key change banner before accepting',
+        );
+      }
+
+      const invitedEd = await fromBase64(invite.invited_ed25519_pub);
+      const invitedX = await fromBase64(invite.invited_x25519_pub);
       const wrappedBytes = await fromBase64(invite.wrapped_room_key);
+      const envSig = await fromBase64(invite.inviter_signature);
+      if (
+        !bytesEq(invitedEd, device.ed25519PublicKey) ||
+        !bytesEq(invitedX, device.x25519PublicKey)
+      ) {
+        throw new Error(
+          'invite pubkeys don\'t match this device — refusing',
+        );
+      }
+
+      try {
+        await verifyInviteEnvelope(
+          {
+            roomId: invite.room_id,
+            generation: invite.generation,
+            invitedUserId: userId,
+            invitedDeviceId: device.deviceId,
+            invitedDeviceEd25519PublicKey: invitedEd,
+            invitedDeviceX25519PublicKey: invitedX,
+            wrappedRoomKey: wrappedBytes,
+            inviterUserId: invite.created_by,
+            inviterDeviceId: invite.inviter_device_id,
+            expiresAtMs: invite.expires_at_ms,
+          },
+          envSig,
+          inviterDev.ed25519PublicKey,
+        );
+      } catch (err) {
+        if (err instanceof CryptoError && err.code === 'SIGNATURE_INVALID') {
+          throw new Error(
+            'invite signature did not verify — refusing (possible server tampering)',
+          );
+        }
+        throw err;
+      }
+
+      // Unwrap the room key using this device's X25519 keypair.
       const roomKey = await unwrapRoomKey(
         { wrapped: wrappedBytes, generation: invite.generation },
-        identity.x25519PublicKey,
-        identity.x25519PrivateKey,
+        device.x25519PublicKey,
+        device.x25519PrivateKey,
       );
-      // Re-wrap for ourselves and insert room_members.
-      const selfWrap = await wrapRoomKeyFor(roomKey, identity.x25519PublicKey);
+      // Re-wrap for this device, sign the membership row.
+      const selfWrap = await wrapRoomKeyFor(roomKey, device.x25519PublicKey);
+      const selfWrapSig = await signMembershipWrap(
+        {
+          roomId: invite.room_id,
+          generation: invite.generation,
+          memberUserId: userId,
+          memberDeviceId: device.deviceId,
+          wrappedRoomKey: selfWrap.wrapped,
+          signerDeviceId: device.deviceId,
+        },
+        device.ed25519PrivateKey,
+      );
       await addRoomMember({
         roomId: invite.room_id,
         userId,
+        deviceId: device.deviceId,
         generation: invite.generation,
         wrappedRoomKey: selfWrap.wrapped,
+        signerDeviceId: device.deviceId,
+        wrapSignature: selfWrapSig,
       });
       await deleteInvite(invite.id);
       onDone();
@@ -305,6 +431,15 @@ function InviteCard({
         <code className="font-mono text-xs">{invite.room_id.slice(0, 8)}</code>{' '}
         from <code className="font-mono text-xs">{invite.created_by.slice(0, 8)}</code>
       </div>
+      {inviterFingerprint && (
+        <div className="mt-1 text-xs text-neutral-600 dark:text-neutral-400">
+          inviter safety number: <code className="font-mono">{inviterFingerprint}</code>
+          <br />
+          <span className="text-neutral-500">
+            confirm this matches the inviter out-of-band (phone, in person) before accepting
+          </span>
+        </div>
+      )}
       <div className="mt-2 flex gap-2">
         <button
           onClick={() => void accept()}
@@ -328,12 +463,12 @@ function InviteCard({
 
 function CreateRoomForm({
   userId,
-  identity,
+  device,
   rooms,
   onCreated,
 }: {
   userId: string;
-  identity: Identity;
+  device: DeviceKeyBundle;
   rooms: RoomRow[];
   onCreated: () => void;
 }) {
@@ -348,20 +483,32 @@ function CreateRoomForm({
     setBusy(true);
     setError(null);
     try {
-      // We need the room id before we can bind the name ciphertext's AD, so
-      // create the room first, then a second update writes the encrypted name.
       const room = await createRoom({
         kind,
         parentRoomId: parentId || null,
         createdBy: userId,
       });
       const roomKey = await generateRoomKey(room.current_generation);
-      const selfWrap = await wrapRoomKeyFor(roomKey, identity.x25519PublicKey);
+      const selfWrap = await wrapRoomKeyFor(roomKey, device.x25519PublicKey);
+      const selfWrapSig = await signMembershipWrap(
+        {
+          roomId: room.id,
+          generation: room.current_generation,
+          memberUserId: userId,
+          memberDeviceId: device.deviceId,
+          wrappedRoomKey: selfWrap.wrapped,
+          signerDeviceId: device.deviceId,
+        },
+        device.ed25519PrivateKey,
+      );
       await addRoomMember({
         roomId: room.id,
         userId,
+        deviceId: device.deviceId,
         generation: room.current_generation,
         wrappedRoomKey: selfWrap.wrapped,
+        signerDeviceId: device.deviceId,
+        wrapSignature: selfWrapSig,
       });
       if (name.trim()) {
         const enc = await encryptRoomName({ name, roomId: room.id, roomKey });
@@ -449,15 +596,13 @@ function CreateRoomForm({
 
 function InviteForm({
   userId,
-  identity,
+  device,
   rooms,
-  names,
   onInvited,
 }: {
   userId: string;
-  identity: Identity;
+  device: DeviceKeyBundle;
   rooms: RoomRow[];
-  names: Map<string, string>;
   onInvited: () => void;
 }) {
   const [roomId, setRoomId] = useState(rooms[0]?.id ?? '');
@@ -522,36 +667,78 @@ function InviteForm({
           'this pair room already has two people — pair rooms are capped at 2',
         );
       }
-      // Fetch the invitee's public identity.
-      const inviteePub = await fetchIdentity(inviteeId);
-      if (!inviteePub) throw new Error('that user has no published identity');
-      // TOFU observation (emits key-change events if applicable). Best-effort —
-      // a banner is informational and shouldn't abort the invite.
-      try {
-        await observeContact(inviteeId, inviteePub);
-      } catch (err) {
-        console.error('observeContact failed for invitee', inviteeId, errorMessage(err));
+      // Fetch + verify invitee's UMK pub and device list. Pick the most
+      // recently created active device as the invite target. Later, that
+      // device will rewrap for the invitee's other devices on accept.
+      const inviteeUmk = await fetchUserMasterKeyPub(inviteeId);
+      if (!inviteeUmk) throw new Error('that user has no published UMK');
+      const inviteeDevices = await fetchPublicDevices(inviteeId);
+      const activeDevices: PublicDevice[] = [];
+      for (const d of inviteeDevices) {
+        try {
+          await verifyPublicDeviceChain(d, inviteeUmk.ed25519PublicKey);
+          activeDevices.push(d);
+        } catch {
+          // skip revoked/invalid devices
+        }
       }
-      // Need our wrapped room key so we can unwrap the roomKey, then re-wrap for invitee.
+      if (activeDevices.length === 0) {
+        throw new Error('invitee has no active signed devices');
+      }
+      const targetDev = activeDevices[activeDevices.length - 1];
+
+      const tofuContact = {
+        ed25519PublicKey: inviteeUmk.ed25519PublicKey,
+        x25519PublicKey: targetDev.x25519PublicKey,
+        selfSignature: new Uint8Array(0),
+      };
+      const tofu = await observeContact(inviteeId, tofuContact);
+      if (tofu.status === 'changed') {
+        throw new Error(
+          'invitee\'s UMK has changed since you last saw it — acknowledge the key change before inviting',
+        );
+      }
+
       const myWrapped = await getMyWrappedRoomKey({
         roomId,
-        userId,
+        deviceId: device.deviceId,
         generation: room.current_generation,
       });
       if (!myWrapped) throw new Error('you are not a current-generation member of that room');
       const roomKey = await unwrapRoomKey(
         { wrapped: myWrapped, generation: room.current_generation },
-        identity.x25519PublicKey,
-        identity.x25519PrivateKey,
+        device.x25519PublicKey,
+        device.x25519PrivateKey,
       );
-      const inviteeWrap = await wrapRoomKeyFor(roomKey, inviteePub.x25519PublicKey);
+      const inviteeWrap = await wrapRoomKeyFor(roomKey, targetDev.x25519PublicKey);
+      const expiresAtMs = Date.now() + 60 * 60 * 24 * 7 * 1000;
+      const envelopeSig = await signInviteEnvelope(
+        {
+          roomId,
+          generation: room.current_generation,
+          invitedUserId: inviteeId,
+          invitedDeviceId: targetDev.deviceId,
+          invitedDeviceEd25519PublicKey: targetDev.ed25519PublicKey,
+          invitedDeviceX25519PublicKey: targetDev.x25519PublicKey,
+          wrappedRoomKey: inviteeWrap.wrapped,
+          inviterUserId: userId,
+          inviterDeviceId: device.deviceId,
+          expiresAtMs,
+        },
+        device.ed25519PrivateKey,
+      );
       await createInvite({
         roomId,
         invitedUserId: inviteeId,
-        invitedX25519Pub: inviteePub.x25519PublicKey,
+        invitedDeviceId: targetDev.deviceId,
+        invitedEd25519Pub: targetDev.ed25519PublicKey,
+        invitedX25519Pub: targetDev.x25519PublicKey,
         generation: room.current_generation,
         wrappedRoomKey: inviteeWrap.wrapped,
         createdBy: userId,
+        inviterDeviceId: device.deviceId,
+        inviterSignature: envelopeSig,
+        expiresAtMs,
       });
       setStatus('Invite sent.');
       setInviteeId('');
@@ -577,11 +764,8 @@ function InviteForm({
           className="mt-1 block w-full rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-900"
         >
           {rooms.map((r) => {
-            const name = names.get(r.id);
             const full = fullness.get(r.id) ?? false;
-            const base = name
-              ? `${name} · ${r.kind}`
-              : `${r.id.slice(0, 8)} · ${r.kind} · gen ${r.current_generation}`;
+            const base = `${r.id.slice(0, 8)} · ${r.kind} · gen ${r.current_generation}`;
             const label = full ? `${base} · full` : base;
             return (
               <option key={r.id} value={r.id} disabled={full}>

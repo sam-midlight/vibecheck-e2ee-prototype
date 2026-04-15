@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { onKeyChange, acceptKeyChange, type KeyChangeEvent } from '@/lib/e2ee-core';
-import { fetchIdentity } from '@/lib/supabase/queries';
+import { fetchPublicDevices, fetchUserMasterKeyPub } from '@/lib/supabase/queries';
 
 /**
  * Listens globally for TOFU key-change events. Each unacknowledged change
@@ -22,9 +22,17 @@ export function KeyChangeBanner() {
   if (events.length === 0) return null;
 
   async function trust(e: KeyChangeEvent) {
-    const pub = await fetchIdentity(e.userId);
-    if (!pub) return;
-    await acceptKeyChange(e.userId, pub);
+    const umk = await fetchUserMasterKeyPub(e.userId);
+    if (!umk) return;
+    const devices = await fetchPublicDevices(e.userId);
+    // Pick the most-recent active device's x25519 pub for the TOFU cache.
+    const latest = devices[devices.length - 1];
+    if (!latest) return;
+    await acceptKeyChange(e.userId, {
+      ed25519PublicKey: umk.ed25519PublicKey,
+      x25519PublicKey: latest.x25519PublicKey,
+      selfSignature: new Uint8Array(0),
+    });
     setEvents((prev) => prev.filter((x) => x !== e));
   }
   function dismiss(e: KeyChangeEvent) {

@@ -135,16 +135,22 @@ import { generateApprovalCode, generateApprovalSalt, hashApprovalCode } from '@/
 // B (new device) creates a request:
 const code = await generateApprovalCode();            // 6 digits, shown on B's screen
 const salt = await generateApprovalSalt();            // 16-byte hex
-const codeHash = await hashApprovalCode(code, salt);  // sha256(salt||code), hex
+const codeHash = await hashApprovalCode(code, salt, linkKeys.x25519PublicKey, linkKeys.linkNonce);
+// sha256('vibecheck:approval:v2' || salt || code || linkingPub || linkNonce)
 // INSERT into device_approval_requests { linking_pubkey, code_hash, code_salt, link_nonce }
 
-// A (existing device) sees the request via realtime, prompts for the code:
-if (await hashApprovalCode(typedByUser, req.code_salt) !== req.code_hash) reject();
+// A (existing device) sees the request via realtime, prompts for the code.
+// VERIFY against the ROW's current linking_pubkey/link_nonce — if an attacker
+// mutated the row, the hash will mismatch and we refuse to seal.
+const expected = await hashApprovalCode(typedByUser, req.code_salt, req.linking_pubkey, req.link_nonce);
+if (expected !== req.code_hash) reject();
 const sealed = await sealIdentityForLink(aIdentity, req.linking_pubkey);
 // INSERT into device_link_handoffs { link_nonce, inviting_user_id, sealed_payload }
 ```
 
-Why hash and not store plaintext: defense-in-depth for DB dumps. Real security is the 10-min TTL + single-use — 20 bits of code entropy means no KDF meaningfully slows brute-force.
+Why transcript-bind linking_pubkey + link_nonce into the hash: without it, an attacker with row-write access could swap `linking_pubkey` for their own, the code hash would still verify, and A would seal the identity to the attacker. Binding both into the hash makes any row mutation invalidate the verify step.
+
+Why hash (rather than store plaintext): defense-in-depth for DB dumps. Real security is short TTL + single-use + server-side attempt caps — 20 bits of code entropy means no KDF meaningfully slows brute-force.
 
 ### Recovery phrase — `recovery.ts`
 

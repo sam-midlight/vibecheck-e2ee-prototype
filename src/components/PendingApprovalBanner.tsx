@@ -1,46 +1,51 @@
 'use client';
 
 /**
- * Shown on already-signed-in devices (device A) when a new device (B) has
- * posted a pending `device_approval_requests` row for this account.
+ * A-side of device approval (v3, per-device identities).
  *
- * Flow on A:
- *   1. Banner appears for each pending request.
- *   2. User enters the 6-digit code displayed on B.
- *   3. On match: seal identity with B's linking pubkey, write handoff row,
- *      delete the approval request.
- *   4. On mismatch: show error, let user try again (or ignore).
- *   5. Request TTL on the server also deletes stale rows.
+ * When a new device (B) posts a `device_approval_requests` row, any
+ * already-signed-in device whose user is the UMK-holder can approve. Flow:
  *
- * We deliberately do NOT show any fingerprint/metadata that would let an
- * attacker (who has compromised this auth) push the user into tapping Approve
- * out of habit. The only way forward is entering the code printed on B.
+ *   1. B's request carries B's freshly-generated device_ed_pub + device_x_pub
+ *      + device_id + a bound code_hash.
+ *   2. User of this device (A) types the 6-digit code shown on B.
+ *   3. We verify the candidate hash against the row (server-side RPC that
+ *      rate-limits failed attempts).
+ *   4. On match, A's UMK priv signs an issuance certificate for B's pubs.
+ *   5. A INSERTs a `devices` row with B's pubs + that cert.
+ *   6. The approval request row is deleted.
+ *   7. B polls, sees its own device_id in the device list with a valid cert,
+ *      finishes enrollment locally.
+ *
+ * This device only offers the approve button if it currently holds the UMK
+ * priv (stored in IndexedDB as the `userMasterKey` row). Non-UMK devices see
+ * nothing — they can't issue certs.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   fromBase64,
+  getUserMasterKey,
   hashApprovalCode,
-  getIdentity,
-  sealIdentityForLink,
-  type Identity,
+  signDeviceIssuance,
+  type UserMasterKey,
 } from '@/lib/e2ee-core';
 import { errorMessage } from '@/lib/errors';
 import { getSupabase } from '@/lib/supabase/client';
 import {
   deleteApprovalRequest,
   listPendingApprovalRequests,
-  postLinkHandoff,
+  registerDevice,
   subscribeApprovalRequests,
+  verifyApprovalCode,
   type DeviceApprovalRequestRow,
 } from '@/lib/supabase/queries';
 
 export function PendingApprovalBanner() {
   const [userId, setUserId] = useState<string | null>(null);
-  const [identity, setIdentity] = useState<Identity | null>(null);
+  const [umk, setUmk] = useState<UserMasterKey | null>(null);
   const [requests, setRequests] = useState<DeviceApprovalRequestRow[]>([]);
 
-  // Load session + local identity (we need it to seal when we fulfil).
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -48,8 +53,8 @@ export function PendingApprovalBanner() {
       const { data } = await supabase.auth.getUser();
       if (cancelled || !data.user) return;
       setUserId(data.user.id);
-      const id = await getIdentity(data.user.id);
-      if (!cancelled && id) setIdentity(id);
+      const k = await getUserMasterKey(data.user.id);
+      if (!cancelled && k) setUmk(k);
     })();
     return () => {
       cancelled = true;
@@ -62,15 +67,13 @@ export function PendingApprovalBanner() {
     seenIds.current.add(row.id);
     setRequests((prev) => [...prev, row]);
   }, []);
-
   const dropRequest = useCallback((id: string) => {
     seenIds.current.delete(id);
     setRequests((prev) => prev.filter((r) => r.id !== id));
   }, []);
 
-  // Load already-pending requests + subscribe to new ones.
   useEffect(() => {
-    if (!userId || !identity) return;
+    if (!userId || !umk) return;
     let cancelled = false;
     (async () => {
       try {
@@ -86,9 +89,9 @@ export function PendingApprovalBanner() {
       cancelled = true;
       unsub();
     };
-  }, [userId, identity, addRequest]);
+  }, [userId, umk, addRequest]);
 
-  if (!identity || requests.length === 0) return null;
+  if (!umk || requests.length === 0) return null;
 
   return (
     <div className="space-y-2">
@@ -96,7 +99,7 @@ export function PendingApprovalBanner() {
         <ApprovalCard
           key={req.id}
           request={req}
-          identity={identity}
+          umk={umk}
           onResolved={() => dropRequest(req.id)}
         />
       ))}
@@ -106,11 +109,11 @@ export function PendingApprovalBanner() {
 
 function ApprovalCard({
   request,
-  identity,
+  umk,
   onResolved,
 }: {
   request: DeviceApprovalRequestRow;
-  identity: Identity;
+  umk: UserMasterKey;
   onResolved: () => void;
 }) {
   const [code, setCode] = useState('');
@@ -124,17 +127,56 @@ function ApprovalCard({
       if (!/^[0-9]{6}$/.test(code)) {
         throw new Error('enter the 6 digits shown on the new device');
       }
-      const expected = await hashApprovalCode(code, request.code_salt);
-      if (expected !== request.code_hash) {
+      if (
+        !request.device_ed25519_pub ||
+        !request.device_x25519_pub ||
+        !request.device_id ||
+        request.created_at_ms == null
+      ) {
+        throw new Error(
+          'approval row missing v3 fields (pre-0015 request? ask B to retry)',
+        );
+      }
+
+      const devEdPub = await fromBase64(request.device_ed25519_pub);
+      const devXPub = await fromBase64(request.device_x25519_pub);
+      const linkNonce = await fromBase64(request.link_nonce);
+
+      // Transcript-bound hash: if a row-mutating attacker swapped any of the
+      // device pubs or nonce, the hash will mismatch and we refuse.
+      const candidate = await hashApprovalCode(
+        code,
+        request.code_salt,
+        devXPub,
+        linkNonce,
+      );
+      const matched = await verifyApprovalCode(request.id, candidate);
+      if (!matched) {
         throw new Error('code did not match — check the new device screen');
       }
-      const linkingPub = await fromBase64(request.linking_pubkey);
-      const sealed = await sealIdentityForLink(identity, linkingPub);
-      const linkNonce = await fromBase64(request.link_nonce);
-      await postLinkHandoff({
-        linkNonce,
-        invitingUserId: request.user_id,
-        sealedPayload: sealed,
+
+      // Sign an issuance cert for B's device bundle.
+      const issuanceSig = await signDeviceIssuance(
+        {
+          userId: request.user_id,
+          deviceId: request.device_id,
+          deviceEd25519PublicKey: devEdPub,
+          deviceX25519PublicKey: devXPub,
+          createdAtMs: request.created_at_ms,
+        },
+        umk.ed25519PrivateKey,
+      );
+      await registerDevice({
+        userId: request.user_id,
+        deviceId: request.device_id,
+        deviceEd25519Pub: devEdPub,
+        deviceX25519Pub: devXPub,
+        issuanceCreatedAtMs: request.created_at_ms,
+        issuanceSignature: issuanceSig,
+        // A (this device) can't seal B's display name — only B has the x
+        // priv for B's own device. B fills this in via
+        // setDeviceDisplayNameCiphertext after it picks up the cert.
+        displayNameCiphertext: null,
       });
       await deleteApprovalRequest(request.id);
       onResolved();

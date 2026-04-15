@@ -11,7 +11,8 @@ import {
   decodeBlobRow,
   deleteAttachment,
   downloadAttachment,
-  fetchIdentity,
+  fetchPublicDevices,
+  fetchUserMasterKeyPub,
   getMyWrappedRoomKey,
   insertBlob,
   listDevices,
@@ -24,6 +25,7 @@ import {
   bytesEqual,
   CryptoError,
   decryptBlob,
+  decryptDeviceDisplayName,
   decryptImageAttachment,
   encryptBlob,
   fromBase64,
@@ -31,24 +33,26 @@ import {
   generateApprovalSalt,
   generateRecoveryPhrase,
   generateRoomKey,
-  getIdentity,
   getSodium,
+  getUserMasterKey,
   hashApprovalCode,
   isPhraseValid,
   prepareImageForUpload,
   randomBytes,
+  signMembershipWrap,
   signMessage,
-  toBase64,
   toHex,
-  unwrapIdentityWithPhrase,
   unwrapRoomKey,
+  unwrapUserMasterKeyWithPhrase,
   verifyMessage,
-  verifySelfSignature,
-  wrapIdentityWithPhrase,
+  verifyPublicDevice,
   wrapRoomKeyFor,
-  type Identity,
+  wrapUserMasterKeyWithPhrase,
+  type DeviceKeyBundle,
   type RoomKey,
+  type UserMasterKey,
 } from '@/lib/e2ee-core';
+import { loadEnrolledDevice } from '@/lib/bootstrap';
 
 const CHECK_NAMES = [
   'Sodium (libsodium WASM) ready',
@@ -72,7 +76,8 @@ type CheckName = (typeof CHECK_NAMES)[number];
 
 interface Context {
   userId: string;
-  identity: Identity;
+  device: DeviceKeyBundle;
+  umk: UserMasterKey | null;
   roomId: string;
   roomKey: RoomKey;
   lastBlobRow?: BlobRow;
@@ -150,36 +155,45 @@ export default function StatusPage() {
     }
     ctx.userId = userId;
 
-    ctx.identity = await runStep(CHECK_NAMES[1], async () => {
-      const identity = await getIdentity(userId);
-      if (!identity) throw new Error('No identity found in IndexedDB for this user.');
+    const enrolled = await runStep(CHECK_NAMES[1], async () => {
+      const e = await loadEnrolledDevice(userId);
+      if (!e) throw new Error('No device bundle in IndexedDB for this user.');
       return {
-        detail: `ed25519_pub=${(await toBase64(identity.ed25519PublicKey)).slice(0, 24)}…`,
-        result: identity,
+        detail: `deviceId=${e.deviceBundle.deviceId.slice(0, 8)}…, UMK holder=${e.umk ? 'yes' : 'no'}`,
+        result: e,
       };
     });
-    if (!ctx.identity) return finish(allOk);
+    if (!enrolled) return finish(allOk);
+    ctx.device = enrolled.deviceBundle;
+    ctx.umk = enrolled.umk ?? (await getUserMasterKey(userId));
 
     await runStep(CHECK_NAMES[2], async () => {
-      const pub = await fetchIdentity(userId);
-      if (!pub) throw new Error('No identities row on server.');
-      const match = await bytesEqual(pub.ed25519PublicKey, ctx.identity!.ed25519PublicKey);
-      if (!match) throw new Error('Local Ed25519 pub does not match published one.');
-      return { detail: 'local === server' };
+      const umkPub = await fetchUserMasterKeyPub(userId);
+      if (!umkPub) throw new Error('No identities row on server.');
+      if (ctx.umk) {
+        const match = await bytesEqual(umkPub.ed25519PublicKey, ctx.umk.ed25519PublicKey);
+        if (!match) throw new Error('Local UMK pub does not match published one.');
+        return { detail: 'local UMK === server UMK' };
+      }
+      return { detail: 'UMK not on this device (secondary) — published pub fetched' };
     });
 
     await runStep(CHECK_NAMES[3], async () => {
-      const pub = await fetchIdentity(userId);
-      if (!pub) throw new Error('Identity not on server.');
-      const ok = await verifySelfSignature(pub);
-      if (!ok) throw new Error('self_signature does not verify against ed25519_pub.');
-      return { detail: 'sign(ed_pub || x_pub) verified' };
+      // In v3 the published "self_signature" is gone; we instead verify that
+      // this device's cert chains to the published UMK pub.
+      const umkPub = await fetchUserMasterKeyPub(userId);
+      if (!umkPub) throw new Error('No UMK on server.');
+      const devices = await fetchPublicDevices(userId);
+      const me = devices.find((d) => d.deviceId === ctx.device!.deviceId);
+      if (!me) throw new Error('This device not in published device list.');
+      await verifyPublicDevice(me, umkPub.ed25519PublicKey);
+      return { detail: 'device cert verifies against published UMK' };
     });
 
     await runStep(CHECK_NAMES[4], async () => {
       const msg = await randomBytes(64);
-      const sig = await signMessage(msg, ctx.identity!.ed25519PrivateKey);
-      const ok = await verifyMessage(msg, sig, ctx.identity!.ed25519PublicKey);
+      const sig = await signMessage(msg, ctx.device!.ed25519PrivateKey);
+      const ok = await verifyMessage(msg, sig, ctx.device!.ed25519PublicKey);
       if (!ok) throw new Error('signature did not verify');
       return { detail: `signed + verified 64 random bytes (sig=${sig.byteLength}B)` };
     });
@@ -192,20 +206,23 @@ export default function StatusPage() {
         payload,
         roomId,
         roomKey,
-        senderEd25519PrivateKey: ctx.identity!.ed25519PrivateKey,
+        senderUserId: userId,
+        senderDeviceId: ctx.device!.deviceId,
+        senderDeviceEd25519PrivateKey: ctx.device!.ed25519PrivateKey,
       });
       const back = await decryptBlob<typeof payload>({
         blob,
         roomId,
         roomKey,
-        senderEd25519PublicKey: ctx.identity!.ed25519PublicKey,
+        resolveSenderDeviceEd25519Pub: async (_uid, did) =>
+          did === ctx.device!.deviceId ? ctx.device!.ed25519PublicKey : null,
       });
-      if (back.probe !== 'hello') throw new Error('payload mismatch');
+      if (back.payload.probe !== 'hello') throw new Error('payload mismatch');
       return { detail: 'JSON roundtrip OK' };
     });
 
     const testRoom = await runStep(CHECK_NAMES[6], async () => {
-      const existing = await findOrCreateTestRoom(userId, ctx.identity!);
+      const existing = await findOrCreateTestRoom(userId, ctx.device!);
       return {
         detail: `room_id=${existing.roomId} gen=${existing.roomKey.generation}`,
         result: existing,
@@ -222,11 +239,14 @@ export default function StatusPage() {
         payload,
         roomId: ctx.roomId!,
         roomKey: ctx.roomKey!,
-        senderEd25519PrivateKey: ctx.identity!.ed25519PrivateKey,
+        senderUserId: userId,
+        senderDeviceId: ctx.device!.deviceId,
+        senderDeviceEd25519PrivateKey: ctx.device!.ed25519PrivateKey,
       });
       const row = await insertBlob({
         roomId: ctx.roomId!,
         senderId: userId,
+        senderDeviceId: ctx.device!.deviceId,
         blob,
       });
       return {
@@ -260,11 +280,14 @@ export default function StatusPage() {
             payload,
             roomId: ctx.roomId!,
             roomKey: ctx.roomKey!,
-            senderEd25519PrivateKey: ctx.identity!.ed25519PrivateKey,
+            senderUserId: userId,
+            senderDeviceId: ctx.device!.deviceId,
+            senderDeviceEd25519PrivateKey: ctx.device!.ed25519PrivateKey,
           });
           await insertBlob({
             roomId: ctx.roomId!,
             senderId: userId,
+            senderDeviceId: ctx.device!.deviceId,
             blob,
           }).catch((err) => finish(() => reject(err)));
         };
@@ -278,9 +301,10 @@ export default function StatusPage() {
                 blob,
                 roomId: ctx.roomId!,
                 roomKey: ctx.roomKey!,
-                senderEd25519PublicKey: ctx.identity!.ed25519PublicKey,
+                resolveSenderDeviceEd25519Pub: async (_uid, did) =>
+                  did === ctx.device!.deviceId ? ctx.device!.ed25519PublicKey : null,
               });
-              if (decoded.probeId === probeId) {
+              if (decoded.payload.probeId === probeId) {
                 finish(() => resolve(Math.round(performance.now() - start)));
               }
             } catch {
@@ -318,7 +342,7 @@ export default function StatusPage() {
       const blob = {
         nonce: await fromBase64(row.nonce),
         ciphertext: tampered,
-        signature: await fromBase64(row.signature),
+        signature: row.signature ? await fromBase64(row.signature) : new Uint8Array(0),
         generation: row.generation,
       };
       try {
@@ -326,7 +350,8 @@ export default function StatusPage() {
           blob,
           roomId: ctx.roomId!,
           roomKey: ctx.roomKey!,
-          senderEd25519PublicKey: ctx.identity!.ed25519PublicKey,
+          resolveSenderDeviceEd25519Pub: async (_uid, did) =>
+            did === ctx.device!.deviceId ? ctx.device!.ed25519PublicKey : null,
         });
       } catch (e) {
         if (e instanceof CryptoError) {
@@ -339,23 +364,49 @@ export default function StatusPage() {
 
     await runStep(CHECK_NAMES[11], async () => {
       const devices = await listDevices(userId);
-      const names = devices
-        .map((d) => `  · ${d.display_name} (id ${d.id.slice(0, 8)}…)`)
-        .join('\n');
-      return { detail: `${devices.length} device(s):\n${names}` };
+      const lines: string[] = [];
+      for (const d of devices) {
+        let label: string;
+        if (d.display_name_ciphertext && d.id === ctx.device!.deviceId) {
+          const plain = await decryptDeviceDisplayName(
+            await fromBase64(d.display_name_ciphertext),
+            ctx.device!.x25519PublicKey,
+            ctx.device!.x25519PrivateKey,
+          );
+          label = plain ?? '(sealed to self; decrypt failed)';
+        } else if (d.display_name_ciphertext) {
+          label = '(sealed to its owning device)';
+        } else if (d.display_name) {
+          label = `${d.display_name} (legacy plaintext)`;
+        } else {
+          label = '(no label)';
+        }
+        lines.push(`  · ${label} (id ${d.id.slice(0, 8)}…)`);
+      }
+      return { detail: `${devices.length} device(s):\n${lines.join('\n')}` };
     });
 
     await runStep(CHECK_NAMES[12], async () => {
       const code = await generateApprovalCode();
       const salt = await generateApprovalSalt();
-      const expected = await hashApprovalCode(code, salt);
-      const redo = await hashApprovalCode(code, salt);
+      const linkingPub = new Uint8Array(32);
+      const linkNonce = new Uint8Array(32);
+      crypto.getRandomValues(linkingPub);
+      crypto.getRandomValues(linkNonce);
+      const expected = await hashApprovalCode(code, salt, linkingPub, linkNonce);
+      const redo = await hashApprovalCode(code, salt, linkingPub, linkNonce);
       if (expected !== redo) throw new Error('hash not deterministic');
-      const wrong = await hashApprovalCode('000000', salt);
+      const wrong = await hashApprovalCode('000000', salt, linkingPub, linkNonce);
       if (wrong === expected && code !== '000000') {
         throw new Error('hash collided with different code (should not happen)');
       }
-      return { detail: `code=${code} hash=${expected.slice(0, 16)}…` };
+      const swappedPub = new Uint8Array(32);
+      crypto.getRandomValues(swappedPub);
+      const tampered = await hashApprovalCode(code, salt, swappedPub, linkNonce);
+      if (tampered === expected) {
+        throw new Error('hash did not detect linking_pubkey swap (transcript binding broken)');
+      }
+      return { detail: `code=${code} hash=${expected.slice(0, 16)}… (pubkey-bound)` };
     });
 
     await runStep(CHECK_NAMES[13], async () => {
@@ -364,30 +415,27 @@ export default function StatusPage() {
       // recovery_blobs so the user's real escrow (if any) is untouched.
       const phrase = generateRecoveryPhrase();
       if (!isPhraseValid(phrase)) throw new Error('generated phrase failed own checksum');
-      const wrapped = await wrapIdentityWithPhrase(
-        ctx.identity!,
+      if (!ctx.umk) {
+        return { detail: 'this device is not the UMK holder; skipping local wrap roundtrip' };
+      }
+      const wrapped = await wrapUserMasterKeyWithPhrase(
+        ctx.umk,
         phrase,
         ctx.userId!,
-        { opslimit: 2, memlimit: 64 * 1024 * 1024 }, // lower Argon2 cost for the /status check only
+        { opslimit: 2, memlimit: 64 * 1024 * 1024 },
       );
-      const unwrapped = await unwrapIdentityWithPhrase(
+      const unwrapped = await unwrapUserMasterKeyWithPhrase(
         { ...wrapped, kdfOpslimit: 2, kdfMemlimit: 64 * 1024 * 1024 },
         phrase,
         ctx.userId!,
       );
       const edOk = await bytesEqual(
         unwrapped.ed25519PrivateKey,
-        ctx.identity!.ed25519PrivateKey,
+        ctx.umk.ed25519PrivateKey,
       );
-      const xOk = await bytesEqual(
-        unwrapped.x25519PrivateKey,
-        ctx.identity!.x25519PrivateKey,
-      );
-      if (!edOk || !xOk) {
-        throw new Error('unwrapped private keys do not match original');
-      }
+      if (!edOk) throw new Error('unwrapped UMK priv does not match original');
       return {
-        detail: `24 words → Argon2id → XChaCha20 wrap → unwrap → priv halves identical`,
+        detail: `24 words → Argon2id → XChaCha20 wrap → unwrap → UMK priv identical`,
       };
     });
 
@@ -492,7 +540,7 @@ export default function StatusPage() {
  */
 async function findOrCreateTestRoom(
   userId: string,
-  identity: Identity,
+  device: DeviceKeyBundle,
 ): Promise<{ roomId: string; roomKey: RoomKey }> {
   const supabase = getSupabase();
 
@@ -509,8 +557,6 @@ async function findOrCreateTestRoom(
 
   if (selfRef.length > 0) {
     const keep = selfRef[0];
-    // Delete any extra self-ref rooms the old bug left behind. Best-effort —
-    // ignore errors so a stuck one doesn't block health checks.
     for (const extra of selfRef.slice(1)) {
       await supabase.from('rooms').delete().eq('id', extra.id).then(
         () => undefined,
@@ -519,29 +565,41 @@ async function findOrCreateTestRoom(
     }
     const wrapped = await getMyWrappedRoomKey({
       roomId: keep.id,
-      userId,
+      deviceId: device.deviceId,
       generation: keep.current_generation,
     });
     if (wrapped) {
       const roomKey = await unwrapRoomKey(
         { wrapped, generation: keep.current_generation },
-        identity.x25519PublicKey,
-        identity.x25519PrivateKey,
+        device.x25519PublicKey,
+        device.x25519PrivateKey,
       );
       return { roomId: keep.id, roomKey };
     }
-    // We own the row but lost access to its current-gen key — fall through
-    // and rebuild from scratch.
   }
 
   const room = await createRoom({ kind: 'group', createdBy: userId });
   const roomKey = await generateRoomKey(room.current_generation);
-  const wrapped = await wrapRoomKeyFor(roomKey, identity.x25519PublicKey);
+  const wrapped = await wrapRoomKeyFor(roomKey, device.x25519PublicKey);
+  const selfWrapSig = await signMembershipWrap(
+    {
+      roomId: room.id,
+      generation: room.current_generation,
+      memberUserId: userId,
+      memberDeviceId: device.deviceId,
+      wrappedRoomKey: wrapped.wrapped,
+      signerDeviceId: device.deviceId,
+    },
+    device.ed25519PrivateKey,
+  );
   await addRoomMember({
     roomId: room.id,
     userId,
+    deviceId: device.deviceId,
     generation: room.current_generation,
     wrappedRoomKey: wrapped.wrapped,
+    signerDeviceId: device.deviceId,
+    wrapSignature: selfWrapSig,
   });
   // Stamp the self-reference marker. Uses the existing `rooms_member_update`
   // policy — we just added ourselves as a current-gen member above.
