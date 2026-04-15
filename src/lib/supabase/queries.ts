@@ -403,6 +403,17 @@ export async function deleteInvite(inviteId: string): Promise<void> {
   if (error) throw error;
 }
 
+/**
+ * Delete a room and everything in it. Only the creator can do this
+ * (enforced by the `rooms_creator_delete` RLS policy). Child rows in
+ * room_members, room_invites, and blobs cascade automatically.
+ */
+export async function deleteRoom(roomId: string): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.from('rooms').delete().eq('id', roomId);
+  if (error) throw error;
+}
+
 export async function bumpRoomGeneration(
   roomId: string,
   newGeneration: number,

@@ -1,6 +1,7 @@
 'use client';
 
 import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { AppShell } from '@/components/AppShell';
 import { KeyChangeBanner } from '@/components/KeyChangeBanner';
 import { errorMessage } from '@/lib/errors';
@@ -23,6 +24,7 @@ import {
   addRoomMember,
   bumpRoomGeneration,
   decodeBlobRow,
+  deleteRoom,
   fetchIdentity,
   getMyWrappedRoomKey,
   insertBlob,
@@ -58,6 +60,7 @@ export default function RoomDetailPage({
 }
 
 function RoomInner({ roomId }: { roomId: string }) {
+  const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [room, setRoom] = useState<RoomRow | null>(null);
@@ -149,20 +152,27 @@ function RoomInner({ roomId }: { roomId: string }) {
     })();
   }, [loadAll]);
 
-  // Subscribe to realtime blobs for this room.
-  useEffect(() => {
-    if (!identity || !userId) return;
-    const unsub = subscribeBlobs(roomId, async (row) => {
+  const ingestBlobRow = useCallback(
+    async (row: BlobRow) => {
       const rk = roomKeyRef.current;
-      if (!rk) return;
+      if (!rk || !identity || !userId) return;
       const decoded = await decodeAndVerify(row, rk, identity, userId);
       setBlobs((prev) => {
         if (prev.some((b) => b.id === decoded.id)) return prev;
         return [...prev, decoded];
       });
+    },
+    [identity, userId],
+  );
+
+  // Subscribe to realtime blobs for this room.
+  useEffect(() => {
+    if (!identity || !userId) return;
+    const unsub = subscribeBlobs(roomId, (row) => {
+      void ingestBlobRow(row);
     });
     return unsub;
-  }, [roomId, identity, userId]);
+  }, [roomId, identity, userId, ingestBlobRow]);
 
   if (loading) return <p className="text-sm text-neutral-500">loading…</p>;
   if (error) {
@@ -197,12 +207,37 @@ function RoomInner({ roomId }: { roomId: string }) {
             )}
           </p>
         </div>
-        <button
-          onClick={() => setRenameOpen(true)}
-          className="shrink-0 rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
-        >
-          {roomName ? 'rename' : 'set name'}
-        </button>
+        <div className="flex shrink-0 gap-2">
+          <button
+            onClick={() => setRenameOpen(true)}
+            className="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
+          >
+            {roomName ? 'rename' : 'set name'}
+          </button>
+          {room.created_by === userId && (
+            <button
+              onClick={async () => {
+                const label = roomName ?? room.id.slice(0, 8);
+                if (
+                  !confirm(
+                    `Delete room "${label}" for everyone?\n\nThis removes all members, invites, and every encrypted message in it. It cannot be undone.`,
+                  )
+                ) {
+                  return;
+                }
+                try {
+                  await deleteRoom(roomId);
+                  router.replace('/rooms');
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e));
+                }
+              }}
+              className="rounded border border-red-300 px-2 py-1 text-xs text-red-700 dark:border-red-800 dark:text-red-400"
+            >
+              delete
+            </button>
+          )}
+        </div>
       </div>
 
       {renameOpen && (
@@ -236,6 +271,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         userId={userId}
         identity={identity}
         roomKey={roomKey}
+        onSent={ingestBlobRow}
       />
     </div>
   );
@@ -568,11 +604,13 @@ function Composer({
   userId,
   identity,
   roomKey,
+  onSent,
 }: {
   roomId: string;
   userId: string;
   identity: Identity;
   roomKey: RoomKey;
+  onSent: (row: BlobRow) => void;
 }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
@@ -590,9 +628,10 @@ function Composer({
         roomKey,
         senderEd25519PrivateKey: identity.ed25519PrivateKey,
       });
-      await insertBlob({ roomId, senderId: userId, blob });
+      const row = await insertBlob({ roomId, senderId: userId, blob });
       setText('');
-      // Realtime will deliver it back into the feed.
+      // Render immediately; the realtime echo will dedupe (rows keyed by id).
+      onSent(row);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
