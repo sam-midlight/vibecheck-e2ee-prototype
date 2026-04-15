@@ -82,7 +82,8 @@ export class CryptoError extends Error {
       | 'SIGNATURE_INVALID'
       | 'SELF_SIG_INVALID'
       | 'BAD_KEY_LENGTH'
-      | 'BAD_GENERATION',
+      | 'BAD_GENERATION'
+      | 'BAD_INPUT',
   ) {
     super(message);
     this.name = 'CryptoError';

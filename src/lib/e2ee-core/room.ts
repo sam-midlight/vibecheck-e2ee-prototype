@@ -13,9 +13,21 @@
  */
 
 import { CryptoError, type Bytes, type RoomKey, type WrappedRoomKey } from './types';
-import { getSodium, randomBytes, assertLength } from './sodium';
+import {
+  bytesToString,
+  concatBytes,
+  fromHex,
+  getSodium,
+  randomBytes,
+  stringToBytes,
+  assertLength,
+} from './sodium';
 
 const ROOM_KEY_BYTES = 32;
+const NAME_NONCE_BYTES = 24;
+const NAME_MAX_BYTES = 256;
+/** Field tag included in AD so a name ciphertext can never be swapped with a blob ciphertext. */
+const NAME_AD_TAG = stringToBytes('vibecheck:name:v1');
 
 /** Generate a fresh 32-byte room key at the given generation (defaults to 1). */
 export async function generateRoomKey(generation = 1): Promise<RoomKey> {
@@ -80,4 +92,79 @@ export async function rotateRoomKey(
 export async function zeroRoomKey(roomKey: RoomKey): Promise<void> {
   const sodium = await getSodium();
   sodium.memzero(roomKey.key);
+}
+
+/**
+ * Encrypt a room's display name under its current room key.
+ *
+ * Unsigned — any current member is allowed to rename, so we don't tie this to
+ * one identity. Confidentiality + tamper-detection come from XChaCha20-Poly1305
+ * (AEAD). The AD binds the ciphertext to (roomId, generation, "name" field
+ * tag) so it can't be swapped with a blob ciphertext or replayed into a
+ * different room even though they share the same key.
+ */
+export async function encryptRoomName(params: {
+  name: string;
+  roomId: string;
+  roomKey: RoomKey;
+}): Promise<{ ciphertext: Bytes; nonce: Bytes }> {
+  const { name, roomId, roomKey } = params;
+  const trimmed = name.trim();
+  if (!trimmed) throw new CryptoError('room name cannot be empty', 'BAD_INPUT');
+  const plaintext = stringToBytes(trimmed);
+  if (plaintext.length > NAME_MAX_BYTES) {
+    throw new CryptoError(
+      `room name too long (${plaintext.length} > ${NAME_MAX_BYTES} bytes)`,
+      'BAD_INPUT',
+    );
+  }
+  const sodium = await getSodium();
+  const nonce = await randomBytes(NAME_NONCE_BYTES);
+  const ad = await buildNameAd(roomId, roomKey.generation);
+  const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+    plaintext,
+    ad,
+    null,
+    nonce,
+    roomKey.key,
+  );
+  sodium.memzero(plaintext);
+  return { ciphertext, nonce };
+}
+
+/** Decrypt a room name. Returns null if inputs are null; throws on tamper. */
+export async function decryptRoomName(params: {
+  ciphertext: Bytes | null;
+  nonce: Bytes | null;
+  roomId: string;
+  roomKey: RoomKey;
+}): Promise<string | null> {
+  const { ciphertext, nonce, roomId, roomKey } = params;
+  if (!ciphertext || !nonce) return null;
+  const sodium = await getSodium();
+  const ad = await buildNameAd(roomId, roomKey.generation);
+  let plaintext: Bytes;
+  try {
+    plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+      null,
+      ciphertext,
+      ad,
+      nonce,
+      roomKey.key,
+    );
+  } catch {
+    throw new CryptoError('room-name decryption failed (tampered or wrong key)', 'DECRYPT_FAILED');
+  }
+  try {
+    return bytesToString(plaintext);
+  } finally {
+    sodium.memzero(plaintext);
+  }
+}
+
+async function buildNameAd(roomId: string, generation: number): Promise<Bytes> {
+  const uuidBytes = await fromHex(roomId.replaceAll('-', ''));
+  const gen = new Uint8Array(4);
+  new DataView(gen.buffer).setUint32(0, generation, false);
+  return concatBytes(NAME_AD_TAG, uuidBytes, gen);
 }

@@ -7,6 +7,8 @@ import { KeyChangeBanner } from '@/components/KeyChangeBanner';
 import { errorMessage } from '@/lib/errors';
 import { getSupabase } from '@/lib/supabase/client';
 import {
+  decryptRoomName,
+  encryptRoomName,
   fromBase64,
   generateRoomKey,
   getIdentity,
@@ -24,6 +26,7 @@ import {
   getMyWrappedRoomKey,
   listMyInvites,
   listMyRooms,
+  renameRoom,
   type RoomInviteRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
@@ -41,8 +44,52 @@ function RoomsInner() {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [rooms, setRooms] = useState<RoomRow[]>([]);
   const [invites, setInvites] = useState<RoomInviteRow[]>([]);
+  const [names, setNames] = useState<Map<string, string>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!userId || !identity || rooms.length === 0) {
+      setNames(new Map());
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const pairs = await Promise.all(
+        rooms.map(async (r): Promise<[string, string] | null> => {
+          if (!r.name_ciphertext || !r.name_nonce) return null;
+          try {
+            const wrapped = await getMyWrappedRoomKey({
+              roomId: r.id,
+              userId,
+              generation: r.current_generation,
+            });
+            if (!wrapped) return null;
+            const roomKey = await unwrapRoomKey(
+              { wrapped, generation: r.current_generation },
+              identity.x25519PublicKey,
+              identity.x25519PrivateKey,
+            );
+            const name = await decryptRoomName({
+              ciphertext: await fromBase64(r.name_ciphertext),
+              nonce: await fromBase64(r.name_nonce),
+              roomId: r.id,
+              roomKey,
+            });
+            return name ? [r.id, name] : null;
+          } catch (e) {
+            console.error('room-name decrypt failed', r.id, errorMessage(e));
+            return null;
+          }
+        }),
+      );
+      if (cancelled) return;
+      setNames(new Map(pairs.filter((p): p is [string, string] => p !== null)));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [userId, identity, rooms]);
 
   const reload = useCallback(
     async (uid: string) => {
@@ -120,31 +167,42 @@ function RoomsInner() {
           <p className="mt-2 text-sm text-neutral-500">No rooms yet. Create one below.</p>
         )}
         <ul className="mt-2 space-y-2">
-          {rooms.map((room) => (
-            <li
-              key={room.id}
-              className="flex items-center justify-between rounded border border-neutral-200 px-3 py-2 text-sm dark:border-neutral-800"
-            >
-              <div>
-                <span className="font-mono text-xs text-neutral-500">{room.id.slice(0, 8)}</span>{' '}
-                <span className="ml-2 rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] uppercase dark:bg-neutral-900">
-                  {room.kind}
-                </span>
-                <span className="ml-2 text-xs text-neutral-500">gen {room.current_generation}</span>
-                {room.parent_room_id && (
-                  <span className="ml-2 text-xs text-neutral-500">
-                    ↳ child of {room.parent_room_id.slice(0, 8)}
-                  </span>
-                )}
-              </div>
-              <Link
-                href={`/rooms/${room.id}`}
-                className="rounded bg-neutral-900 px-2 py-1 text-xs text-white dark:bg-white dark:text-neutral-900"
+          {rooms.map((room) => {
+            const name = names.get(room.id);
+            return (
+              <li
+                key={room.id}
+                className="flex items-center justify-between rounded border border-neutral-200 px-3 py-2 text-sm dark:border-neutral-800"
               >
-                open →
-              </Link>
-            </li>
-          ))}
+                <div className="min-w-0">
+                  {name ? (
+                    <span className="font-medium">{name}</span>
+                  ) : (
+                    <span className="font-mono text-xs text-neutral-500">
+                      {room.id.slice(0, 8)}
+                    </span>
+                  )}
+                  <span className="ml-2 rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] uppercase dark:bg-neutral-900">
+                    {room.kind}
+                  </span>
+                  <span className="ml-2 text-xs text-neutral-500">
+                    gen {room.current_generation}
+                  </span>
+                  {room.parent_room_id && (
+                    <span className="ml-2 text-xs text-neutral-500">
+                      ↳ child of {room.parent_room_id.slice(0, 8)}
+                    </span>
+                  )}
+                </div>
+                <Link
+                  href={`/rooms/${room.id}`}
+                  className="ml-2 rounded bg-neutral-900 px-2 py-1 text-xs text-white dark:bg-white dark:text-neutral-900"
+                >
+                  open →
+                </Link>
+              </li>
+            );
+          })}
         </ul>
       </section>
 
@@ -267,6 +325,7 @@ function CreateRoomForm({
 }) {
   const [kind, setKind] = useState<'pair' | 'group'>('pair');
   const [parentId, setParentId] = useState<string>('');
+  const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -275,6 +334,8 @@ function CreateRoomForm({
     setBusy(true);
     setError(null);
     try {
+      // We need the room id before we can bind the name ciphertext's AD, so
+      // create the room first, then a second update writes the encrypted name.
       const room = await createRoom({
         kind,
         parentRoomId: parentId || null,
@@ -288,8 +349,17 @@ function CreateRoomForm({
         generation: room.current_generation,
         wrappedRoomKey: selfWrap.wrapped,
       });
+      if (name.trim()) {
+        const enc = await encryptRoomName({ name, roomId: room.id, roomKey });
+        await renameRoom({
+          roomId: room.id,
+          nameCiphertext: enc.ciphertext,
+          nameNonce: enc.nonce,
+        });
+      }
       onCreated();
       setParentId('');
+      setName('');
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -303,6 +373,17 @@ function CreateRoomForm({
       className="space-y-3 rounded border border-neutral-200 p-4 dark:border-neutral-800"
     >
       <h2 className="text-base font-semibold">Create room</h2>
+      <div>
+        <label className="text-xs text-neutral-500">name (optional, encrypted)</label>
+        <input
+          type="text"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          maxLength={120}
+          placeholder="e.g. dinner planning"
+          className="mt-1 block w-full rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-900"
+        />
+      </div>
       <div className="flex gap-3 text-sm">
         <label className="flex items-center gap-1">
           <input

@@ -51,6 +51,8 @@ export interface RoomRow {
   current_generation: number;
   created_by: string;
   created_at: string;
+  name_ciphertext: string | null;
+  name_nonce: string | null;
 }
 
 export interface RoomMemberRow {
@@ -251,19 +253,45 @@ export async function createRoom(params: {
   kind: 'pair' | 'group';
   parentRoomId?: string | null;
   createdBy: string;
+  nameCiphertext?: Bytes | null;
+  nameNonce?: Bytes | null;
 }): Promise<RoomRow> {
   const supabase = getSupabase();
+  const row: Record<string, unknown> = {
+    kind: params.kind,
+    parent_room_id: params.parentRoomId ?? null,
+    created_by: params.createdBy,
+  };
+  if (params.nameCiphertext && params.nameNonce) {
+    row.name_ciphertext = await toBase64(params.nameCiphertext);
+    row.name_nonce = await toBase64(params.nameNonce);
+  }
   const { data, error } = await supabase
     .from('rooms')
-    .insert({
-      kind: params.kind,
-      parent_room_id: params.parentRoomId ?? null,
-      created_by: params.createdBy,
-    })
+    .insert(row)
     .select('*')
     .single<RoomRow>();
   if (error) throw error;
   return data;
+}
+
+/** Replace a room's encrypted display name. Pass nulls to clear the name. */
+export async function renameRoom(params: {
+  roomId: string;
+  nameCiphertext: Bytes | null;
+  nameNonce: Bytes | null;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from('rooms')
+    .update({
+      name_ciphertext:
+        params.nameCiphertext ? await toBase64(params.nameCiphertext) : null,
+      name_nonce:
+        params.nameNonce ? await toBase64(params.nameNonce) : null,
+    })
+    .eq('id', params.roomId);
+  if (error) throw error;
 }
 
 export async function addRoomMember(params: {

@@ -8,7 +8,10 @@ import { getSupabase } from '@/lib/supabase/client';
 import {
   CryptoError,
   decryptBlob,
+  decryptRoomName,
   encryptBlob,
+  encryptRoomName,
+  fromBase64,
   getIdentity,
   observeContact,
   rotateRoomKey,
@@ -25,6 +28,7 @@ import {
   insertBlob,
   listBlobs,
   listRoomMembers,
+  renameRoom,
   subscribeBlobs,
   type BlobRow,
   type RoomMemberRow,
@@ -58,8 +62,10 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [room, setRoom] = useState<RoomRow | null>(null);
   const [roomKey, setRoomKey] = useState<RoomKey | null>(null);
+  const [roomName, setRoomName] = useState<string | null>(null);
   const [members, setMembers] = useState<RoomMemberRow[]>([]);
   const [blobs, setBlobs] = useState<DecodedBlob[]>([]);
+  const [renameOpen, setRenameOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const roomKeyRef = useRef<RoomKey | null>(null);
@@ -94,6 +100,23 @@ function RoomInner({ roomId }: { roomId: string }) {
       );
       setRoomKey(rk);
       roomKeyRef.current = rk;
+
+      if (roomRow.name_ciphertext && roomRow.name_nonce) {
+        try {
+          const name = await decryptRoomName({
+            ciphertext: await fromBase64(roomRow.name_ciphertext),
+            nonce: await fromBase64(roomRow.name_nonce),
+            roomId,
+            roomKey: rk,
+          });
+          setRoomName(name);
+        } catch (e) {
+          console.error('room-name decrypt failed', errorMessage(e));
+          setRoomName(null);
+        }
+      } else {
+        setRoomName(null);
+      }
 
       const mems = await listRoomMembers(roomId);
       setMembers(mems);
@@ -155,16 +178,47 @@ function RoomInner({ roomId }: { roomId: string }) {
     <div className="mx-auto max-w-2xl space-y-4">
       <KeyChangeBanner />
 
-      <div className="flex items-baseline justify-between">
-        <div>
-          <h1 className="text-xl font-semibold">
-            Room <code className="font-mono text-sm">{room.id.slice(0, 8)}</code>
+      <div className="flex items-baseline justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="truncate text-xl font-semibold">
+            {roomName ?? (
+              <span className="text-neutral-500">
+                Room <code className="font-mono text-sm">{room.id.slice(0, 8)}</code>
+              </span>
+            )}
           </h1>
           <p className="text-xs text-neutral-500">
             {room.kind} · gen {room.current_generation} · {members.filter((m) => m.generation === room.current_generation).length} member(s)
+            {roomName && (
+              <>
+                {' · '}
+                <code className="font-mono">{room.id.slice(0, 8)}</code>
+              </>
+            )}
           </p>
         </div>
+        <button
+          onClick={() => setRenameOpen(true)}
+          className="shrink-0 rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
+        >
+          {roomName ? 'rename' : 'set name'}
+        </button>
       </div>
+
+      {renameOpen && (
+        <RenameRoomDialog
+          roomId={roomId}
+          roomKey={roomKey}
+          initialName={roomName ?? ''}
+          onClose={() => setRenameOpen(false)}
+          onSaved={(newName) => {
+            setRoomName(newName);
+            setRenameOpen(false);
+            // Also refresh the room row so name_ciphertext is current in state.
+            void loadAll(userId, identity);
+          }}
+        />
+      )}
 
       <MemberList
         room={room}
@@ -301,6 +355,35 @@ function MemberList({
           wrappedRoomKey: wraps[i].wrapped,
         });
       }
+      // If the room has an encrypted name, re-encrypt it under the new key so
+      // remaining members can still read it at the new generation. Decrypt
+      // with the old key first (AD is bound to generation).
+      if (room.name_ciphertext && room.name_nonce) {
+        try {
+          const oldName = await decryptRoomName({
+            ciphertext: await fromBase64(room.name_ciphertext),
+            nonce: await fromBase64(room.name_nonce),
+            roomId: room.id,
+            roomKey,
+          });
+          if (oldName) {
+            const enc = await encryptRoomName({
+              name: oldName,
+              roomId: room.id,
+              roomKey: next,
+            });
+            await renameRoom({
+              roomId: room.id,
+              nameCiphertext: enc.ciphertext,
+              nameNonce: enc.nonce,
+            });
+          }
+        } catch (err) {
+          // Don't block rotation on a name-recrypt failure; clear the name instead.
+          console.error('name re-encrypt failed, clearing', errorMessage(err));
+          await renameRoom({ roomId: room.id, nameCiphertext: null, nameNonce: null });
+        }
+      }
       // Bump generation pointer.
       await bumpRoomGeneration(room.id, next.generation);
       // Delete removed user's rows (all generations for clean-up).
@@ -395,6 +478,90 @@ function safeStringify(p: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
+
+function RenameRoomDialog({
+  roomId,
+  roomKey,
+  initialName,
+  onClose,
+  onSaved,
+}: {
+  roomId: string;
+  roomKey: RoomKey;
+  initialName: string;
+  onClose: () => void;
+  onSaved: (name: string) => void;
+}) {
+  const [name, setName] = useState(initialName);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const trimmed = name.trim();
+      if (!trimmed) {
+        await renameRoom({ roomId, nameCiphertext: null, nameNonce: null });
+        onSaved('');
+        return;
+      }
+      const enc = await encryptRoomName({ name: trimmed, roomId, roomKey });
+      await renameRoom({
+        roomId,
+        nameCiphertext: enc.ciphertext,
+        nameNonce: enc.nonce,
+      });
+      onSaved(trimmed);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <form
+        onSubmit={save}
+        className="w-full max-w-md space-y-3 rounded-lg bg-white p-5 shadow-xl dark:bg-neutral-900"
+      >
+        <h2 className="text-base font-semibold">Rename room</h2>
+        <p className="text-xs text-neutral-500">
+          The name is encrypted with the room key — members see it, the server
+          only sees ciphertext. Leave blank to clear the name.
+        </p>
+        <input
+          type="text"
+          value={name}
+          autoFocus
+          onChange={(e) => setName(e.target.value)}
+          maxLength={120}
+          placeholder="e.g. dinner planning"
+          className="block w-full rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-950"
+        />
+        {error && <p className="text-xs text-red-600">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
+          >
+            cancel
+          </button>
+          <button
+            type="submit"
+            disabled={busy}
+            className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+          >
+            {busy ? 'saving…' : 'save'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
 
 function Composer({
   roomId,
