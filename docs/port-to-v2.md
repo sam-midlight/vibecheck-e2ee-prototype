@@ -27,6 +27,10 @@ Copy these things verbatim:
 - `supabase/migrations/0018_purge_stale_invites_on_rotate.sql` — extends `kick_and_rotate` to DELETE `room_invites` at `generation < new_gen` in the same transaction. Closes a race where a stale invite (wrapping a superseded gen's key) could be accepted after a rotation, leaving the invitee with a row that's immediately purged by the next rotation's FS cleanup.
 - `supabase/migrations/0019_retain_10_generations.sql` — widens the FS purge window from 2 gens to 10. `kick_and_rotate`'s purge clause is now `< p_new_gen - 9`. Returning members on a fresh session can decrypt ~9 rotations of past history instead of ~1. Retrospective-only security surface (sealed bytes remain opaque at rest).
 
+- `supabase/migrations/0020_nullable_linking_pubkey.sql` — drops NOT NULL on the legacy `device_approval_requests.linking_pubkey` column (v3 approval flow doesn't populate it; was blocking mobile sign-in).
+
+**Multi-device sync note (critical for V2):** all membership-changing actions must use `wrapRoomKeyForAllMyDevices` (not single-device `addRoomMember`) and all invite-send paths must use `sendInviteToAllDevices` (not single-device `createInvite`). These helpers in `bootstrap.ts` ensure every device on the user's account gets immediate access to every room, and invites can be accepted from any device. If you add a new room-join flow, use these helpers. See the rotation paths in `rooms/[id]/page.tsx` for how keepers' devices are enumerated during key rotation.
+
 **Additional top-level files to copy beyond `src/lib/e2ee-core/`:**
 - `src/lib/bootstrap.ts` — app-glue layer above e2ee-core. Contains `bootstrapNewUser`, `enrollDeviceWithUmk`, `loadEnrolledDevice`, `rotateUserMasterKey`, `rotateAllRoomsIAdmin`. Not portable the same way e2ee-core is — imports from `supabase/queries` — so either copy verbatim alongside the queries module, or re-implement against your own data layer.
 - `src/components/PinSetupModal.tsx` — shared mandatory-capable passphrase setup modal. Used by auth callback (enforced default) and settings (change passphrase).
