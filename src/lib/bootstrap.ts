@@ -14,6 +14,7 @@ import {
   encryptRoomKeyForBackup,
   filterActiveDevices,
   fromBase64,
+  generateCallKey,
   getBackupKey,
   generateDeviceKeyBundle,
   generateUserMasterKey,
@@ -29,8 +30,13 @@ import {
   signMembershipWrap,
   toBase64,
   unwrapRoomKey,
+  unwrapCallKey,
+  verifyCallEnvelope,
   verifyPublicDevice,
+  wrapAndSignCallEnvelope,
   wrapRoomKeyFor,
+  zeroCallKey,
+  type CallKey,
   type DeviceKeyBundle,
   type PublicDevice,
   type UserMasterKey,
@@ -42,12 +48,17 @@ import {
   createInvite,
   fetchPublicDevices,
   fetchUserMasterKeyPub,
+  fetchCallKeyEnvelope,
   getMyWrappedRoomKey,
   kickAndRotate,
+  listCallMembers,
   listRoomMembers,
   publishUserMasterKey,
   registerDevice,
+  rotateCallKey as rpcRotateCallKey,
+  startCall as rpcStartCall,
   upsertKeyBackup,
+  type CallEnvelopeInput,
   type RoomRow,
 } from '@/lib/supabase/queries';
 
@@ -627,6 +638,368 @@ export async function sendInviteToAllDevices(params: {
       expiresAtMs,
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Call key distribution (v3 video calls — migration 0023 + e2ee-core/call.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Enumerate every active device for every current member of a room, and
+ * chain-verify each device's issuance cert against its user's UMK pub.
+ * Returns `(userId, device)` pairs suitable for envelope generation.
+ *
+ * Used by `startCallInRoom` to compute the initial envelope set, and by
+ * `rotateCallKeyForCurrentMembers` to compute the re-wrap set.
+ */
+async function verifiedMemberDevices(roomId: string): Promise<
+  Array<{ userId: string; device: PublicDevice }>
+> {
+  const members = await listRoomMembers(roomId);
+  const currentGen = members.reduce((g, m) => Math.max(g, m.generation), 0);
+  const uniqueUserIds = Array.from(
+    new Set(members.filter((m) => m.generation === currentGen).map((m) => m.user_id)),
+  );
+
+  const out: Array<{ userId: string; device: PublicDevice }> = [];
+  for (const userId of uniqueUserIds) {
+    const umkPub = await fetchUserMasterKeyPub(userId);
+    if (!umkPub) continue;
+    const devices = await filterActiveDevices(
+      await fetchPublicDevices(userId),
+      umkPub.ed25519PublicKey,
+    );
+    for (const d of devices) out.push({ userId, device: d });
+  }
+  return out;
+}
+
+/** Default reconnection-grace window (§6.5). */
+export const HEARTBEAT_GRACE_SECONDS = 30;
+
+/**
+ * Filter call_members to the subset considered "currently active" — left_at
+ * is null AND last_seen_at is within `graceSeconds` of now.
+ *
+ * Separating stale from left matters because:
+ *   - a "left" device is explicitly gone and should be evicted on rotation;
+ *   - a "stale" device has dropped a heartbeat but might return within
+ *     grace (§6.5) — we don't want to keep rotating on every flap, but we
+ *     also don't want them to block rotation permanently.
+ *
+ * For rotator election we intersect the two: only non-stale, non-left
+ * devices can be the rotator. For re-wrapping on rotation we include
+ * non-left (including briefly-stale) so returning devices don't have to
+ * rejoin from scratch — they were never evicted, only skipped for the
+ * election.
+ */
+export function filterActiveCallMembers<
+  T extends { left_at: string | null; last_seen_at: string },
+>(members: T[], graceSeconds = HEARTBEAT_GRACE_SECONDS): T[] {
+  const cutoff = Date.now() - graceSeconds * 1000;
+  return members.filter((m) => {
+    if (m.left_at !== null) return false;
+    return Date.parse(m.last_seen_at) >= cutoff;
+  });
+}
+
+/**
+ * Deterministic rotator election (§6.3 of the design doc).
+ *
+ * Rule: lowest `(joined_at ASC, device_id ASC)` among currently-active
+ * members. "Active" = left_at null AND last_seen_at within grace. Pure
+ * computation — no coordination. If two nodes compute the same answer,
+ * only one wins the `rotate_call_key` RPC thanks to the DB's
+ * `new_gen = current + 1` check.
+ */
+export async function isDesignatedRotator(params: {
+  callId: string;
+  myDeviceId: string;
+  graceSeconds?: number;
+}): Promise<boolean> {
+  const members = await listCallMembers(params.callId);
+  const active = filterActiveCallMembers(members, params.graceSeconds).sort(
+    (a, b) => {
+      if (a.joined_at !== b.joined_at) return a.joined_at.localeCompare(b.joined_at);
+      return a.device_id.localeCompare(b.device_id);
+    },
+  );
+  return active.length > 0 && active[0].device_id === params.myDeviceId;
+}
+
+/**
+ * Return the device_ids of call_members who have gone stale (past
+ * `graceSeconds` since last heartbeat) but haven't formally left.
+ * Used by the stale-sweep loop in the call UI: if any are present and
+ * this client is the designated rotator, trigger a rotation that
+ * excludes them.
+ */
+export async function listStaleCallDeviceIds(
+  callId: string,
+  graceSeconds = HEARTBEAT_GRACE_SECONDS,
+): Promise<string[]> {
+  const members = await listCallMembers(callId);
+  const cutoff = Date.now() - graceSeconds * 1000;
+  return members
+    .filter((m) => m.left_at === null && Date.parse(m.last_seen_at) < cutoff)
+    .map((m) => m.device_id);
+}
+
+/**
+ * Start a new E2EE video call in a room. Generates a CallKey, wraps it to
+ * every verified-active member device, signs each envelope with the acting
+ * device's ed25519 priv, and atomically creates the call via the
+ * `start_call` RPC. Returns the generated call_id and the CallKey so the
+ * caller can hand both to the LiveKit adapter.
+ */
+export async function startCallInRoom(params: {
+  roomId: string;
+  userId: string;
+  device: DeviceKeyBundle;
+}): Promise<{ callId: string; callKey: CallKey }> {
+  const { roomId, device } = params;
+  const callId = crypto.randomUUID();
+  const callKey = await generateCallKey(1);
+
+  const targets = await verifiedMemberDevices(roomId);
+  if (targets.length === 0) {
+    throw new Error('room has no verified-active member devices — cannot start call');
+  }
+
+  const envelopes: CallEnvelopeInput[] = [];
+  for (const { userId: targetUserId, device: targetDevice } of targets) {
+    const env = await wrapAndSignCallEnvelope({
+      callKey,
+      callId,
+      targetDeviceId: targetDevice.deviceId,
+      targetX25519PublicKey: targetDevice.x25519PublicKey,
+      senderDeviceId: device.deviceId,
+      senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
+    });
+    envelopes.push({
+      targetDeviceId: targetDevice.deviceId,
+      targetUserId,
+      ciphertext: env.ciphertext,
+      signature: env.signature,
+    });
+  }
+
+  await rpcStartCall({
+    callId,
+    roomId,
+    signerDeviceId: device.deviceId,
+    envelopes,
+  });
+
+  return { callId, callKey };
+}
+
+/**
+ * Fetch the envelope addressed to this device at `generation`, verify the
+ * sender's signature chain (sender's device cert → sender's UMK), and
+ * unwrap the CallKey. Returns `null` if no envelope exists yet (the
+ * rotator hasn't included us — caller waits for the next rotation).
+ */
+export async function fetchAndUnwrapCallKey(params: {
+  callId: string;
+  generation: number;
+  device: DeviceKeyBundle;
+}): Promise<CallKey | null> {
+  const { callId, generation, device } = params;
+  const row = await fetchCallKeyEnvelope({
+    callId,
+    generation,
+    targetDeviceId: device.deviceId,
+  });
+  if (!row) return null;
+
+  const ciphertext = await fromBase64(row.ciphertext);
+  const signature = await fromBase64(row.signature);
+
+  // Resolve + verify the sender device. We fetch the user's UMK pub via
+  // the devices row's user_id, then chain-verify the device's issuance cert.
+  const supabase = getSupabase();
+  const { data: senderRow, error: senderErr } = await supabase
+    .from('devices')
+    .select('id, user_id, device_ed25519_pub, device_x25519_pub, issuance_created_at_ms, issuance_signature, revoked_at_ms, revocation_signature')
+    .eq('id', row.sender_device_id)
+    .maybeSingle();
+  if (senderErr) throw senderErr;
+  if (!senderRow) {
+    throw new Error(`unknown sender device ${row.sender_device_id}`);
+  }
+  const senderUmk = await fetchUserMasterKeyPub(senderRow.user_id);
+  if (!senderUmk) {
+    throw new Error(`no UMK for sender user ${senderRow.user_id}`);
+  }
+  const senderPublicDevice: PublicDevice = {
+    deviceId: senderRow.id,
+    userId: senderRow.user_id,
+    ed25519PublicKey: await fromBase64(senderRow.device_ed25519_pub),
+    x25519PublicKey: await fromBase64(senderRow.device_x25519_pub),
+    createdAtMs: senderRow.issuance_created_at_ms,
+    issuanceSignature: await fromBase64(senderRow.issuance_signature),
+    revocation:
+      senderRow.revoked_at_ms != null && senderRow.revocation_signature != null
+        ? {
+            revokedAtMs: senderRow.revoked_at_ms,
+            signature: await fromBase64(senderRow.revocation_signature),
+          }
+        : null,
+  };
+  // verifyPublicDevice throws on CERT_INVALID or DEVICE_REVOKED — both are
+  // "don't trust this envelope." Propagate and let the caller handle.
+  await verifyPublicDevice(senderPublicDevice, senderUmk.ed25519PublicKey);
+
+  await verifyCallEnvelope(
+    {
+      callId,
+      generation,
+      targetDeviceId: device.deviceId,
+      senderDeviceId: row.sender_device_id,
+      ciphertext,
+    },
+    signature,
+    senderPublicDevice.ed25519PublicKey,
+  );
+
+  return unwrapCallKey(
+    ciphertext,
+    generation,
+    device.x25519PublicKey,
+    device.x25519PrivateKey,
+  );
+}
+
+/**
+ * Rotator-only. Generates a fresh CallKey, wraps it for every active
+ * member device (excluding any in `excludeDeviceIds`), and calls
+ * `rotate_call_key` RPC. Concurrent rotators lose on the DB's
+ * `p_new_gen = current + 1` check — caller should catch and re-read.
+ */
+export async function rotateCallKeyForCurrentMembers(params: {
+  callId: string;
+  device: DeviceKeyBundle;
+  oldGeneration: number;
+  excludeDeviceIds?: string[];
+}): Promise<CallKey> {
+  const { callId, device, oldGeneration, excludeDeviceIds = [] } = params;
+  const newGeneration = oldGeneration + 1;
+  const excluded = new Set(excludeDeviceIds);
+
+  // Target set = current active call_members (left_at IS NULL), minus any
+  // excluded devices (e.g. the device that just left or was revoked).
+  const callMembers = await listCallMembers(callId);
+  const activeMemberDeviceIds = new Set(
+    callMembers.filter((m) => m.left_at === null).map((m) => m.device_id),
+  );
+
+  // Resolve device public material. We need x25519 pubs to wrap + UMK chain
+  // to verify each is still trusted. Batch by user_id to avoid N+1 UMK fetches.
+  const membersByUser = new Map<string, string[]>();
+  for (const m of callMembers) {
+    if (m.left_at !== null) continue;
+    if (excluded.has(m.device_id)) continue;
+    const arr = membersByUser.get(m.user_id) ?? [];
+    arr.push(m.device_id);
+    membersByUser.set(m.user_id, arr);
+  }
+
+  const callKey = await generateCallKey(newGeneration);
+  const envelopes: CallEnvelopeInput[] = [];
+
+  for (const [userId, wantedDeviceIds] of membersByUser) {
+    const umkPub = await fetchUserMasterKeyPub(userId);
+    if (!umkPub) continue;
+    const active = await filterActiveDevices(
+      await fetchPublicDevices(userId),
+      umkPub.ed25519PublicKey,
+    );
+    for (const d of active) {
+      if (!wantedDeviceIds.includes(d.deviceId)) continue;
+      if (!activeMemberDeviceIds.has(d.deviceId)) continue;
+      const env = await wrapAndSignCallEnvelope({
+        callKey,
+        callId,
+        targetDeviceId: d.deviceId,
+        targetX25519PublicKey: d.x25519PublicKey,
+        senderDeviceId: device.deviceId,
+        senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
+      });
+      envelopes.push({
+        targetDeviceId: d.deviceId,
+        targetUserId: userId,
+        ciphertext: env.ciphertext,
+        signature: env.signature,
+      });
+    }
+  }
+
+  try {
+    await rpcRotateCallKey({
+      callId,
+      signerDeviceId: device.deviceId,
+      oldGeneration,
+      newGeneration,
+      envelopes,
+    });
+  } catch (err) {
+    await zeroCallKey(callKey);
+    throw err;
+  }
+  return callKey;
+}
+
+/**
+ * Revocation cascade (§6.4 of the design doc).
+ *
+ * For every active call where the revoked device is still a member and the
+ * acting device is ALSO a member, bump the generation and wrap the new
+ * CallKey to everyone except the revoked device. Calls where the acting
+ * device is not a participant are left alone — the other participants'
+ * heartbeat-grace logic (§6.5) will eventually force a rotation once the
+ * revoked device stops heartbeating.
+ */
+export async function cascadeRevocationIntoActiveCalls(params: {
+  userId: string;
+  revokedDeviceId: string;
+  device: DeviceKeyBundle;
+}): Promise<{ rotated: number; failures: Array<{ callId: string; error: string }> }> {
+  const supabase = getSupabase();
+  const { data: rows, error } = await supabase
+    .from('calls')
+    .select('id, current_generation')
+    .is('ended_at', null);
+  if (error) throw error;
+  const calls = (rows ?? []) as Array<{ id: string; current_generation: number }>;
+
+  let rotated = 0;
+  const failures: Array<{ callId: string; error: string }> = [];
+  for (const call of calls) {
+    try {
+      const members = await listCallMembers(call.id);
+      const revokedIsActive = members.some(
+        (m) => m.device_id === params.revokedDeviceId && m.left_at === null,
+      );
+      if (!revokedIsActive) continue;
+      const actingIsActive = members.some(
+        (m) => m.device_id === params.device.deviceId && m.left_at === null,
+      );
+      if (!actingIsActive) continue;
+
+      const newKey = await rotateCallKeyForCurrentMembers({
+        callId: call.id,
+        device: params.device,
+        oldGeneration: call.current_generation,
+        excludeDeviceIds: [params.revokedDeviceId],
+      });
+      await zeroCallKey(newKey);
+      rotated++;
+    } catch (err) {
+      failures.push({ callId: call.id, error: errorMessage(err) });
+    }
+  }
+  return { rotated, failures };
 }
 
 export { getDeviceRecord, verifyPublicDevice };

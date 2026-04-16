@@ -31,6 +31,16 @@ Copy these things verbatim:
 
 - `supabase/migrations/0022_key_backup.sql` — adds the server-side room-key backup table (Matrix-style key-backup). `key_backup (user_id, room_id, generation, ciphertext, nonce)` stores per-generation room keys encrypted under a user-scoped 32-byte backup key. RLS: `key_backup_owner` locks SELECT/INSERT/UPDATE/DELETE to `user_id = auth.uid()`. Also adds nullable `devices.backup_key_wrap` — a sealed (`crypto_box_seal`) copy of the backup key, written by the approving device and picked up by the newly-enrolled device so it can pull and decrypt the backup on first load. The backup key itself is escrowed inside the v3 recovery blob (see §12) so recovery-phrase entry on a fresh device recovers both UMK priv AND backup key.
 
+- `supabase/migrations/0023_calls.sql` — E2EE video-call scaffolding. Adds three tables (`calls`, `call_members`, `call_key_envelopes`) plus six RPCs (`start_call`, `join_call`, `leave_call`, `rotate_call_key`, `heartbeat_call`, `end_call`) and two helpers (`is_active_call_member`, `assert_caller_owns_device`). `call_key_envelopes` is the call-scoped analogue of `room_members.wrapped_room_key`: each row is a sealed CallKey addressed to one target device, signed by the sender device. `rotate_call_key` enforces `p_new_gen = current_gen + 1` so concurrent rotators serialize via the DB — no leader lease. `calls` is published on realtime; `call_members` and `call_key_envelopes` are not (publication churn on every heartbeat would be intolerable). **V2 must also port:** `src/lib/e2ee-core/call.ts` (pure crypto — joins the blob/membership/etc module family); `src/lib/livekit/` (new peer module — adapter + token renewal, portable as one directory, requires `npm install livekit-client`); `supabase/functions/livekit-token/` (Deno edge function that mints 5-min LiveKit JWTs after verifying device + call membership). See `docs/video-call-design.md` for the full design.
+
+**E2EE video call invariants (V2 must preserve):**
+- `rotateCallKeyForCurrentMembers` excludes any device NOT in the new envelope set — that's the eviction mechanism for leave + revoke. If V2 adds a new "kick from call" flow, it must call the rotation RPC with the kicked device omitted from envelopes, not attempt to directly delete rows.
+- The elected rotator is deterministic: lowest `(joined_at ASC, device_id ASC)` among non-stale, non-left members. Concurrent rotators are resolved by the DB's `new_gen = current + 1` uniqueness constraint; losers read the new gen and move on. Do not add a leader-lease scheme.
+- **LiveKit token renewal is mandatory, not optional.** Tokens are 5-minute TTL to support the revocation-cascade path — any call longer than 5 min without silent renewal drops randomly. `livekit-adapter.ts`'s `scheduleRenewal` + `visibilitychange` handler own this; never call `Room.connect` manually or without going through `LiveKitAdapter`.
+- **Revocation cascades into active calls.** `revokeDevice` in `src/app/settings/page.tsx` calls BOTH `rotateAllRoomsIAdmin` AND `cascadeRevocationIntoActiveCalls` — the latter re-keys every active call the acting device is currently in, omitting the revoked device from new envelopes. Calls the acting device is NOT in are handled via the heartbeat-grace loop on remaining participants (30s window). Any new "revoke device" UX must replicate both cascades.
+- **Heartbeat grace is 30 seconds** (`HEARTBEAT_GRACE_SECONDS` in bootstrap.ts). Shrinking it causes UX-hostile flapping on normal network flaps; widening it extends the window where a maliciously offlined device can lurk with the CallKey. Document and discuss before changing.
+- QVGA capture constraints (320×240 @ 15fps, simulcast off) are hardcoded in `src/lib/livekit/adapter.ts`. Consuming apps may override per-call but the foundation default is the retro mode, because it also simplifies frame-key management (no simulcast = no per-layer keys).
+
 **Crash-safe rotation + key-backup invariants (V2 must preserve):**
 - Recovery-blob write MUST precede UMK-pub publish during any rotation. The split helpers `generateRotatedUmk` / `commitRotatedUmk` in `bootstrap.ts` make this explicit. A browser crash between the blob write and the pub publish leaves the user recoverable via phrase; a crash the other way around would lock them out. Matrix-SSSS pattern.
 - Every `wrapRoomKeyForAllMyDevices` call checks `getBackupKey(userId)` and, if present, uploads an encrypted room-key to `key_backup` alongside the `room_members` inserts. New rooms, accepted invites, and rotations all take this path — no other call sites should wrap a room key.
@@ -52,8 +62,20 @@ Copy these things verbatim:
 Install in V2:
 
 ```
-npm install libsodium-wrappers-sumo idb @scure/bip39
+npm install libsodium-wrappers-sumo idb @scure/bip39 livekit-client
 ```
+
+`livekit-client` is the SFU client SDK used by `src/lib/livekit/`. Required only if porting the video-call surface (migration 0023 + `e2ee-core/call.ts`).
+
+The LiveKit edge function (`supabase/functions/livekit-token/`) needs these env vars set in Supabase:
+
+```
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+LIVEKIT_WS_URL=wss://<project>.livekit.cloud
+```
+
+Deploy with `supabase functions deploy livekit-token`. Prototype uses LiveKit Cloud (free tier caps call duration at 60 min); V2 should self-host `livekit-server` alongside Supabase to remove that cap.
 
 (`@scure/bip39` is what `src/lib/e2ee-core/recovery.ts` uses for the 24-word phrase.)
 

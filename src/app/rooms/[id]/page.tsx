@@ -363,6 +363,13 @@ function RoomInner({ roomId }: { roomId: string }) {
         </div>
         <div className="flex shrink-0 gap-2">
           <button
+            onClick={() => router.push(`/rooms/${roomId}/call`)}
+            className="rounded bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700"
+            title="Start or join the E2EE video call for this room"
+          >
+            call
+          </button>
+          <button
             onClick={() => setRenameOpen(true)}
             className="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
           >

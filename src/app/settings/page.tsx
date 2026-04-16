@@ -5,7 +5,10 @@ import { AppShell } from '@/components/AppShell';
 import { PinSetupModal } from '@/components/PinSetupModal';
 import { RecoveryPhraseModal } from '@/components/RecoveryPhraseModal';
 import { errorMessage } from '@/lib/errors';
-import { rotateAllRoomsIAdmin } from '@/lib/bootstrap';
+import {
+  cascadeRevocationIntoActiveCalls,
+  rotateAllRoomsIAdmin,
+} from '@/lib/bootstrap';
 import {
   clearDeviceBundle,
   clearWrappedIdentity,
@@ -140,7 +143,7 @@ function SettingsInner() {
         revokedAtMs,
         revocationSignature: signature,
       });
-      // Cascade: rotate every room this user admins so the revoked
+      // Cascade 1: rotate every room this user admins so the revoked
       // device is immediately excluded from new-gen wraps.
       // filterActiveDevices in the rotation helper skips revoked certs.
       if (device) {
@@ -148,12 +151,32 @@ function SettingsInner() {
           const result = await rotateAllRoomsIAdmin({ userId, device });
           if (result.failures.length > 0) {
             console.warn(
-              `revoke cascade: ${result.rotated} room(s) rotated, ${result.failures.length} failed`,
+              `revoke cascade (rooms): ${result.rotated} rotated, ${result.failures.length} failed`,
               result.failures,
             );
           }
         } catch (err) {
-          console.warn('revoke cascade failed:', errorMessage(err));
+          console.warn('room revoke cascade failed:', errorMessage(err));
+        }
+        // Cascade 2: rotate every active call this device was a member of
+        // so the revoked device can't decrypt post-revoke frames. Skips
+        // calls this acting device isn't in; those get caught by the
+        // heartbeat-grace path (phase 7) on the remaining participants'
+        // side within ~30s.
+        try {
+          const callResult = await cascadeRevocationIntoActiveCalls({
+            userId,
+            revokedDeviceId: targetDeviceId,
+            device,
+          });
+          if (callResult.failures.length > 0) {
+            console.warn(
+              `revoke cascade (calls): ${callResult.rotated} rotated, ${callResult.failures.length} failed`,
+              callResult.failures,
+            );
+          }
+        } catch (err) {
+          console.warn('call revoke cascade failed:', errorMessage(err));
         }
       }
       await reloadDevices(userId);

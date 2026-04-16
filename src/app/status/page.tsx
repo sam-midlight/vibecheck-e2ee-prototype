@@ -33,6 +33,7 @@ import {
   generateApprovalCode,
   generateApprovalSalt,
   generateRecoveryPhrase,
+  generateCallKey,
   generateRoomKey,
   getSodium,
   getUserMasterKey,
@@ -43,10 +44,13 @@ import {
   signDeviceIssuance,
   signMessage,
   toHex,
+  unwrapCallKey,
   unwrapRoomKey,
   unwrapUserMasterKeyWithPhrase,
+  verifyCallEnvelope,
   verifyMessage,
   verifyPublicDevice,
+  wrapAndSignCallEnvelope,
   wrapUserMasterKeyWithPhrase,
   type DeviceKeyBundle,
   type RoomKey,
@@ -71,6 +75,7 @@ const CHECK_NAMES = [
   'Recovery phrase wrap + unwrap (local)',
   'Image attachment roundtrip (encrypt → upload → download → decrypt)',
   'Multi-device room key wrap + unwrap',
+  'Call envelope sign + wrap + verify + unwrap roundtrip',
 ] as const;
 
 type CheckName = (typeof CHECK_NAMES)[number];
@@ -540,6 +545,75 @@ export default function StatusPage() {
           () => undefined,
         );
       }
+    });
+
+    await runStep(CHECK_NAMES[16], async () => {
+      // Pure-crypto probe of call.ts: generate a CallKey, wrap it to a
+      // temp recipient bundle, sign the envelope with the signer's bundle,
+      // then verify + unwrap. Proves the envelope signature binds to call
+      // id + gen + target and that the sealed bytes round-trip.
+      const callId = crypto.randomUUID();
+      const recipientBundle = await generateDeviceKeyBundle(crypto.randomUUID());
+      const signerBundle = await generateDeviceKeyBundle(crypto.randomUUID());
+      const callKey = await generateCallKey(1);
+
+      const envelope = await wrapAndSignCallEnvelope({
+        callKey,
+        callId,
+        targetDeviceId: recipientBundle.deviceId,
+        targetX25519PublicKey: recipientBundle.x25519PublicKey,
+        senderDeviceId: signerBundle.deviceId,
+        senderDeviceEd25519PrivateKey: signerBundle.ed25519PrivateKey,
+      });
+
+      await verifyCallEnvelope(
+        {
+          callId,
+          generation: callKey.generation,
+          targetDeviceId: recipientBundle.deviceId,
+          senderDeviceId: signerBundle.deviceId,
+          ciphertext: envelope.ciphertext,
+        },
+        envelope.signature,
+        signerBundle.ed25519PublicKey,
+      );
+
+      // Tamper detection: flip one byte of the ciphertext and confirm the
+      // signature no longer verifies.
+      const tampered = new Uint8Array(envelope.ciphertext);
+      tampered[0] ^= 0x01;
+      try {
+        await verifyCallEnvelope(
+          {
+            callId,
+            generation: callKey.generation,
+            targetDeviceId: recipientBundle.deviceId,
+            senderDeviceId: signerBundle.deviceId,
+            ciphertext: tampered,
+          },
+          envelope.signature,
+          signerBundle.ed25519PublicKey,
+        );
+        throw new Error('tampered envelope verified — signature binding broken');
+      } catch (err) {
+        if (err instanceof CryptoError && err.code === 'SIGNATURE_INVALID') {
+          // expected
+        } else {
+          throw err;
+        }
+      }
+
+      const unwrapped = await unwrapCallKey(
+        envelope.ciphertext,
+        callKey.generation,
+        recipientBundle.x25519PublicKey,
+        recipientBundle.x25519PrivateKey,
+      );
+      const match = await bytesEqual(unwrapped.key, callKey.key);
+      if (!match) throw new Error('unwrapped CallKey does not match original');
+      return {
+        detail: `32B CallKey sealed → signed → tamper-rejected → unwrapped OK (gen ${callKey.generation})`,
+      };
     });
 
     finish(allOk);

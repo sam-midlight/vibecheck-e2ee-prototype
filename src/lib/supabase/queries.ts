@@ -1105,6 +1105,305 @@ export async function listKeyBackups(
   return (data ?? []) as KeyBackupRow[];
 }
 
+// ---------------------------------------------------------------------------
+// calls + call_members + call_key_envelopes (migration 0023)
+// ---------------------------------------------------------------------------
+
+export interface CallRow {
+  id: string;
+  room_id: string;
+  initiator_user_id: string;
+  initiator_device_id: string;
+  started_at: string;
+  ended_at: string | null;
+  current_generation: number;
+}
+
+export interface CallMemberRow {
+  call_id: string;
+  device_id: string;
+  user_id: string;
+  joined_at: string;
+  left_at: string | null;
+  last_seen_at: string;
+}
+
+export interface CallKeyEnvelopeRow {
+  call_id: string;
+  generation: number;
+  target_device_id: string;
+  sender_device_id: string;
+  ciphertext: string;
+  signature: string;
+  created_at: string;
+}
+
+/** Envelope input shape accepted by start_call / rotate_call_key RPCs. */
+export interface CallEnvelopeInput {
+  targetDeviceId: string;
+  targetUserId: string;
+  ciphertext: Bytes;
+  signature: Bytes;
+}
+
+async function encodeEnvelopes(envelopes: CallEnvelopeInput[]): Promise<unknown[]> {
+  return Promise.all(
+    envelopes.map(async (e) => ({
+      target_device_id: e.targetDeviceId,
+      target_user_id: e.targetUserId,
+      ciphertext: await toBase64(e.ciphertext),
+      signature: await toBase64(e.signature),
+    })),
+  );
+}
+
+/**
+ * Start a new call. Caller pre-generates the UUID (ideally UUIDv7) and wraps
+ * the CallKey for every target device before calling. The RPC inserts the
+ * call row, call_members for every envelope target, and all gen=1 envelopes
+ * atomically.
+ */
+export async function startCall(params: {
+  callId: string;
+  roomId: string;
+  signerDeviceId: string;
+  envelopes: CallEnvelopeInput[];
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.rpc('start_call', {
+    p_call_id: params.callId,
+    p_room_id: params.roomId,
+    p_signer_device_id: params.signerDeviceId,
+    p_envelopes: await encodeEnvelopes(params.envelopes),
+  });
+  if (error) throw error;
+}
+
+/**
+ * Announce this device's presence in an existing call. Returns the call's
+ * current generation — if no envelope yet exists for this device at that
+ * gen, the caller waits for the next rotation to pick them up.
+ */
+export async function joinCall(params: {
+  callId: string;
+  deviceId: string;
+}): Promise<{ currentGeneration: number }> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.rpc('join_call', {
+    p_call_id: params.callId,
+    p_device_id: params.deviceId,
+  });
+  if (error) throw error;
+  return { currentGeneration: data as number };
+}
+
+/** Graceful leave. Does not bump generation — rotator election handles that. */
+export async function leaveCall(params: {
+  callId: string;
+  deviceId: string;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.rpc('leave_call', {
+    p_call_id: params.callId,
+    p_device_id: params.deviceId,
+  });
+  if (error) throw error;
+}
+
+/**
+ * Rotator-only. Bumps current_generation by 1 and replaces envelopes with
+ * fresh wraps of the new CallKey. Concurrent rotators lose on the
+ * `p_new_gen = current + 1` check and should re-read state.
+ */
+export async function rotateCallKey(params: {
+  callId: string;
+  signerDeviceId: string;
+  oldGeneration: number;
+  newGeneration: number;
+  envelopes: CallEnvelopeInput[];
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.rpc('rotate_call_key', {
+    p_call_id: params.callId,
+    p_signer_device_id: params.signerDeviceId,
+    p_old_gen: params.oldGeneration,
+    p_new_gen: params.newGeneration,
+    p_envelopes: await encodeEnvelopes(params.envelopes),
+  });
+  if (error) throw error;
+}
+
+/** Keepalive — clients call every ~10s to drive the 30s reconnection grace. */
+export async function heartbeatCall(params: {
+  callId: string;
+  deviceId: string;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.rpc('heartbeat_call', {
+    p_call_id: params.callId,
+    p_device_id: params.deviceId,
+  });
+  if (error) throw error;
+}
+
+/** Any active member can end the call. Marks ended_at + all members' left_at. */
+export async function endCall(callId: string): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.rpc('end_call', { p_call_id: callId });
+  if (error) throw error;
+}
+
+/** Fetch a call row, or null if not found. */
+export async function fetchCall(callId: string): Promise<CallRow | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('calls')
+    .select('*')
+    .eq('id', callId)
+    .maybeSingle<CallRow>();
+  if (error) throw error;
+  return data;
+}
+
+/** Return the currently-active (ended_at IS NULL) call for a room, if any. */
+export async function fetchActiveCallForRoom(roomId: string): Promise<CallRow | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('calls')
+    .select('*')
+    .eq('room_id', roomId)
+    .is('ended_at', null)
+    .order('started_at', { ascending: false })
+    .limit(1)
+    .maybeSingle<CallRow>();
+  if (error) throw error;
+  return data;
+}
+
+/** List call_members rows for a call (RLS-limited to room members). */
+export async function listCallMembers(callId: string): Promise<CallMemberRow[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('call_members')
+    .select('*')
+    .eq('call_id', callId);
+  if (error) throw error;
+  return (data ?? []) as CallMemberRow[];
+}
+
+/** Fetch the envelope addressed to a specific device at a specific generation. */
+export async function fetchCallKeyEnvelope(params: {
+  callId: string;
+  generation: number;
+  targetDeviceId: string;
+}): Promise<CallKeyEnvelopeRow | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('call_key_envelopes')
+    .select('*')
+    .eq('call_id', params.callId)
+    .eq('generation', params.generation)
+    .eq('target_device_id', params.targetDeviceId)
+    .maybeSingle<CallKeyEnvelopeRow>();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Lightweight broadcast for per-call coordination events (member_joined,
+ * member_left). Lives on a realtime broadcast channel — not postgres_changes —
+ * because call_members would be far too chatty for the publication
+ * (heartbeat UPDATEs every 10s). The DB remains the source of truth;
+ * broadcast just wakes existing participants up so they read it.
+ */
+export type CallSignalingEvent =
+  | { type: 'member_joined'; deviceId: string }
+  | { type: 'member_left'; deviceId: string };
+
+export function subscribeCallSignaling(
+  callId: string,
+  onEvent: (ev: CallSignalingEvent) => void,
+): () => void {
+  const supabase = getSupabase();
+  const channel = supabase
+    .channel(`call:${callId}`, { config: { broadcast: { self: false } } })
+    .on('broadcast', { event: 'member_joined' }, (msg) => {
+      const p = msg.payload as { deviceId?: unknown };
+      if (typeof p?.deviceId === 'string') {
+        onEvent({ type: 'member_joined', deviceId: p.deviceId });
+      }
+    })
+    .on('broadcast', { event: 'member_left' }, (msg) => {
+      const p = msg.payload as { deviceId?: unknown };
+      if (typeof p?.deviceId === 'string') {
+        onEvent({ type: 'member_left', deviceId: p.deviceId });
+      }
+    })
+    .subscribe();
+  return () => {
+    void supabase.removeChannel(channel);
+  };
+}
+
+/** Fire-and-forget broadcast a call signaling event. */
+export async function broadcastCallSignaling(
+  callId: string,
+  ev: CallSignalingEvent,
+): Promise<void> {
+  const supabase = getSupabase();
+  const channel = supabase.channel(`call:${callId}`);
+  await new Promise<void>((resolve) => {
+    channel.subscribe((status) => {
+      if (status === 'SUBSCRIBED') resolve();
+    });
+  });
+  await channel.send({
+    type: 'broadcast',
+    event: ev.type,
+    payload: { deviceId: ev.deviceId },
+  });
+  void supabase.removeChannel(channel);
+}
+
+/**
+ * Realtime: INSERT/UPDATE on `calls` rows in this room. Subscribers learn
+ * about call_started (INSERT), key_rotated (UPDATE current_generation),
+ * and call_ended (UPDATE ended_at) through this single channel.
+ */
+export function subscribeRoomCalls(
+  roomId: string,
+  onChange: (row: CallRow, event: 'INSERT' | 'UPDATE') => void,
+  onStatus?: (status: string) => void,
+): () => void {
+  const supabase = getSupabase();
+  const channel = supabase
+    .channel(`calls:${roomId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'calls',
+        filter: `room_id=eq.${roomId}`,
+      },
+      (payload) => onChange(payload.new as CallRow, 'INSERT'),
+    )
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'calls',
+        filter: `room_id=eq.${roomId}`,
+      },
+      (payload) => onChange(payload.new as CallRow, 'UPDATE'),
+    )
+    .subscribe((status) => onStatus?.(status));
+  return () => {
+    void supabase.removeChannel(channel);
+  };
+}
+
 export async function nukeIdentityServer(userId: string): Promise<void> {
   const supabase = getSupabase();
 

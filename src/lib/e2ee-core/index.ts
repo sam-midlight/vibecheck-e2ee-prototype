@@ -31,9 +31,15 @@
  *   Trust (TOFU + key-change detection):
  *     observeContact, acceptKeyChange, onKeyChange
  *
+ *   Call keys (per-call symmetric keys for SFrame E2EE):
+ *     generateCallKey, wrapCallKeyForDevice, unwrapCallKey,
+ *     signCallEnvelope, verifyCallEnvelope, wrapAndSignCallEnvelope,
+ *     zeroCallKey
+ *
  *   Types + errors:
  *     Bytes, Identity, PublicIdentity, DeviceLinkingKeys, RoomKey,
  *     WrappedRoomKey, EncryptedBlob, KnownContact, KeyChangeEvent,
+ *     CallKey, CallKeyEnvelope, CallKeyEnvelopeFields,
  *     CryptoError, TrustError
  */
 
@@ -51,3 +57,4 @@ export * from './attachment';
 export * from './membership';
 export * from './pin-lock';
 export * from './device';
+export * from './call';
