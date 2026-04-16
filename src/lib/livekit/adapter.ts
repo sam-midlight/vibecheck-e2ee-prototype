@@ -80,7 +80,9 @@ export type LiveKitAdapterEvent =
   | { type: 'participant_left'; identity: string }
   | { type: 'token_refreshed'; expiresAt: number }
   | { type: 'token_refresh_failed'; error: string }
-  | { type: 'encryption_state'; state: EncryptionState; detail?: string };
+  | { type: 'encryption_state'; state: EncryptionState; detail?: string }
+  | { type: 'receive_only'; reason: string }
+  | { type: 'media_state'; micEnabled: boolean; cameraEnabled: boolean };
 
 /**
  * Does this browser actually support the insertable-streams API that
@@ -136,14 +138,13 @@ export class LiveKitAdapter {
   private disposed = false;
   private _encryptionState: EncryptionState = 'pending';
   private currentCallKey: CallKey;
+  private _receiveOnly = false;
   /** Sliding window of recent EncryptionError timestamps (ms since epoch). */
   private errorTimestamps: number[] = [];
   /** Transient errors within this window don't flip state to 'failed'. */
   private static readonly ERROR_WINDOW_MS = 10_000;
   /** More than this many errors in the window → sustained, flip to 'failed'. */
-  private static readonly ERROR_THRESHOLD = 10;
-  /** After this many errors within the window, nudge the key provider. */
-  private static readonly ERROR_RESYNC_THRESHOLD = 3;
+  private static readonly ERROR_THRESHOLD = 30;
 
   constructor(opts: LiveKitAdapterOptions) {
     this.callId = opts.callId;
@@ -186,11 +187,17 @@ export class LiveKitAdapter {
     );
 
     // E2EE engine errors (key mismatch, decrypt failure, worker hiccup).
-    // Single errors happen during normal operation — a stray frame arrives
-    // with a stale keyIndex during rotation, or a momentary worker pause.
-    // Only flip to 'failed' on SUSTAINED errors (many inside a short window);
-    // on moderate error bursts, nudge the keyProvider by re-setting the key
-    // (LiveKit's internal ratchet handles most cases; this is a backup).
+    // Transient errors are normal during key rotation / new-participant
+    // churn — a stray frame arrives tagged with a stale keyIndex before
+    // auto-ratchet has converged. Only flip to 'failed' on SUSTAINED
+    // errors within a short window.
+    //
+    // CRITICAL: do NOT call `keyProvider.setKey()` as a "recovery nudge"
+    // here. `ExternalE2EEKeyProvider.setKey()` auto-increments an
+    // INTERNAL keyIndex every call, so any nudge drifts our index ahead
+    // of remote participants and causes MORE InvalidKey errors →
+    // positive-feedback loop. Let LiveKit's built-in auto-ratchet
+    // (KeyProviderEvent.KeyRatcheted) handle it; we just track counts.
     this.room.on(RoomEvent.EncryptionError, (err) => {
       const now = Date.now();
       this.errorTimestamps = this.errorTimestamps.filter(
@@ -211,16 +218,6 @@ export class LiveKitAdapter {
             LiveKitAdapter.ERROR_WINDOW_MS / 1000
           }s — giving up (last: ${msg})`,
         );
-        return;
-      }
-      if (count >= LiveKitAdapter.ERROR_RESYNC_THRESHOLD) {
-        // Nudge: re-apply the current CallKey. No-op if already set, but
-        // can kick the keyProvider's internal state into re-deriving.
-        void this.keyProvider
-          .setKey(this.currentCallKey.key.buffer as ArrayBuffer)
-          .catch((nudgeErr) =>
-            console.warn('[LiveKitAdapter] re-set key failed:', nudgeErr),
-          );
       }
     });
 
@@ -319,32 +316,78 @@ export class LiveKitAdapter {
    * encryption is not confirmed.
    */
   async publishLocalMedia(encryptionWaitMs = 15_000): Promise<void> {
+    let publishedMedia = true;
     try {
       await this.room.localParticipant.enableCameraAndMicrophone();
     } catch (err) {
-      // Translate the common DOMException surfaces into human-friendly
-      // language. The original Error is logged for devtools.
-      if (err instanceof DOMException) {
-        console.warn('[LiveKitAdapter] enableCameraAndMicrophone:', err);
-        if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
-          throw new Error(
-            'Camera or microphone access was blocked. Click the padlock or camera icon in your browser’s address bar, allow access, and try joining again.',
-          );
-        }
-        if (err.name === 'NotFoundError') {
-          throw new Error(
-            'No camera or microphone detected on this device. Plug one in (or unmute a built-in) and try again.',
-          );
-        }
-        if (err.name === 'NotReadableError') {
-          throw new Error(
-            'Your camera or microphone is already in use by another app or tab. Close the other app (Zoom, OBS, another browser tab) and retry.',
-          );
-        }
+      // Known "can't publish but connect anyway" conditions → receive-only.
+      // User didn't grant permission, no device, device in use — all still
+      // allow watching/listening to the other participants. We skip publish
+      // and proceed without the encryption-active wait (no local track =
+      // no ParticipantEncryptionStatusChanged event). Since nothing
+      // plaintext leaves us, the E2EE guarantee still holds locally.
+      const recoverable =
+        err instanceof DOMException &&
+        ['NotAllowedError', 'SecurityError', 'NotFoundError', 'NotReadableError'].includes(
+          err.name,
+        );
+      if (recoverable) {
+        console.warn(
+          `[LiveKitAdapter] ${(err as DOMException).name} on enableCameraAndMicrophone — joining receive-only`,
+        );
+        publishedMedia = false;
+        this._receiveOnly = true;
+        this.emit({ type: 'receive_only', reason: (err as DOMException).name });
+      } else {
+        throw err;
       }
-      throw err;
     }
-    await this.awaitEncryptionActive(encryptionWaitMs);
+    if (publishedMedia) {
+      await this.awaitEncryptionActive(encryptionWaitMs);
+      this.emit({
+        type: 'media_state',
+        micEnabled: this.isMicrophoneEnabled,
+        cameraEnabled: this.isCameraEnabled,
+      });
+    } else {
+      // Receive-only: skip the publish-path encryption gate. The SFrame
+      // worker is loaded + our key is seeded; incoming frames decrypt.
+      this.setEncryptionState('active');
+    }
+  }
+
+  get receiveOnly(): boolean {
+    return this._receiveOnly;
+  }
+
+  get isMicrophoneEnabled(): boolean {
+    return this.room.localParticipant.isMicrophoneEnabled;
+  }
+
+  get isCameraEnabled(): boolean {
+    return this.room.localParticipant.isCameraEnabled;
+  }
+
+  /** Toggle local mic. No-op in receive-only mode (nothing published). */
+  async setMicrophoneEnabled(enabled: boolean): Promise<void> {
+    if (this._receiveOnly) return;
+    await this.room.localParticipant.setMicrophoneEnabled(enabled);
+    this.emit({
+      type: 'media_state',
+      micEnabled: this.isMicrophoneEnabled,
+      cameraEnabled: this.isCameraEnabled,
+    });
+  }
+
+  /** Toggle local camera. No-op in receive-only mode. */
+  async setCameraEnabled(enabled: boolean): Promise<void> {
+    if (this._receiveOnly) return;
+    await this.room.localParticipant.setCameraEnabled(enabled);
+    this.emit({
+      type: 'media_state',
+      micEnabled: this.isMicrophoneEnabled,
+      cameraEnabled: this.isCameraEnabled,
+    });
   }
 
   private async awaitEncryptionActive(timeoutMs: number): Promise<void> {

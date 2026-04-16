@@ -15,6 +15,7 @@
 
 import { use, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { AppShell } from '@/components/AppShell';
 import { getSupabase } from '@/lib/supabase/client';
 import { errorMessage } from '@/lib/errors';
@@ -89,6 +90,7 @@ interface DiagEntry {
 }
 
 function CallInner({ roomId }: { roomId: string }) {
+  const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
   const [device, setDevice] = useState<DeviceKeyBundle | null>(null);
   const [activeCall, setActiveCall] = useState<CallRow | null>(null);
@@ -99,6 +101,10 @@ function CallInner({ roomId }: { roomId: string }) {
   const [tiles, setTiles] = useState<ParticipantTile[]>([]);
   const [encryptionState, setEncryptionState] = useState<EncryptionState>('pending');
   const [encryptionDetail, setEncryptionDetail] = useState<string | null>(null);
+  const [micEnabled, setMicEnabled] = useState(true);
+  const [cameraEnabled, setCameraEnabled] = useState(true);
+  const [receiveOnly, setReceiveOnly] = useState(false);
+  const [receiveOnlyReason, setReceiveOnlyReason] = useState<string | null>(null);
 
   const logDiag = useCallback(
     (kind: DiagEntry['kind'], step: string, detail?: string) => {
@@ -170,8 +176,13 @@ function CallInner({ roomId }: { roomId: string }) {
         // UPDATE — either current_generation bumped, or ended_at set.
         if (row.ended_at != null) {
           setActiveCall((prev) => (prev?.id === row.id ? null : prev));
-          if (adapterRef.current && adapterRef.current.callId === row.id) {
-            void teardown('ended');
+          // Boot everyone on this call page back to the room when it ends.
+          const wasInCall =
+            adapterRef.current && adapterRef.current.callId === row.id;
+          if (wasInCall) {
+            void teardown('ended').then(() => router.push(`/rooms/${roomId}`));
+          } else if (uiState === 'idle' || uiState === 'joining') {
+            router.push(`/rooms/${roomId}`);
           }
           return;
         }
@@ -619,6 +630,10 @@ function CallInner({ roomId }: { roomId: string }) {
     setTiles([]);
     setEncryptionState('pending');
     setEncryptionDetail(null);
+    setReceiveOnly(false);
+    setReceiveOnlyReason(null);
+    setMicEnabled(true);
+    setCameraEnabled(true);
     setUiState(reason === 'ended' ? 'ended' : 'idle');
   }, []);
 
@@ -804,6 +819,12 @@ function CallInner({ roomId }: { roomId: string }) {
         </div>
       )}
 
+      {uiState === 'in_call' && receiveOnly && (
+        <div className="rounded bg-amber-50 border border-amber-300 p-2 text-xs text-amber-900">
+          You joined in <strong>listening-only</strong> mode ({receiveOnlyReason ?? 'camera/mic unavailable'}). Others can&rsquo;t see or hear you. Fix permissions and rejoin to publish.
+        </div>
+      )}
+
       {uiState === 'in_call' && (
         <>
           <div className="grid grid-cols-2 gap-4">
@@ -811,7 +832,47 @@ function CallInner({ roomId }: { roomId: string }) {
               <VideoTile key={t.identity} tile={t} />
             ))}
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            {!receiveOnly && (
+              <>
+                <button
+                  onClick={async () => {
+                    try {
+                      await adapterRef.current?.setMicrophoneEnabled(!micEnabled);
+                    } catch (e) {
+                      console.warn('mic toggle failed', errorMessage(e));
+                    }
+                  }}
+                  className={
+                    micEnabled
+                      ? 'rounded bg-neutral-700 text-white px-4 py-2 hover:bg-neutral-800'
+                      : 'rounded bg-red-600 text-white px-4 py-2 hover:bg-red-700'
+                  }
+                  aria-pressed={!micEnabled}
+                  title={micEnabled ? 'Mute your mic' : 'Unmute your mic'}
+                >
+                  {micEnabled ? 'mute' : 'unmute'}
+                </button>
+                <button
+                  onClick={async () => {
+                    try {
+                      await adapterRef.current?.setCameraEnabled(!cameraEnabled);
+                    } catch (e) {
+                      console.warn('camera toggle failed', errorMessage(e));
+                    }
+                  }}
+                  className={
+                    cameraEnabled
+                      ? 'rounded bg-neutral-700 text-white px-4 py-2 hover:bg-neutral-800'
+                      : 'rounded bg-red-600 text-white px-4 py-2 hover:bg-red-700'
+                  }
+                  aria-pressed={!cameraEnabled}
+                  title={cameraEnabled ? 'Turn camera off' : 'Turn camera on'}
+                >
+                  {cameraEnabled ? 'camera off' : 'camera on'}
+                </button>
+              </>
+            )}
             <button
               onClick={doLeave}
               className="rounded bg-neutral-600 text-white px-4 py-2 hover:bg-neutral-700"
@@ -848,6 +909,13 @@ function CallInner({ roomId }: { roomId: string }) {
         `encryption ${ev.state}`,
         ev.detail,
       );
+    } else if (ev.type === 'receive_only') {
+      setReceiveOnly(true);
+      setReceiveOnlyReason(ev.reason);
+      logDiag('info', 'joined receive-only', ev.reason);
+    } else if (ev.type === 'media_state') {
+      setMicEnabled(ev.micEnabled);
+      setCameraEnabled(ev.cameraEnabled);
     }
   }
 }
