@@ -4,9 +4,11 @@
  */
 
 export {
+  browserSupportsE2EE,
   LiveKitAdapter,
   QVGA_VIDEO_CONSTRAINTS,
   QVGA_PUBLISH_DEFAULTS,
+  type EncryptionState,
   type LiveKitAdapterEvent,
   type LiveKitAdapterListener,
   type LiveKitAdapterOptions,

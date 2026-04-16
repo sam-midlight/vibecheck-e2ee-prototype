@@ -57,6 +57,7 @@ import {
   type UserMasterKey,
 } from '@/lib/e2ee-core';
 import { loadEnrolledDevice, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
+import { browserSupportsE2EE } from '@/lib/livekit';
 
 const CHECK_NAMES = [
   'Sodium (libsodium WASM) ready',
@@ -76,6 +77,7 @@ const CHECK_NAMES = [
   'Image attachment roundtrip (encrypt → upload → download → decrypt)',
   'Multi-device room key wrap + unwrap',
   'Call envelope sign + wrap + verify + unwrap roundtrip',
+  'Browser supports E2EE insertable streams (required for video calls)',
 ] as const;
 
 type CheckName = (typeof CHECK_NAMES)[number];
@@ -614,6 +616,33 @@ export default function StatusPage() {
       return {
         detail: `32B CallKey sealed → signed → tamper-rejected → unwrapped OK (gen ${callKey.generation})`,
       };
+    });
+
+    await runStep(CHECK_NAMES[17], async () => {
+      // Video-call E2EE (SFrame) requires the insertable-streams API. If
+      // this browser doesn't expose it, LiveKit silently falls back to
+      // plain SRTP and the SFU sees plaintext frames. We fail this check
+      // LOUDLY rather than shrug — starting a call here would be a
+      // security regression.
+      const supported = browserSupportsE2EE();
+      const w = window as typeof window & {
+        RTCRtpScriptTransform?: unknown;
+        RTCRtpSender?: { prototype?: { createEncodedStreams?: unknown } };
+      };
+      const api =
+        typeof w.RTCRtpScriptTransform !== 'undefined'
+          ? 'RTCRtpScriptTransform (spec)'
+          : typeof w.RTCRtpSender?.prototype?.createEncodedStreams === 'function'
+            ? 'createEncodedStreams (Chromium/Safari)'
+            : 'none';
+      const ua = navigator.userAgent.slice(0, 80);
+      if (!supported) {
+        throw new Error(
+          `insertable streams not available on this browser — E2EE video calls ` +
+            `cannot engage (would fall back to plaintext SRTP). API detected: ${api}. UA: ${ua}`,
+        );
+      }
+      return { detail: `API: ${api}` };
     });
 
     finish(allOk);

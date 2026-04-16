@@ -41,7 +41,9 @@ import {
 } from '@/lib/supabase/queries';
 import {
   LiveKitAdapter,
+  browserSupportsE2EE,
   makeDefaultTokenFetcher,
+  type EncryptionState,
   type LiveKitAdapterEvent,
 } from '@/lib/livekit';
 import {
@@ -90,6 +92,8 @@ function CallInner({ roomId }: { roomId: string }) {
   const [errorStack, setErrorStack] = useState<string | null>(null);
   const [diag, setDiag] = useState<DiagEntry[]>([]);
   const [tiles, setTiles] = useState<ParticipantTile[]>([]);
+  const [encryptionState, setEncryptionState] = useState<EncryptionState>('pending');
+  const [encryptionDetail, setEncryptionDetail] = useState<string | null>(null);
 
   const logDiag = useCallback(
     (kind: DiagEntry['kind'], step: string, detail?: string) => {
@@ -529,6 +533,8 @@ function CallInner({ roomId }: { roomId: string }) {
       callKeyRef.current = null;
     }
     setTiles([]);
+    setEncryptionState('pending');
+    setEncryptionDetail(null);
     setUiState(reason === 'ended' ? 'ended' : 'idle');
   }, []);
 
@@ -553,16 +559,38 @@ function CallInner({ roomId }: { roomId: string }) {
           </Link>
           <h1 className="text-xl font-semibold mt-1">Video call</h1>
         </div>
-        <div className="text-xs text-neutral-500">
-          state: <span className="font-mono">{uiState}</span>
-          {activeCall && (
-            <>
-              {' '}| gen:{' '}
-              <span className="font-mono">{activeCall.current_generation}</span>
-            </>
-          )}
+        <div className="flex flex-col items-end gap-1 text-xs text-neutral-500">
+          <EncryptionBadge
+            state={encryptionState}
+            detail={encryptionDetail}
+            preflight={uiState === 'idle'}
+          />
+          <div>
+            state: <span className="font-mono">{uiState}</span>
+            {activeCall && (
+              <>
+                {' '}| gen:{' '}
+                <span className="font-mono">{activeCall.current_generation}</span>
+              </>
+            )}
+          </div>
         </div>
       </div>
+
+      {uiState === 'in_call' && encryptionState !== 'active' && (
+        <div className="rounded bg-red-100 border-2 border-red-500 p-3 text-sm text-red-900 font-semibold">
+          ⚠ ENCRYPTION IS NOT ACTIVE on this call.{' '}
+          {encryptionState === 'failed' && 'The E2EE pipeline failed — the SFU may be able to see plaintext frames.'}{' '}
+          {encryptionState === 'pending' && 'Still handshaking — if this persists, leave the call.'}{' '}
+          {encryptionState === 'unsupported' && 'Your browser cannot enforce E2EE. Leave this call.'}
+          <button
+            onClick={doLeave}
+            className="ml-2 rounded bg-red-600 text-white px-2 py-0.5 text-xs hover:bg-red-700"
+          >
+            leave now
+          </button>
+        </div>
+      )}
 
       {error && (
         <div className="rounded bg-red-50 border border-red-200 p-3 text-sm text-red-800 space-y-2">
@@ -676,8 +704,76 @@ function CallInner({ roomId }: { roomId: string }) {
       void teardown('error');
     } else if (ev.type === 'token_refresh_failed') {
       console.warn('livekit token refresh failed:', ev.error);
+    } else if (ev.type === 'encryption_state') {
+      setEncryptionState(ev.state);
+      setEncryptionDetail(ev.detail ?? null);
+      logDiag(
+        ev.state === 'active' ? 'ok' : ev.state === 'pending' ? 'info' : 'err',
+        `encryption ${ev.state}`,
+        ev.detail,
+      );
     }
   }
+}
+
+function EncryptionBadge({
+  state,
+  detail,
+  preflight,
+}: {
+  state: EncryptionState;
+  detail: string | null;
+  preflight: boolean;
+}) {
+  // `preflight` = we haven't connected yet. Show browser-capability check.
+  if (preflight) {
+    if (!browserSupportsE2EE()) {
+      return (
+        <span
+          className="inline-flex items-center gap-1.5 rounded border border-red-300 bg-red-50 px-2 py-0.5 text-[11px] font-mono text-red-800"
+          title="This browser does not support insertable streams. E2EE cannot engage — a call started here would be plaintext-visible to the SFU. Use Chrome, Edge, or Safari 17+."
+        >
+          <span className="h-1.5 w-1.5 rounded-full bg-red-600" />
+          E2EE UNSUPPORTED
+        </span>
+      );
+    }
+    return (
+      <span
+        className="inline-flex items-center gap-1.5 rounded border border-neutral-300 bg-neutral-50 px-2 py-0.5 text-[11px] font-mono text-neutral-600"
+        title="Browser supports E2EE. Will verify engagement on connect."
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-neutral-400" />
+        E2EE ready
+      </span>
+    );
+  }
+
+  const styles: Record<EncryptionState, string> = {
+    pending:
+      'border-amber-300 bg-amber-50 text-amber-800 [&>.dot]:bg-amber-500',
+    active:
+      'border-green-300 bg-green-50 text-green-800 [&>.dot]:bg-green-600',
+    failed: 'border-red-400 bg-red-100 text-red-900 [&>.dot]:bg-red-600',
+    unsupported:
+      'border-red-400 bg-red-100 text-red-900 [&>.dot]:bg-red-600',
+  };
+  const label: Record<EncryptionState, string> = {
+    pending: 'E2EE handshaking',
+    active: 'E2EE active',
+    failed: 'E2EE FAILED',
+    unsupported: 'E2EE UNSUPPORTED',
+  };
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded border px-2 py-0.5 text-[11px] font-mono ${styles[state]}`}
+      title={detail ?? label[state]}
+    >
+      <span className="dot h-1.5 w-1.5 rounded-full" />
+      {label[state]}
+    </span>
+  );
 }
 
 // ---------------------------------------------------------------------------

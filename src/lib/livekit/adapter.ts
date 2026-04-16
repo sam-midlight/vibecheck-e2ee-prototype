@@ -61,13 +61,41 @@ export type LiveKitTokenFetcher = (
 // Adapter lifecycle events.
 // ---------------------------------------------------------------------------
 
+/**
+ * E2EE state transitions surface as `encryption_state` events. The adapter
+ * starts 'pending', flips 'active' iff `room.isE2EEEnabled` is true after
+ * `setE2EEEnabled(true)` succeeds, and flips to 'failed' on any
+ * `RoomEvent.EncryptionError` or a post-connect assertion miss. The call UI
+ * must treat 'failed' or 'unsupported' as "DO NOT TRUST THIS CALL" — a
+ * fallback to plain DTLS-SRTP means the SFU has plaintext access.
+ */
+export type EncryptionState = 'pending' | 'active' | 'failed' | 'unsupported';
+
 export type LiveKitAdapterEvent =
   | { type: 'connected' }
   | { type: 'disconnected'; reason: 'local' | 'remote' | 'revoked' | 'error'; detail?: string }
   | { type: 'participant_joined'; identity: string }
   | { type: 'participant_left'; identity: string }
   | { type: 'token_refreshed'; expiresAt: number }
-  | { type: 'token_refresh_failed'; error: string };
+  | { type: 'token_refresh_failed'; error: string }
+  | { type: 'encryption_state'; state: EncryptionState; detail?: string };
+
+/**
+ * Does this browser actually support the insertable-streams API that
+ * SFrame E2EE requires? Without it, LiveKit silently falls back to plain
+ * SRTP and the SFU sees plaintext. We check at adapter construction.
+ */
+export function browserSupportsE2EE(): boolean {
+  if (typeof window === 'undefined') return false;
+  if (typeof Worker === 'undefined') return false;
+  const w = window as typeof window & {
+    RTCRtpScriptTransform?: unknown;
+    RTCRtpSender?: { prototype?: { createEncodedStreams?: unknown } };
+  };
+  if (typeof w.RTCRtpScriptTransform !== 'undefined') return true;
+  const proto = w.RTCRtpSender?.prototype;
+  return typeof proto?.createEncodedStreams === 'function';
+}
 
 export type LiveKitAdapterListener = (ev: LiveKitAdapterEvent) => void;
 
@@ -104,6 +132,7 @@ export class LiveKitAdapter {
   private visibilityHandler: (() => void) | null = null;
   private listeners = new Set<LiveKitAdapterListener>();
   private disposed = false;
+  private _encryptionState: EncryptionState = 'pending';
 
   constructor(opts: LiveKitAdapterOptions) {
     this.callId = opts.callId;
@@ -144,8 +173,34 @@ export class LiveKitAdapter {
       this.emit({ type: 'participant_left', identity: p.identity }),
     );
 
+    // E2EE engine errors (e.g. key mismatch, decrypt failure, worker crash).
+    // Any of these means SOMETHING about the encryption pipeline is broken
+    // — we flip to 'failed' so the UI can demand the user bail out.
+    this.room.on(RoomEvent.EncryptionError, (err) => {
+      this.setEncryptionState('failed', err instanceof Error ? err.message : String(err));
+    });
+
+    // Bail early if the browser can't do insertable streams at all. LiveKit
+    // would silently fall back to plain SRTP in that case.
+    if (!browserSupportsE2EE()) {
+      this.setEncryptionState(
+        'unsupported',
+        'this browser does not expose insertable-streams — E2EE cannot be enforced',
+      );
+    }
+
     // Seed the first key before any connect attempt.
     void this.keyProvider.setKey(opts.initialCallKey.key.buffer as ArrayBuffer);
+  }
+
+  get encryptionState(): EncryptionState {
+    return this._encryptionState;
+  }
+
+  private setEncryptionState(state: EncryptionState, detail?: string): void {
+    if (this._encryptionState === state) return;
+    this._encryptionState = state;
+    this.emit({ type: 'encryption_state', state, detail });
   }
 
   /** Subscribe to adapter lifecycle events. */
@@ -168,10 +223,33 @@ export class LiveKitAdapter {
   /** Connect to the SFU, enable E2EE, and start the renewal loop. */
   async connect(): Promise<void> {
     if (this.disposed) throw new Error('adapter disposed');
+    if (this._encryptionState === 'unsupported') {
+      throw new Error(
+        'refusing to connect: this browser cannot enforce E2EE ' +
+          '(insertable streams not available). The SFU would see plaintext.',
+      );
+    }
     const tok = await this.fetchToken();
     this.currentToken = tok;
     await this.room.connect(tok.url, tok.jwt);
     await this.room.setE2EEEnabled(true);
+
+    // Assert: setE2EEEnabled resolves even when the underlying pipeline
+    // fails silently (worker never loaded, no insertable-streams, etc.).
+    // `isE2EEEnabled` is the post-conditional truth.
+    if (!this.room.isE2EEEnabled) {
+      this.setEncryptionState(
+        'failed',
+        'setE2EEEnabled resolved but isE2EEEnabled is false',
+      );
+      await this.room.disconnect(true);
+      throw new Error(
+        'refusing to stay connected: E2EE did not engage on this Room — ' +
+          'the SFU would see plaintext frames',
+      );
+    }
+    this.setEncryptionState('active');
+
     this.scheduleRenewal();
     this.installVisibilityHandler();
   }
