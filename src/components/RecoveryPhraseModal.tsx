@@ -104,7 +104,11 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
           <IntroStage onStart={handleStart} onSkip={() => onDone('skipped')} hideSkip={hideSkip} />
         )}
         {stage === 'display' && phrase && (
-          <DisplayStage phrase={phrase} onContinue={() => setStage('verify')} />
+          <DisplayStage
+            phrase={phrase}
+            onContinue={() => setStage('verify')}
+            onCancel={() => onDone('skipped')}
+          />
         )}
         {stage === 'verify' && phrase && (
           <VerifyStage
@@ -183,7 +187,15 @@ function IntroStage({
   );
 }
 
-function DisplayStage({ phrase, onContinue }: { phrase: string; onContinue: () => void }) {
+function DisplayStage({
+  phrase,
+  onContinue,
+  onCancel,
+}: {
+  phrase: string;
+  onContinue: () => void;
+  onCancel: () => void;
+}) {
   const words = splitPhrase(phrase);
   const [ack, setAck] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -264,6 +276,13 @@ function DisplayStage({ phrase, onContinue }: { phrase: string; onContinue: () =
           className="rounded bg-neutral-900 px-4 py-2 text-sm text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
         >
           Continue
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded border border-neutral-300 px-4 py-2 text-sm dark:border-neutral-700"
+        >
+          cancel
         </button>
       </div>
     </div>

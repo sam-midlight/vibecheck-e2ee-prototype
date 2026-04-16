@@ -136,6 +136,15 @@ function RoomsInner() {
     return unsub;
   }, [userId]);
 
+  // Poll every 30s for new rooms + name changes from other devices.
+  // room_members is not in the realtime publication (0009 removed it for
+  // metadata reasons), so polling is the cross-device sync mechanism.
+  useEffect(() => {
+    if (!userId) return;
+    const interval = setInterval(() => void reload(userId), 30_000);
+    return () => clearInterval(interval);
+  }, [userId, reload]);
+
   if (loading || !userId) {
     return <p className="text-sm text-neutral-500">loading…</p>;
   }

@@ -30,6 +30,7 @@ import {
 import {
   decodeBlobRow,
   deleteAttachment,
+  deleteBlob,
   deleteRoom,
   downloadAttachment,
   fetchPublicDevices,
@@ -285,6 +286,14 @@ function RoomInner({ roomId }: { roomId: string }) {
     return unsub;
   }, [roomId, device, userId, ingestBlobRow]);
 
+  // Poll every 30s for room metadata changes (name, generation, members)
+  // from other devices. Rooms table is not in realtime publication.
+  useEffect(() => {
+    if (!device || !userId) return;
+    const interval = setInterval(() => void loadAll(userId, device), 30_000);
+    return () => clearInterval(interval);
+  }, [device, userId, loadAll]);
+
   if (loading) return <p className="text-sm text-neutral-500">loading…</p>;
   if (staleMembership) {
     return (
@@ -447,6 +456,14 @@ function RoomInner({ roomId }: { roomId: string }) {
         roomId={roomId}
         roomKeysByGen={roomKeysByGen}
         nicknames={nicknames}
+        onDelete={async (blobId, hasImage) => {
+          if (!confirm('Delete this message?')) return;
+          if (hasImage) {
+            await deleteAttachment({ roomId, blobId }).catch(() => {});
+          }
+          await deleteBlob(blobId);
+          setBlobs((prev) => prev.filter((b) => b.id !== blobId));
+        }}
       />
 
       <Composer
@@ -893,58 +910,77 @@ function MemberList({
         <p className="mb-2 text-xs text-red-600 dark:text-red-400">{nickError}</p>
       )}
       <ul className="space-y-1">
-        {members.map((m) => {
-          const self = m.user_id === selfUserId;
-          const nick = nicknames.get(m.user_id)?.name?.trim();
-          return (
-            <li
-              key={`${m.user_id}-${m.generation}`}
-              className="flex items-start justify-between gap-2"
-            >
-              <div className="flex min-w-0 flex-col gap-0.5">
-                <span className="flex min-w-0 items-baseline gap-2">
-                  <span className="truncate font-medium">
-                    {nick ?? `${m.user_id.slice(0, 8)}…`}
-                    {self ? ' (you)' : ''}
-                    {m.user_id === room.created_by ? ' · admin' : ''}
+        {(() => {
+          // Deduplicate by user_id — room_members is per-device but the
+          // member list should show one row per user. Count their devices.
+          const seen = new Set<string>();
+          const unique: Array<{ userId: string; deviceCount: number }> = [];
+          for (const m of members) {
+            if (seen.has(m.user_id)) {
+              unique.find((u) => u.userId === m.user_id)!.deviceCount++;
+            } else {
+              seen.add(m.user_id);
+              unique.push({ userId: m.user_id, deviceCount: 1 });
+            }
+          }
+          return unique.map((u) => {
+            const self = u.userId === selfUserId;
+            const nick = nicknames.get(u.userId)?.name?.trim();
+            return (
+              <li
+                key={u.userId}
+                className="flex items-start justify-between gap-2"
+              >
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  <span className="flex min-w-0 items-baseline gap-2">
+                    <span className="truncate font-medium">
+                      {nick ?? `${u.userId.slice(0, 8)}…`}
+                      {self ? ' (you)' : ''}
+                      {u.userId === room.created_by ? ' · admin' : ''}
+                    </span>
+                    <code
+                      className="font-mono text-[10px] text-neutral-500"
+                      title={u.userId}
+                    >
+                      {u.userId.slice(0, 8)}
+                    </code>
+                    {u.deviceCount > 1 && (
+                      <span className="text-[10px] text-neutral-400">
+                        {u.deviceCount} devices
+                      </span>
+                    )}
                   </span>
-                  <code
-                    className="font-mono text-[10px] text-neutral-500"
-                    title={m.user_id}
+                  {fingerprints.get(u.userId) && (
+                    <code
+                      className="font-mono text-[10px] text-neutral-400"
+                      title="safety number — compare out-of-band (phone, in person) to confirm identity"
+                    >
+                      🔑 {fingerprints.get(u.userId)}
+                    </code>
+                  )}
+                </div>
+                {isAdmin && !self && (
+                  <button
+                    onClick={() => void kickMember(u.userId)}
+                    disabled={busy}
+                    className="rounded border border-red-300 px-2 py-0.5 text-xs text-red-700 disabled:opacity-50 dark:border-red-800 dark:text-red-400"
                   >
-                    {m.user_id.slice(0, 8)}
-                  </code>
-                </span>
-                {fingerprints.get(m.user_id) && (
-                  <code
-                    className="font-mono text-[10px] text-neutral-400"
-                    title="safety number — compare out-of-band (phone, in person) to confirm identity"
-                  >
-                    🔑 {fingerprints.get(m.user_id)}
-                  </code>
+                    remove + rotate
+                  </button>
                 )}
-              </div>
-              {isAdmin && !self && (
-                <button
-                  onClick={() => void kickMember(m.user_id)}
-                  disabled={busy}
-                  className="rounded border border-red-300 px-2 py-0.5 text-xs text-red-700 disabled:opacity-50 dark:border-red-800 dark:text-red-400"
-                >
-                  remove + rotate
-                </button>
-              )}
-              {!isAdmin && self && (
-                <button
-                  onClick={() => void leaveRoom()}
-                  disabled={busy}
-                  className="rounded border border-amber-300 px-2 py-0.5 text-xs text-amber-800 disabled:opacity-50 dark:border-amber-800 dark:text-amber-300"
-                >
-                  leave
-                </button>
-              )}
-            </li>
-          );
-        })}
+                {!isAdmin && self && (
+                  <button
+                    onClick={() => void leaveRoom()}
+                    disabled={busy}
+                    className="rounded border border-amber-300 px-2 py-0.5 text-xs text-amber-800 disabled:opacity-50 dark:border-amber-800 dark:text-amber-300"
+                  >
+                    leave
+                  </button>
+                )}
+              </li>
+            );
+          });
+        })()}
       </ul>
       {!isAdmin && (
         <p className="mt-2 text-[11px] text-neutral-500">
@@ -965,12 +1001,14 @@ function BlobFeed({
   roomId,
   roomKeysByGen,
   nicknames,
+  onDelete,
 }: {
   blobs: DecodedBlob[];
   selfUserId: string;
   roomId: string;
   roomKeysByGen: Map<number, RoomKey>;
   nicknames: NicknameMap;
+  onDelete: (blobId: string, hasImage: boolean) => Promise<void>;
 }) {
   const [showSystem, setShowSystem] = useState(false);
   const sorted = useMemo(
@@ -1022,7 +1060,7 @@ function BlobFeed({
               : 'bg-neutral-100 dark:bg-neutral-900';
           const imageHeader = b.verified ? asImagePayload(b.payload) : null;
           return (
-            <li key={b.id} className={`rounded px-3 py-2 text-sm ${selfBubble}`}>
+            <li key={b.id} className={`group relative rounded px-3 py-2 text-sm ${selfBubble}`}>
               <div className="mb-1 flex items-center justify-between gap-2 text-[10px] uppercase tracking-wide opacity-70">
                 <span>
                   {displayNameFor(b.senderId, selfUserId, nicknames)}
@@ -1030,6 +1068,14 @@ function BlobFeed({
                 </span>
                 <span>{new Date(b.createdAt).toLocaleTimeString()}</span>
               </div>
+              {b.senderId === selfUserId && b.verified && (
+                <button
+                  onClick={() => void onDelete(b.id, !!imageHeader)}
+                  className="absolute right-2 top-2 rounded bg-red-600/80 px-1.5 py-0.5 text-[10px] text-white opacity-0 transition group-hover:opacity-100"
+                >
+                  delete
+                </button>
+              )}
               {!b.verified ? (
                 <p className="text-xs text-red-500">error: {b.error}</p>
               ) : imageHeader ? (

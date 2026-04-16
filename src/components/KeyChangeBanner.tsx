@@ -1,20 +1,51 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { onKeyChange, acceptKeyChange, type KeyChangeEvent } from '@/lib/e2ee-core';
+import { getSupabase } from '@/lib/supabase/client';
 import { fetchPublicDevices, fetchUserMasterKeyPub } from '@/lib/supabase/queries';
 
 /**
  * Listens globally for TOFU key-change events. Each unacknowledged change
  * renders as a banner row with "Trust new key" / "Dismiss" buttons.
+ * Self key changes (own UMK rotation) are auto-accepted silently.
  */
 export function KeyChangeBanner() {
   const [events, setEvents] = useState<KeyChangeEvent[]>([]);
+  const selfUidRef = useRef<string | null>(null);
 
   useEffect(() => {
-    const unsub = onKeyChange((event) => {
-      // Cap to the most recent 50 to bound memory under repeated key changes.
-      setEvents((prev) => (prev.length >= 50 ? [...prev.slice(-49), event] : [...prev, event]));
+    void getSupabase()
+      .auth.getUser()
+      .then(({ data }) => {
+        selfUidRef.current = data.user?.id ?? null;
+      });
+  }, []);
+
+  useEffect(() => {
+    const unsub = onKeyChange(async (event) => {
+      // Auto-accept own key changes — these fire after UMK rotation on
+      // this device and are expected, not suspicious.
+      if (selfUidRef.current && event.userId === selfUidRef.current) {
+        try {
+          const umk = await fetchUserMasterKeyPub(event.userId);
+          if (!umk) return;
+          const devices = await fetchPublicDevices(event.userId);
+          const latest = devices[devices.length - 1];
+          if (!latest) return;
+          await acceptKeyChange(event.userId, {
+            ed25519PublicKey: umk.ed25519PublicKey,
+            x25519PublicKey: latest.x25519PublicKey,
+            selfSignature: new Uint8Array(0),
+          });
+        } catch {
+          // non-fatal
+        }
+        return;
+      }
+      setEvents((prev) =>
+        prev.length >= 50 ? [...prev.slice(-49), event] : [...prev, event],
+      );
     });
     return unsub;
   }, []);

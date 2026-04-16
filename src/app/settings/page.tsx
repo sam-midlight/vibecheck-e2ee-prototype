@@ -5,6 +5,7 @@ import { AppShell } from '@/components/AppShell';
 import { PinSetupModal } from '@/components/PinSetupModal';
 import { RecoveryPhraseModal } from '@/components/RecoveryPhraseModal';
 import { errorMessage } from '@/lib/errors';
+import { rotateAllRoomsIAdmin } from '@/lib/bootstrap';
 import {
   clearDeviceBundle,
   clearWrappedIdentity,
@@ -24,7 +25,6 @@ import { useRouter } from 'next/navigation';
 import { getSupabase } from '@/lib/supabase/client';
 import {
   fetchUserMasterKeyPub,
-  fetchPublicDevices,
   hasRecoveryBlob,
   listDevices,
   revokeDevice,
@@ -140,10 +140,22 @@ function SettingsInner() {
         revokedAtMs,
         revocationSignature: signature,
       });
-      // Verify the UMK pub surfaced from our latest fetch — the active
-      // device set this query returns also powers other clients' wrap
-      // decisions, so freshness matters.
-      void fetchPublicDevices;
+      // Cascade: rotate every room this user admins so the revoked
+      // device is immediately excluded from new-gen wraps.
+      // filterActiveDevices in the rotation helper skips revoked certs.
+      if (device) {
+        try {
+          const result = await rotateAllRoomsIAdmin({ userId, device });
+          if (result.failures.length > 0) {
+            console.warn(
+              `revoke cascade: ${result.rotated} room(s) rotated, ${result.failures.length} failed`,
+              result.failures,
+            );
+          }
+        } catch (err) {
+          console.warn('revoke cascade failed:', errorMessage(err));
+        }
+      }
       await reloadDevices(userId);
     } catch (e) {
       setError(errorMessage(e));
@@ -325,10 +337,10 @@ function SettingsInner() {
           Device passphrase lock
         </h2>
         <p className="text-xs text-neutral-600 dark:text-neutral-400">
-          Without this, your identity private keys sit in this browser\u2019s
-          IndexedDB as plaintext — readable by browser extensions, disk
-          forensics, or anyone else who uses this profile. With it, the keys
-          are Argon2id-wrapped and you enter a passphrase on each new session.
+          Your device keys are Argon2id-wrapped in IndexedDB and require this
+          passphrase on each new session. Without it, a browser extension,
+          disk forensics tool, or anyone with access to this browser profile
+          could read your private keys.
         </p>
         {pinEnabled === null ? (
           <p className="text-sm text-neutral-500">checking…</p>

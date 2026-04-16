@@ -715,6 +715,13 @@ export async function insertBlob(params: {
   return data;
 }
 
+/** Delete a blob row. Only the sender can do this (RLS: sender_id = auth.uid()). */
+export async function deleteBlob(blobId: string): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.from('blobs').delete().eq('id', blobId);
+  if (error) throw error;
+}
+
 export async function listBlobs(
   roomId: string,
   limit = 200,
