@@ -109,7 +109,7 @@ function RoomsInner() {
         setRooms(r);
         setInvites(i);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(errorMessage(e));
       }
     },
     [],
@@ -406,7 +406,7 @@ function InviteCard({
       await deleteInvite(invite.id);
       onDone();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -418,7 +418,7 @@ function InviteCard({
       await deleteInvite(invite.id);
       onDone();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -522,7 +522,7 @@ function CreateRoomForm({
       setParentId('');
       setName('');
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -744,7 +744,7 @@ function InviteForm({
       setInviteeId('');
       onInvited();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }

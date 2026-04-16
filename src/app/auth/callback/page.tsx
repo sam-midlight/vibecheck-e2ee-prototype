@@ -33,6 +33,7 @@ import {
   type EnrolledDevice,
 } from '@/lib/bootstrap';
 import { PinSetupModal } from '@/components/PinSetupModal';
+import { errorMessage } from '@/lib/errors';
 import {
   createApprovalRequest,
   deleteApprovalRequest,
@@ -101,8 +102,14 @@ export default function AuthCallbackPage() {
 
       const { data: userData, error: userErr } = await supabase.auth.getUser();
       if (userErr || !userData.user) {
-        setError(userErr?.message ?? 'not signed in');
-        setStep('error');
+        // No active session — can't continue with the callback flow.
+        // Common on mobile when the magic link is opened in a different
+        // browser context than the one that requested it, or when the
+        // URL-hash token fails to parse. Send the user back to the landing
+        // page so they can try again cleanly, rather than dead-ending on
+        // a cryptic "Auth session missing!" error screen.
+        console.warn('auth callback: no session, routing to /', userErr?.message);
+        router.replace('/');
         return;
       }
       const uid = userData.user.id;
@@ -203,7 +210,7 @@ export default function AuthCallbackPage() {
     run().catch((e) => {
       console.error(e);
       if (!cancelled) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(errorMessage(e));
         setStep('error');
       }
     });
@@ -250,7 +257,7 @@ export default function AuthCallbackPage() {
       setEnrolled(fresh);
       setStep('offer-recovery-setup');
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
       setStep('error');
     }
   }, [userId]);
@@ -405,7 +412,7 @@ function UnlockPassphrase({
       }
       onUnlocked({ userId, deviceBundle: state.deviceBundle, umk: state.umk });
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -695,14 +702,14 @@ function AwaitingApproval({
 
         pollHandle = setInterval(() => {
           void tryInstall().catch((e) => {
-            if (!cancelled) onError(e instanceof Error ? e.message : String(e));
+            if (!cancelled) onError(errorMessage(e));
           });
         }, 2000);
         void tryInstall().catch(() => {
           // non-fatal on first poll
         });
       } catch (e) {
-        if (!cancelled) onError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) onError(errorMessage(e));
       }
     })();
 

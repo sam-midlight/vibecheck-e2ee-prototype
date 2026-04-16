@@ -12,6 +12,7 @@
  */
 
 import { useState } from 'react';
+import { errorMessage } from '@/lib/errors';
 import {
   encodeRecoveryBlob,
   generateRecoveryPhrase,
@@ -91,7 +92,7 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
       }
       onDone('saved');
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
       setStage('error');
     }
   }

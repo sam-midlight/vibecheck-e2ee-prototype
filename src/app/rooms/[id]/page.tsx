@@ -233,7 +233,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         if ((e as { staleMembership?: boolean } | null)?.staleMembership) {
           setStaleMembership(true);
         } else {
-          setError(e instanceof Error ? e.message : String(e));
+          setError(errorMessage(e));
         }
       } finally {
         setLoading(false);
@@ -257,7 +257,7 @@ function RoomInner({ roomId }: { roomId: string }) {
       if (delErr) throw delErr;
       router.replace('/rooms');
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
       setLeaveBusy(false);
     }
   }
@@ -377,7 +377,7 @@ function RoomInner({ roomId }: { roomId: string }) {
                   await deleteRoom(roomId);
                   router.replace('/rooms');
                 } catch (e) {
-                  setError(e instanceof Error ? e.message : String(e));
+                  setError(errorMessage(e));
                 }
               }}
               className="rounded border border-red-300 px-2 py-1 text-xs text-red-700 dark:border-red-800 dark:text-red-400"
@@ -548,7 +548,7 @@ async function decodeAndVerify(
       verified: true,
     };
   } catch (e) {
-    const message = e instanceof CryptoError ? `${e.code}: ${e.message}` : e instanceof Error ? e.message : String(e);
+    const message = e instanceof CryptoError ? `${e.code}: ${e.message}` : errorMessage(e);
     return {
       id: row.id,
       senderId: row.sender_id,
@@ -646,7 +646,7 @@ function MemberList({
     try {
       await onSendNickname(trimmed);
     } catch (err) {
-      setNickError(err instanceof Error ? err.message : String(err));
+      setNickError(errorMessage(err));
     } finally {
       setNickBusy(false);
     }
@@ -800,7 +800,7 @@ function MemberList({
       await rotateAndRemove({ keeperMembers, removeUserIds: [removedUserId] });
       onChange();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -828,7 +828,7 @@ function MemberList({
       await rotateAndRemove({ keeperMembers: members, removeUserIds: [] });
       onChange();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -850,7 +850,7 @@ function MemberList({
       await rotateAndRemove({ keeperMembers: remaining, removeUserIds: [selfUserId] });
       onLeft();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -1121,7 +1121,7 @@ function ImageAttachment({
         setFullUrl(createdUrl);
       } catch (e) {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        setError(errorMessage(e));
       }
     })();
     return () => {
@@ -1263,7 +1263,7 @@ function InRoomInviteForm({
       setInviteeId('');
       onInvited();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -1419,7 +1419,7 @@ function RenameRoomDialog({
       });
       onSaved(trimmed);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -1571,7 +1571,7 @@ function Composer({
       if (pendingImage) await sendImage();
       if (text.trim()) await sendText();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }

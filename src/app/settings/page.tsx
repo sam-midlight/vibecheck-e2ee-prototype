@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { AppShell } from '@/components/AppShell';
 import { PinSetupModal } from '@/components/PinSetupModal';
 import { RecoveryPhraseModal } from '@/components/RecoveryPhraseModal';
+import { errorMessage } from '@/lib/errors';
 import {
   clearDeviceBundle,
   clearWrappedIdentity,
@@ -79,7 +80,7 @@ function SettingsInner() {
         // non-fatal
       }
       await reloadDevices(data.user.id);
-    })().catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    })().catch((e) => setError(errorMessage(e)));
   }, []);
 
   async function reloadDevices(uid: string) {
@@ -145,7 +146,7 @@ function SettingsInner() {
       void fetchPublicDevices;
       await reloadDevices(userId);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -176,7 +177,7 @@ function SettingsInner() {
       await clearUserMasterKey(userId);
       router.replace('/auth/callback');
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
       setBusy(false);
     }
   }

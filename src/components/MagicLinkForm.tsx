@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { errorMessage } from '@/lib/errors';
 
 type Status = 'idle' | 'sending' | 'ready' | 'error';
 
@@ -34,7 +35,7 @@ export function MagicLinkForm() {
       setLink(body.url);
       setStatus('ready');
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
       setStatus('error');
     }
   }

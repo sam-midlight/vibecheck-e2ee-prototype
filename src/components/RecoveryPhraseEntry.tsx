@@ -12,6 +12,7 @@
  */
 
 import { useState } from 'react';
+import { errorMessage } from '@/lib/errors';
 import {
   decodeRecoveryBlob,
   getSodium,
@@ -84,7 +85,7 @@ export function RecoveryPhraseEntry({ userId, onRecovered, onBack }: Props) {
       const enrolled = await enrollDeviceWithUmk(userId, umk);
       onRecovered(enrolled);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setBusy(false);
     }

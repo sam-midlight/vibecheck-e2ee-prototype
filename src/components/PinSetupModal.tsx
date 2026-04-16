@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { errorMessage } from '@/lib/errors';
 
 export function PinSetupModal({
   onCancel,
@@ -37,7 +38,7 @@ export function PinSetupModal({
     try {
       await onSave(passphrase);
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(errorMessage(e));
     } finally {
       setBusy(false);
     }

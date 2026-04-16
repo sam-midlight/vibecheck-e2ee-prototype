@@ -181,7 +181,7 @@ function ApprovalCard({
       await deleteApprovalRequest(request.id);
       onResolved();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setBusy(false);
     }

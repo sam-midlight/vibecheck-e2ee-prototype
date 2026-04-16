@@ -1,175 +1,189 @@
 # vibecheck-e2ee-prototype
 
-A standalone prototype proving a **zero-knowledge, Signal/Bitwarden-style encryption foundation** for a real-time rooms/messaging app. Built with Next.js 16 + Supabase + `libsodium-wrappers-sumo`. The `src/lib/e2ee-core/` module is intentionally app-agnostic and ports wholesale into V2.
+A standalone prototype proving a **zero-knowledge, per-device E2EE foundation** for a real-time rooms/messaging app. Next.js 16 + Supabase + `libsodium-wrappers-sumo`. The `src/lib/e2ee-core/` module + `src/lib/bootstrap.ts` + all migrations are intentionally designed to be **lifted wholesale into a consuming app**.
 
-- **Spec and decision log:** this file
-- **Module API reference:** `src/lib/e2ee-core/README.md`
-- **Port into V2 checklist:** `docs/port-to-v2.md`
+- **Agent onboarding (read first if you're an AI):** `AGENTS.md`
+- **e2ee-core API reference:** `src/lib/e2ee-core/README.md`
+- **Port into a consuming app:** `docs/port-to-v2.md`
 
 ---
 
-## Architecture at a glance
+## Architecture at a glance (v3 per-device identities)
 
 ```
-┌─────────────────────────────┐        ┌─────────────────────────────┐
-│         Browser A           │        │         Browser B           │
-│                             │        │                             │
-│  IndexedDB: identity privs  │        │  IndexedDB: identity privs  │
-│    ↑                        │        │    ↑                        │
-│    │                        │        │    │                        │
-│  e2ee-core                  │        │  e2ee-core                  │
-│  encrypt + sign blob        │        │  verify + decrypt blob      │
-│    ↓                        │        │    ↑                        │
-└───────────┬─────────────────┘        └─────────────┬───────────────┘
-            │ ciphertext + sig + nonce                │
-            ▼                                         │
-        ┌───────────────────── Supabase ─────────────────┐
-        │  Postgres + RLS                                │
-        │  • identities       (public keys only)         │
-        │  • rooms            (kind, parent, generation) │
-        │  • room_members     (wrapped room keys)        │
-        │  • room_invites     (pending wrapped keys)     │
-        │  • blobs            (nonce + ciphertext + sig) │
-        │  • device_link_handoffs (ephemeral)            │
-        │  • device_approval_requests (ephemeral)        │
-        │  • recovery_blobs   (phrase-wrapped priv keys) │
-        │  + Realtime pushes new rows to subscribers     │
-        │  Storage bucket                                │
-        │  • room-attachments (encrypted image blobs)    │
-        └─────────────────────────────────────────────────┘
+┌──────────────────────────── User account ────────────────────────────┐
+│                                                                      │
+│  User Master Key (UMK) — Ed25519 only                                │
+│  ├── Signs: device issuance certs, device revocation certs           │
+│  ├── Does NOT encrypt messages, does NOT wrap room keys              │
+│  ├── Private half: lives on primary device + (encrypted) in          │
+│  │   recovery_blobs; NEVER transmitted in usable form                │
+│  └── Wrapped by: 24-word BIP-39 phrase (Argon2id) + Passphrase lock  │
+│                                                                      │
+│  N Device Key Bundles (one per device)                               │
+│  ├── Ed25519 — signs blobs, signs membership ops                     │
+│  ├── X25519  — receives sealed room-key wraps                        │
+│  ├── Private halves: generated locally; NEVER leave the device       │
+│  └── Trust chain: devices.issuance_signature verifies against UMK    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+Per-room, per-generation:
+  • Room symmetric key (32 bytes, XChaCha20-Poly1305)
+  • Wrapped per-DEVICE via crypto_box_seal to each device.x25519_pub
+  • Rotation: admin creates new gen, re-wraps for every current member's
+    devices, atomic via kick_and_rotate RPC (also purges < new_gen - 9)
 ```
 
-Supabase sees routing metadata (who posted to which room when) but never any plaintext payload.
-
-## Key hierarchy
+### Blob wire format (v3)
 
 ```
-User identity (per account, device-local only — no server backup)
-├── Ed25519 signing keypair   — identity, write authenticity, self-signature
-└── X25519 DH keypair         — used to receive wrapped room keys
+blobs row:
+  { sender_id, sender_device_id, generation, nonce, ciphertext }
 
-Per-room (per generation)
-└── Room symmetric key (32 bytes)
-    ├── Wrapped per member via crypto_box_seal(roomKey, member.x25519_pub)
-    └── Incremented on membership change; old blobs stay under old key
+AEAD plaintext (JSON envelope):
+  { v: 3, s: sender_user_id, sd: sender_device_id, sig: <base64>, p: <payload> }
+  • sig = sign(domain || room_id || gen || nonce || sha256(payload),
+              sender_device_ed_priv)
+  • Verifier: fetch devices row by (sender_id, sender_device_id),
+              verify issuance cert against user's UMK, then check sig.
 ```
 
 ## Trust model (what we defend against)
 
-| Attacker                             | Outcome                                               |
-| ------------------------------------ | ----------------------------------------------------- |
-| Supabase operator (curious)          | Sees only ciphertext + routing metadata               |
-| Supabase operator (actively swapping pubkeys post-signup) | Detected by TOFU banner on next interaction |
-| Supabase operator (MITM on *first* invite) | Not prevented — accepted tradeoff for zero friction   |
-| Stolen JWT without the device        | Can read metadata; cannot decrypt; cannot forge writes (sig check) |
-| Stolen unlocked device               | Full access. No extra re-auth gate.                   |
-| Attacker with mailbox, no phrase     | Can sign in, but hits `device-linking-needed` chooser — needs a legitimate device to approve via 6-digit code, OR the recovery phrase |
-| Attacker with mailbox + phrase       | Full account compromise. Phrase is a standalone credential by design — store it offline |
-| Attacker pushing "approve" on A      | Defeated by code-entry flow: the 6-digit code lives on B's screen, so A has nothing to approve unless the real user types it |
-| Lost all devices, have phrase        | Enter phrase on new device → unwrap from `recovery_blobs` → identity restored. Old room blobs remain decryptable |
-| Lost all devices, no phrase          | No recovery. User resets; partners re-invite. Old room blobs permanently lost |
-| Removed group member                 | Can still decrypt past blobs they cached; cannot decrypt anything new (key rotated). Only the room admin (creator) can remove someone. Other members can only leave themselves. |
-| Server-side abuse / CSAM scanning    | Not possible by design. Every image is re-encoded client-side (EXIF/GPS stripped) and encrypted under the room key before upload — the server stores opaque bytes. Accept this tradeoff before shipping to a general audience; Signal and iMessage do. |
+| Attacker | Outcome |
+|---|---|
+| Supabase operator (curious) | Sees routing metadata (who posted to which room when). Cannot decrypt; cannot forge writes that verify. |
+| Supabase operator (row-mutating, `service_role` leak, SQL injection) | Cannot add a "ghost device" to an account — missing UMK signature fails every client's `verifyPublicDevice`. Cannot impersonate an inviter — signed envelope fails on accept. |
+| Compromised secondary device | Attacker has THAT device's bundle only. Cannot sign device certs (no UMK). Next UMK rotation evicts them; explicit revocation evicts them instantly. |
+| Compromised primary device (UMK priv exfiltrated) | Full account takeover until user rotates UMK. Mitigation: Settings → "Rotate & generate new phrase" signs a fresh UMK + new phrase + cascades room-key rotation on every admin-owned room. |
+| Attacker with mailbox, no phrase | Signs in, hits device-linking-chooser, needs either a 6-digit code from an existing device OR the phrase. Cannot enroll unilaterally. |
+| Attacker with mailbox + phrase | Account compromise. Phrase is a standalone credential by design — store it offline. |
+| Removed group member | Row deleted at kick time; they're excluded from new gen immediately. Cached past-gen keys stay decryptable on their device (no server-side revocation of what they already saw) but `< new_gen - 9` wraps are server-purged so fresh sessions can't rebuild them. |
+| Stolen unlocked device (no passphrase set) | Full access to this device's room memberships. **But passphrase lock is enforced as default since Point 19 fix** — any newly-enrolled device must set one before reaching `/rooms`. |
+| Stolen locked device | Argon2id (opslimit 3 / memlimit 256 MiB) protects the wrapped bundle. Attacker must brute-force the passphrase offline. |
+| Server-side abuse scanning / CSAM detection | Impossible by design. Images are client-re-encoded (EXIF stripped), AEAD-encrypted under room key + bound to `{room_id, blob_id, generation}`, stored as opaque bytes. Policy decision — accept before shipping to a general audience. |
 
-## Core decisions (and why)
+## Core design choices
 
-- **`libsodium-wrappers-sumo` over WebCrypto** — Argon2id availability and a clean `crypto_box_seal` primitive beat WebCrypto's smaller surface; portable across platforms we might add later.
-- **Ed25519 + X25519** — standard Signal-style split: signing separate from DH. Avoids accidental key reuse across purposes.
-- **XChaCha20-Poly1305 for blobs** — random 24-byte nonce is safe without state, avoiding the AES-GCM nonce reuse footgun.
-- **Per-room symmetric key wrapped per member** — Bitwarden-style. Simple to reason about, supports multi-member rooms, and key rotation is tractable.
-- **`crypto_box_seal` for wrapping** — anonymous sender, keyed only by recipient's X25519 pubkey. Right semantics for "post this key for a specific user to pick up."
-- **Two-path multi-device onboarding**:
-  1. **Device approval (primary)** — new device (B) generates an ephemeral X25519 keypair + short 6-digit code, writes a `device_approval_requests` row. An already-signed-in device (A) sees a banner; the user types the code; A seals its identity with B's pub, writes a `device_link_handoffs` row; B decrypts and installs. Code-on-B-entered-on-A closes the social-engineering ("approve this push") attack that plagues push-based MFA.
-  2. **Recovery phrase (optional, opt-in)** — 24-word BIP-39 phrase runs through Argon2id (256 MiB / opslimit 3) to derive a wrapping key; identity privs are sealed with XChaCha20-Poly1305 and the ciphertext is uploaded to `recovery_blobs`. The phrase never leaves the client. Enter it on a fresh device to restore without a legitimate other device. Forced 3-word verification step on generation catches "I didn't actually write it down" regret.
-- **TOFU + key-change banners, not manual safety-number comparison** — chose low friction; WhatsApp's compromise. `tofu.ts` detects changes; banner surfaces them.
-- **Email magic link (no password)** — Supabase Auth handles the directory; identity keys are the real trust anchor.
-- **Implicit auth flow, not PKCE** — `src/lib/supabase/client.ts` sets `flowType: 'implicit'` so the magic-link token comes back in the URL hash rather than via a code-exchange that needs a verifier in the requesting browser's localStorage. This lets the user request the link in Browser B and open the email in Browser A (or vice-versa) without hitting "PKCE code verifier not found." The email itself remains the trust anchor. If V2 goes SSR-first, switch back to `pkce` with `@supabase/ssr` cookie storage.
-- **Text (base64) columns, not bytea** — PostgREST's bytea encoding is quirky and version-dependent; the payloads are already opaque, so text is trivially correct.
+- **Signal/Matrix-style per-device identity**, not Bitwarden-style single-root-key. A device compromise scopes to that one device; the UMK stays on one (or zero) device at a time.
+- **`libsodium-wrappers-sumo`** — Argon2id + `crypto_box_seal` + XChaCha20-Poly1305 in one audited library.
+- **XChaCha20-Poly1305 AEAD for all ciphertexts** — random 24-byte nonce is safe without state.
+- **Sealed-box wrapping** (`crypto_box_seal`) for room keys — anonymous sender, keyed only by recipient device's X25519 pubkey. Correct semantics for "post this key for a specific device."
+- **Per-generation shared room key** (not per-message ratcheting) — O(1) send, O(N·devices) re-wrap on membership change. 10-generation retention window for "read history on fresh sessions" UX, paired with aggressive server-side purge of older wraps.
+- **Atomic `kick_and_rotate` RPC** — evictee delete + new-gen wraps + gen bump + stale-invite purge + FS purge in one SECURITY DEFINER transaction. Conditional `current_generation = old_gen` guard rejects concurrent rotations.
+- **Blob sigs inside AEAD** — the outer `blobs.signature` column is null on new rows; the Ed25519 signature rides inside the encrypted envelope. Server no longer stores a per-sender fingerprint linkable across blobs.
+- **Transcript-bound 6-digit approval code** — `hash = SHA-256(domain || salt || code || linking_pubkey || link_nonce)` + server-side `verify_approval_code` RPC with 5-attempt limit and 2-minute TTL. Not a PAKE (deferred), but closes the active row-swap attack.
+- **Mandatory PIN-lock** — first sign-in / first unlock / first enrollment all pass through `require-pin-setup`. Identity is Argon2id-wrapped in IndexedDB; plaintext-in-IDB is no longer the default posture.
+- **UMK rotation cascades to room rotation** — rotating the master key also re-keys every room the user admins, so ghost devices can't retain room access.
+- **Implicit auth flow, not PKCE** — `src/lib/supabase/client.ts` uses `flowType: 'implicit'`. Email magic link comes back in URL hash rather than needing a verifier stored in the requesting browser. Lets users request in Browser B and open the email in Browser A. If porting to SSR-first, switch back to `pkce` with `@supabase/ssr` cookie storage.
 
 ## Project layout
 
 ```
 src/
-├── app/                         Next.js 16 App Router pages
-│   ├── page.tsx                 Landing + magic-link form
-│   ├── auth/callback/page.tsx   Post-magic-link bootstrap (identity gen / publish)
-│   ├── link-device/page.tsx     QR show + scan for device linking
-│   ├── status/page.tsx          Live 12-check E2EE verification dashboard
-│   └── rooms/
-│       ├── page.tsx             Rooms list, create, invite, accept
-│       └── [id]/page.tsx        Encrypted feed + realtime + member rotate
-├── components/
-│   ├── AppShell.tsx             Auth-aware header + layout
-│   ├── MagicLinkForm.tsx
-│   ├── QrShow.tsx / QrScan.tsx
-│   ├── KeyChangeBanner.tsx
-│   └── StatusCheck.tsx
+├── app/
+│   ├── page.tsx                          Landing + magic-link form
+│   ├── auth/callback/page.tsx            Identity bootstrap, approval,
+│   │                                     recovery, unlock, enforce-PIN gate
+│   ├── api/dev/magic-link/route.ts       ⚠ TEMP dev shortcut — revert
+│   │                                     before real-audience deploy
+│   ├── rooms/page.tsx                    Rooms list + create + invite
+│   ├── rooms/[id]/page.tsx               Room detail, messages, rotate,
+│   │                                     in-room invite, nicknames
+│   ├── settings/page.tsx                 Safety number, recovery phrase,
+│   │                                     device list + revoke, PIN-lock
+│   └── status/page.tsx                   Green-dot diagnostic dashboard
+├── components/                           AppShell, PinSetupModal,
+│                                         RecoveryPhraseModal, ...
 ├── lib/
-│   ├── e2ee-core/               ★ APP-AGNOSTIC CRYPTO MODULE (ported into V2)
-│   └── supabase/                Typed client + query helpers
+│   ├── e2ee-core/                        ★ Pure crypto — copy verbatim
+│   │   ├── device.ts                     UMK + DeviceKeyBundle + certs
+│   │   ├── membership.ts                 Invite + wrap signatures
+│   │   ├── blob.ts                       v3 envelope (sig inside AEAD)
+│   │   ├── room.ts                       Keygen, wrap, unwrap, rotate
+│   │   ├── pin-lock.ts                   Argon2id-wrapped device state
+│   │   ├── recovery.ts                   BIP-39 phrase wraps UMK priv
+│   │   ├── attachment.ts                 Image re-encode + AEAD
+│   │   ├── approval.ts                   6-digit code hash
+│   │   ├── linking.ts                    (legacy — kept for back-compat)
+│   │   ├── storage.ts                    IndexedDB for device/umk/wrapped
+│   │   ├── tofu.ts                       Key-change detection
+│   │   ├── identity.ts                   Sign/verify primitives
+│   │   └── sodium.ts                     Lazy libsodium init + encoders
+│   ├── bootstrap.ts                      ★ App-glue helpers: bootstrapNewUser,
+│   │                                     enrollDeviceWithUmk, rotateUserMasterKey,
+│   │                                     rotateAllRoomsIAdmin, loadEnrolledDevice
+│   └── supabase/                         Client + typed queries
 supabase/
 └── migrations/
-    ├── 0001_init.sql                          identities, devices, rooms,
-    │                                          room_members, room_invites,
-    │                                          blobs, device_link_handoffs
-    │                                          + RLS + Realtime publication
-    ├── 0002_device_approval_and_recovery.sql  device_approval_requests
-    │                                          (code-based device linking)
-    │                                          + recovery_blobs (phrase-
-    │                                          wrapped identity escrow)
-    ├── 0003_room_name.sql                     encrypted room display names
-    ├── 0004_room_delete.sql                   rooms_creator_delete policy
-    ├── 0005_tighten_handoff_rls.sql           scopes device_link_handoffs
-    │                                          to inviting_user_id = auth.uid()
-    ├── 0006_attachments_bucket.sql            room-attachments Storage
-    │                                          bucket + RLS for encrypted
-    │                                          image attachments
-    └── 0007_pair_cap_and_admin_delete.sql     pair rooms = 2 people (trigger)
-                                               + admin-only kick (tightened
-                                               room_members delete/insert RLS)
+    0001_init                           core schema + RLS + realtime
+    0002_device_approval_and_recovery   device_approval_requests, recovery_blobs
+    0003_room_name                      encrypted room display names
+    0004_room_delete                    rooms_creator_delete policy
+    0005_tighten_handoff_rls            handoffs_owner_all
+    0006_attachments_bucket             room-attachments bucket + RLS
+    0007_pair_cap_and_admin_delete      pair=2 trigger + admin-only kick
+    0008_backport_live_helpers          is_room_member_at + my_room_ids +
+                                        room_current_generation (SECURITY DEFINER)
+    0009_atomic_kick_and_rotate         kick_and_rotate RPC, same-gen RLS
+    0010_approval_attempt_limiter       verify_approval_code RPC
+    0011_signed_membership              inviter_signature + wrap_signature
+    0012_identity_epoch                 auto-bump trigger on UMK change
+    0013_auto_rotate_and_purge          last_rotated_at + FS purge
+    0014_blob_signature_nullable        sig moves inside AEAD
+    0015_per_device_identities          ★ STRUCTURAL PIVOT — UMK + device keys
+    0016_display_name_and_not_null      sealed-to-self display_name + NOT NULL
+    0017_public_read_devices            devices SELECT = authenticated
+    0018_purge_stale_invites_on_rotate  kick_and_rotate also wipes stale invites
+    0019_retain_10_generations          FS window 2 → 10 gens
 ```
 
 ## Getting started
 
 ```bash
-cp .env.example .env.local    # fill in Supabase URL + anon key
+cp .env.example .env.local    # fill NEXT_PUBLIC_SUPABASE_URL + ANON_KEY
 npm install
 npm run dev                   # http://localhost:3000
 ```
 
-### Supabase project setup (one-time)
+### Supabase setup (one-time)
 
-1. Create a new project at [supabase.com](https://supabase.com).
-2. Settings → API → copy project URL and anon key into `.env.local`.
-3. Authentication → Providers → enable Email (leave password optional / unused).
-4. Authentication → URL Configuration → add `http://localhost:3000/auth/callback` to allowed redirect URLs.
-5. SQL Editor → paste every file in `supabase/migrations/` in numeric order and run each.
-6. Database → Replication → ensure Realtime is enabled for `blobs`, `room_invites`, `device_link_handoffs`, `room_members`, and `device_approval_requests` (the migrations attempt to do this automatically).
+1. Create a project at [supabase.com](https://supabase.com).
+2. Settings → API → copy URL + anon key to `.env.local`. (For dev magic-link shortcut, also copy `service_role` to `SUPABASE_SERVICE_ROLE_KEY` — server-only env var, never bundle to browser.)
+3. Auth → Providers → enable Email.
+4. Auth → URL Configuration → add `http://localhost:3000/auth/callback` to redirect allow-list.
+5. SQL Editor → paste each file in `supabase/migrations/` in order and run. (Or use the Supabase CLI's `db push`.)
+6. Database → Replication → ensure Realtime is on for `blobs`, `room_invites`, `device_approval_requests`. (`room_members` is intentionally NOT published — migration 0009 removed it.)
 
 ### Verification walkthrough
 
-After signup:
+1. `/status` — every check green within a few seconds.
+2. Open the app in a second browser profile. Sign up with a different email.
+3. User A: Rooms → copy user ID → create a "pair" room → paste B's user ID → send invite.
+4. User B: Rooms → accept invite (safety-number shown at accept time).
+5. Both users → open the room. Send a message. Realtime delivery.
+6. Supabase Table Editor → `blobs` → ciphertext is opaque base64.
+7. Settings → "Your safety number" matches between the two browsers (read it out to confirm).
+8. Kick a member → `rooms.current_generation` bumps.
 
-1. Open `/status` — every row should go green within a few seconds. This proves libsodium, IndexedDB, Supabase auth, RLS, encryption, realtime, and tamper detection are all live.
-2. Open the app in a second browser profile (incognito = second user). Sign up with a different email.
-3. On user A: Rooms → copy user ID → create a "pair" room → paste B's user ID into invite form → send.
-4. On user B: Rooms → accept the invite.
-5. Both users: click into the room. Send a message. Watch the other side receive it live.
-6. In Supabase Table Editor → `blobs`: confirm the `ciphertext` column is an opaque base64 string you can't read.
-7. Remove a member from a group room and confirm `rooms.current_generation` bumps.
-
-## Deploying to Vercel (after local is green)
+## Deploying to Vercel (test/preview only today — see warning below)
 
 1. Push to GitHub.
-2. Import on Vercel; paste the two env vars.
-3. Deploy. Grab the `*.vercel.app` URL.
-4. Back in Supabase → Auth → URL Configuration → add that URL + `/auth/callback`.
+2. Import on Vercel; set env vars.
+3. Deploy. Add the `*.vercel.app/auth/callback` URL to Supabase redirect allow-list.
+
+**⚠ Temporary state:** `src/app/api/dev/magic-link/route.ts` is an unguarded server endpoint that generates magic links for any email via service-role key. Intentional for today's friends-testing sessions. **Before any real-audience deploy**: delete that file and revert `src/components/MagicLinkForm.tsx` to `supabase.auth.signInWithOtp` (see `docs/port-to-v2.md` for exact steps).
 
 ## Known limitations / future upgrades
 
-- **No Key Transparency yet** — TOFU can be defeated if Supabase is compromised on first contact. Upgrade path: publish a KT log and have clients auto-audit their own keys.
-- **No server-side Ed25519 signature verification** — signatures are checked on read. A pgsodium trigger on `blobs.insert` could reject forged writes server-side too. Skipped to keep the prototype portable.
-- **Invite by user_id, not email** — inviting by email requires either an RPC function or an email column on `identities`. Left for V2 to choose.
-- **No message history beyond the current generation after rotation** — old blobs can still be decrypted by anyone who holds the old key (e.g. the removed member), but new members won't be able to read pre-rotation blobs. This is expected.
-- ~~**No file/attachment encryption**~~ — images are supported via `src/lib/e2ee-core/attachment.ts`: re-encoded to WebP client-side (EXIF auto-stripped by `createImageBitmap`), encrypted under the current room key with a distinct AD tag (`vibecheck:attachment:v1`) bound to `roomId + blobId + generation`, uploaded to the `room-attachments` Storage bucket. The outer `blobs` row carries only the small encrypted header (mime + dimensions + tiny blur placeholder). Streaming AEAD (`crypto_secretstream_*`) is the V2 upgrade if/when you add video or large files.
-- **Single-device crypto ops** — libsodium is WASM in-browser. If V2 adds native mobile, mirror the primitives with the platform's preferred library.
+See `docs/port-to-v2.md` for the full deferred list. Highlights:
+
+- **No PAKE** for device approval — transcript-bound hash closes the active attack; CPace/OPAQUE is the textbook fix.
+- **No full Sealed Sender** — signature lives inside AEAD but `sender_id` column is still visible to the server. Full hide needs an Edge Function insert path.
+- **No Megolm-style intra-generation ratchet** — gen-granular FS via rotation + 10-gen retention covers most of the same surface for small/medium groups.
+- **No traffic padding** — ciphertext length reflects plaintext length.
+- **No WebCrypto non-extractable keys** — byte-oriented libsodium is the bottleneck.
+- **No "confirm trusted devices" picker during UMK rotation** — today's rotation re-signs every active device. A proper rotation UX asks the user to tick off ghost devices first.
+- **No Key Transparency log** — TOFU is the anchor; a KT log would let clients auto-audit.
+- **Single-device crypto ops (web only)** — for native mobile, mirror the primitives against the platform's preferred library.

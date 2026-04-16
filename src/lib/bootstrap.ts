@@ -32,6 +32,7 @@ import {
   type UserMasterKey,
 } from '@/lib/e2ee-core';
 import { getSupabase } from '@/lib/supabase/client';
+import { errorMessage } from '@/lib/errors';
 import {
   fetchPublicDevices,
   fetchUserMasterKeyPub,
@@ -441,7 +442,7 @@ export async function rotateAllRoomsIAdmin(params: {
     } catch (e) {
       failures.push({
         roomId: room.id,
-        error: e instanceof Error ? e.message : String(e),
+        error: errorMessage(e),
       });
     }
   }
