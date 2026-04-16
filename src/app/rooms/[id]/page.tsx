@@ -58,6 +58,50 @@ interface DecodedBlob {
   payload: unknown;
   verified: boolean;
   error?: string;
+  /** True when this row exists but THIS device has no key for its generation
+   *  (e.g. it was sent before we joined, or after we were kicked). We hide
+   *  these from the feed rather than render "invalid" rows for them. */
+  missingKey?: boolean;
+}
+
+/** Latest nickname a user has set in this room. Keyed by user_id. */
+type NicknameMap = Map<string, { name: string; ts: number }>;
+
+/** Nickname payload shape. */
+interface NicknamePayload {
+  type: 'nickname';
+  name: string;
+  ts: number;
+}
+
+const NICKNAME_MAX = 40;
+
+function isNicknamePayload(p: unknown): p is NicknamePayload {
+  if (typeof p !== 'object' || p === null) return false;
+  const t = (p as { type?: unknown }).type;
+  const n = (p as { name?: unknown }).name;
+  const ts = (p as { ts?: unknown }).ts;
+  return t === 'nickname' && typeof n === 'string' && typeof ts === 'number';
+}
+
+function updateNicknamesFromBlob(prev: NicknameMap, b: DecodedBlob): NicknameMap {
+  if (!b.verified || !isNicknamePayload(b.payload)) return prev;
+  const existing = prev.get(b.senderId);
+  if (existing && existing.ts >= b.payload.ts) return prev;
+  const next = new Map(prev);
+  next.set(b.senderId, { name: b.payload.name, ts: b.payload.ts });
+  return next;
+}
+
+function displayNameFor(
+  userId: string,
+  selfUserId: string,
+  nicknames: NicknameMap,
+): string {
+  if (userId === selfUserId) return 'you';
+  const nick = nicknames.get(userId);
+  if (nick && nick.name.trim()) return nick.name;
+  return `${userId.slice(0, 8)}…`;
 }
 
 export default function RoomDetailPage({
@@ -85,6 +129,7 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [roomName, setRoomName] = useState<string | null>(null);
   const [members, setMembers] = useState<RoomMemberRow[]>([]);
   const [blobs, setBlobs] = useState<DecodedBlob[]>([]);
+  const [nicknames, setNicknames] = useState<NicknameMap>(() => new Map());
   const [renameOpen, setRenameOpen] = useState(false);
   const [rtStatus, setRtStatus] = useState<string>('connecting');
   const [loading, setLoading] = useState(true);
@@ -160,6 +205,12 @@ function RoomInner({ roomId }: { roomId: string }) {
         rows.map((row) => decodeAndVerify(row, byGen, uid)),
       );
       setBlobs(decoded);
+      // Build the nickname map from the full history — the latest ts wins
+      // per sender. Nickname blobs are stored alongside messages and
+      // filtered out of the visible feed by isSystemPayload.
+      let nickMap: NicknameMap = new Map();
+      for (const b of decoded) nickMap = updateNicknamesFromBlob(nickMap, b);
+      setNicknames(nickMap);
     },
     [roomId],
   );
@@ -192,6 +243,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         if (prev.some((b) => b.id === decoded.id)) return prev;
         return [...prev, decoded];
       });
+      setNicknames((prev) => updateNicknamesFromBlob(prev, decoded));
     },
     [device, userId],
   );
@@ -296,8 +348,26 @@ function RoomInner({ roomId }: { roomId: string }) {
         selfUserId={userId}
         device={device}
         roomKey={roomKey}
+        nicknames={nicknames}
         onChange={() => void loadAll(userId, device)}
         onLeft={() => router.replace('/rooms')}
+        onSendNickname={async (name) => {
+          const blob = await encryptBlob({
+            payload: { type: 'nickname', name, ts: Date.now() } satisfies NicknamePayload,
+            roomId,
+            roomKey,
+            senderUserId: userId,
+            senderDeviceId: device.deviceId,
+            senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
+          });
+          const row = await insertBlob({
+            roomId,
+            senderId: userId,
+            senderDeviceId: device.deviceId,
+            blob,
+          });
+          await ingestBlobRow(row);
+        }}
       />
 
       {room.created_by === userId && (
@@ -319,6 +389,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         selfUserId={userId}
         roomId={roomId}
         roomKeysByGen={roomKeysByGen}
+        nicknames={nicknames}
       />
 
       <Composer
@@ -398,6 +469,7 @@ async function decodeAndVerify(
         generation: blob.generation,
         payload: null,
         verified: false,
+        missingKey: true,
         error: `no key for generation ${blob.generation} (you weren't a member at that time)`,
       };
     }
@@ -437,20 +509,55 @@ function MemberList({
   selfUserId,
   device,
   roomKey,
+  nicknames,
   onChange,
   onLeft,
+  onSendNickname,
 }: {
   room: RoomRow;
   members: RoomMemberRow[];
   selfUserId: string;
   device: DeviceKeyBundle;
   roomKey: RoomKey;
+  nicknames: NicknameMap;
   onChange: () => void;
   onLeft: () => void;
+  onSendNickname: (name: string) => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const isAdmin = room.created_by === selfUserId;
+  const selfNick = nicknames.get(selfUserId)?.name ?? '';
+  const [nickDraft, setNickDraft] = useState(selfNick);
+  const [nickBusy, setNickBusy] = useState(false);
+  const [nickError, setNickError] = useState<string | null>(null);
+  // Keep the edit box in sync if realtime delivers a new value for self.
+  useEffect(() => {
+    setNickDraft(selfNick);
+  }, [selfNick]);
+
+  async function saveNickname(e: React.FormEvent) {
+    e.preventDefault();
+    const trimmed = nickDraft.trim();
+    if (!trimmed) {
+      setNickError('nickname cannot be empty');
+      return;
+    }
+    if (trimmed.length > NICKNAME_MAX) {
+      setNickError(`max ${NICKNAME_MAX} characters`);
+      return;
+    }
+    if (trimmed === selfNick) return;
+    setNickBusy(true);
+    setNickError(null);
+    try {
+      await onSendNickname(trimmed);
+    } catch (err) {
+      setNickError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setNickBusy(false);
+    }
+  }
 
   /**
    * Rotate the room key for all keepers' devices, sign each wrap with our
@@ -683,19 +790,52 @@ function MemberList({
           </button>
         </div>
       )}
+      <form
+        onSubmit={saveNickname}
+        className="mb-2 flex items-center gap-2 rounded border border-neutral-200 px-2 py-1 text-xs dark:border-neutral-800"
+      >
+        <span className="text-neutral-500 shrink-0">your name here:</span>
+        <input
+          type="text"
+          value={nickDraft}
+          onChange={(e) => setNickDraft(e.target.value)}
+          maxLength={NICKNAME_MAX}
+          placeholder={`e.g. Sam (${selfUserId.slice(0, 4)})`}
+          className="flex-1 rounded border border-neutral-300 px-2 py-0.5 text-xs dark:border-neutral-700 dark:bg-neutral-900"
+        />
+        <button
+          type="submit"
+          disabled={nickBusy || nickDraft.trim() === selfNick}
+          className="rounded bg-neutral-900 px-2 py-0.5 text-[11px] text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+        >
+          {nickBusy ? 'saving…' : 'save'}
+        </button>
+      </form>
+      {nickError && (
+        <p className="mb-2 text-xs text-red-600 dark:text-red-400">{nickError}</p>
+      )}
       <ul className="space-y-1">
         {members.map((m) => {
           const self = m.user_id === selfUserId;
+          const nick = nicknames.get(m.user_id)?.name?.trim();
           return (
             <li
               key={`${m.user_id}-${m.generation}`}
               className="flex items-center justify-between"
             >
-              <code className="font-mono text-xs text-neutral-500">
-                {m.user_id}
-                {self ? ' (you)' : ''}
-                {m.user_id === room.created_by ? ' · admin' : ''}
-              </code>
+              <span className="flex min-w-0 items-baseline gap-2">
+                <span className="truncate font-medium">
+                  {nick ?? `${m.user_id.slice(0, 8)}…`}
+                  {self ? ' (you)' : ''}
+                  {m.user_id === room.created_by ? ' · admin' : ''}
+                </span>
+                <code
+                  className="font-mono text-[10px] text-neutral-500"
+                  title={m.user_id}
+                >
+                  {m.user_id.slice(0, 8)}
+                </code>
+              </span>
               {isAdmin && !self && (
                 <button
                   onClick={() => void kickMember(m.user_id)}
@@ -736,22 +876,31 @@ function BlobFeed({
   selfUserId,
   roomId,
   roomKeysByGen,
+  nicknames,
 }: {
   blobs: DecodedBlob[];
   selfUserId: string;
   roomId: string;
   roomKeysByGen: Map<number, RoomKey>;
+  nicknames: NicknameMap;
 }) {
   const [showSystem, setShowSystem] = useState(false);
   const sorted = useMemo(
     () => [...blobs].sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
     [blobs],
   );
+  // Always drop rows this device can't decrypt (wrong generation). They're
+  // from periods you weren't a member of the room; surfacing them just adds
+  // noise and confuses returning members who were re-invited after a kick.
+  const decryptable = useMemo(() => sorted.filter((b) => !b.missingKey), [sorted]);
   const visible = useMemo(
-    () => (showSystem ? sorted : sorted.filter((b) => !isSystemPayload(b.payload))),
-    [sorted, showSystem],
+    () =>
+      showSystem
+        ? decryptable
+        : decryptable.filter((b) => !isSystemPayload(b.payload)),
+    [decryptable, showSystem],
   );
-  const hiddenCount = sorted.length - visible.length;
+  const hiddenCount = decryptable.length - visible.length;
 
   return (
     <section className="rounded border border-neutral-200 p-3 dark:border-neutral-800">
@@ -788,7 +937,7 @@ function BlobFeed({
             <li key={b.id} className={`rounded px-3 py-2 text-sm ${selfBubble}`}>
               <div className="mb-1 flex items-center justify-between gap-2 text-[10px] uppercase tracking-wide opacity-70">
                 <span>
-                  {b.senderId === selfUserId ? 'you' : `${b.senderId.slice(0, 8)}…`}
+                  {displayNameFor(b.senderId, selfUserId, nicknames)}
                   {b.verified ? ' · ✓ signed' : ' · ✗ invalid'}
                 </span>
                 <span>{new Date(b.createdAt).toLocaleTimeString()}</span>
@@ -1109,9 +1258,11 @@ function NonLiveBadge({ status }: { status: string }) {
   );
 }
 
-/** System noise emitted by /status (health probes). Not user content. */
+/** System noise not displayed in the message feed: /status probes +
+ *  nickname payloads (nicknames surface in member-list + sender labels). */
 function isSystemPayload(p: unknown): boolean {
   if (typeof p !== 'object' || p === null) return false;
+  if (isNicknamePayload(p)) return true;
   const kind = (p as { kind?: unknown }).kind;
   return typeof kind === 'string' && kind.startsWith('status-');
 }
