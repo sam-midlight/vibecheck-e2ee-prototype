@@ -214,6 +214,7 @@ function SettingsInner() {
         <RecoveryPhraseModal
           userId={userId}
           umk={umk}
+          device={device}
           hideSkip
           rotate
           onDone={async (result) => {

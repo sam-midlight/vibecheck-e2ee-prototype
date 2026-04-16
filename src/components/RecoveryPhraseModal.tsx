@@ -17,9 +17,10 @@ import {
   generateRecoveryPhrase,
   splitPhrase,
   wrapUserMasterKeyWithPhrase,
+  type DeviceKeyBundle,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
-import { rotateUserMasterKey } from '@/lib/bootstrap';
+import { rotateAllRoomsIAdmin, rotateUserMasterKey } from '@/lib/bootstrap';
 import { putRecoveryBlob } from '@/lib/supabase/queries';
 
 interface Props {
@@ -34,11 +35,18 @@ interface Props {
    * The old blob becomes inert even if someone held a copy.
    */
   rotate?: boolean;
+  /**
+   * When rotate is true, pass the local device bundle so the modal can
+   * also cascade a rotation into every room this user administrates
+   * (fresh symmetric keys + bumped generations). Without this, the UMK
+   * rotates but rooms stay on old symmetric keys.
+   */
+  device?: DeviceKeyBundle;
 }
 
 type Stage = 'intro' | 'display' | 'verify' | 'uploading' | 'error';
 
-export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate }: Props) {
+export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, device }: Props) {
   const [stage, setStage] = useState<Stage>('intro');
   const [phrase, setPhrase] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -59,6 +67,28 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate }: P
       const blob = await wrapUserMasterKeyWithPhrase(umkToWrap, phrase, userId);
       const encoded = await encodeRecoveryBlob(blob);
       await putRecoveryBlob({ userId, ...encoded });
+
+      // Cascade: when we just rotated UMK, also rotate every room this
+      // user administrates so their symmetric keys + generations bump.
+      // Without this, room keys stay the same across a UMK rotation,
+      // leaving a ghost device (if one existed) still able to read
+      // in-flight messages until the next rotation.
+      if (rotate && device) {
+        try {
+          const result = await rotateAllRoomsIAdmin({ userId, device });
+          if (result.failures.length > 0) {
+            console.warn(
+              `[recovery] ${result.rotated} room(s) rotated; ${result.failures.length} failed:`,
+              result.failures,
+            );
+          }
+        } catch (err) {
+          // Cascade failure shouldn't block the phrase setup itself;
+          // log + let the user move on. They can re-trigger rotation
+          // from each affected room manually.
+          console.warn('[recovery] room cascade failed', err);
+        }
+      }
       onDone('saved');
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

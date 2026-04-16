@@ -134,6 +134,8 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [rtStatus, setRtStatus] = useState<string>('connecting');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [staleMembership, setStaleMembership] = useState(false);
+  const [leaveBusy, setLeaveBusy] = useState(false);
   const roomKeyRef = useRef<RoomKey | null>(null);
   const roomKeysByGenRef = useRef<Map<number, RoomKey>>(new Map());
 
@@ -171,9 +173,9 @@ function RoomInner({ roomId }: { roomId: string }) {
       }
       const current = byGen.get(roomRow.current_generation);
       if (!current) {
-        throw new Error(
-          'this device is not a current-generation member (may need re-invite or rewrap from another of your devices)',
-        );
+        const err = new Error('STALE_MEMBERSHIP');
+        (err as Error & { staleMembership?: boolean }).staleMembership = true;
+        throw err;
       }
       setRoomKey(current);
       roomKeyRef.current = current;
@@ -227,12 +229,37 @@ function RoomInner({ roomId }: { roomId: string }) {
         setDevice(enrolled.deviceBundle);
         await loadAll(data.user.id, enrolled.deviceBundle);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        if ((e as { staleMembership?: boolean } | null)?.staleMembership) {
+          setStaleMembership(true);
+        } else {
+          setError(e instanceof Error ? e.message : String(e));
+        }
       } finally {
         setLoading(false);
       }
     })();
   }, [loadAll]);
+
+  async function abandonStaleMembership() {
+    if (!userId) return;
+    setLeaveBusy(true);
+    try {
+      const supabase = getSupabase();
+      // Delete every row we still have for this room, across all generations.
+      // We're not a current-gen member so a regular `leave` (which rotates)
+      // wouldn't work anyway — this is the pure cleanup path.
+      const { error: delErr } = await supabase
+        .from('room_members')
+        .delete()
+        .eq('room_id', roomId)
+        .eq('user_id', userId);
+      if (delErr) throw delErr;
+      router.replace('/rooms');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setLeaveBusy(false);
+    }
+  }
 
   const ingestBlobRow = useCallback(
     async (row: BlobRow) => {
@@ -261,6 +288,38 @@ function RoomInner({ roomId }: { roomId: string }) {
   }, [roomId, device, userId, ingestBlobRow]);
 
   if (loading) return <p className="text-sm text-neutral-500">loading…</p>;
+  if (staleMembership) {
+    return (
+      <div className="mx-auto max-w-2xl space-y-3">
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+          <p className="font-semibold">You&apos;re out of sync with this room.</p>
+          <p className="mt-2 text-xs">
+            Your current membership row is from an older generation of the
+            room&apos;s key — probably a stale invite that landed after the
+            room was rotated. The only way forward is to leave, then ask the
+            admin to re-invite you. Messages sent to this room while you
+            were out of sync will stay unreadable to you.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => void abandonStaleMembership()}
+            disabled={leaveBusy}
+            className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+          >
+            {leaveBusy ? 'leaving…' : 'leave this room'}
+          </button>
+          <button
+            onClick={() => router.replace('/rooms')}
+            disabled={leaveBusy}
+            className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
+          >
+            back to rooms
+          </button>
+        </div>
+      </div>
+    );
+  }
   if (error) {
     return (
       <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-900 dark:border-red-900 dark:bg-red-950 dark:text-red-200">

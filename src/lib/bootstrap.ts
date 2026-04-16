@@ -8,8 +8,11 @@
  */
 
 import {
+  decryptRoomName,
   encryptDeviceDisplayName,
+  encryptRoomName,
   filterActiveDevices,
+  fromBase64,
   generateDeviceKeyBundle,
   generateUserMasterKey,
   getDeviceBundle,
@@ -18,19 +21,27 @@ import {
   putDeviceBundle,
   putDeviceRecord,
   putUserMasterKey,
+  rotateRoomKey,
   signDeviceIssuance,
+  signMembershipWrap,
+  toBase64,
+  unwrapRoomKey,
   verifyPublicDevice,
   type DeviceKeyBundle,
+  type PublicDevice,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
 import { getSupabase } from '@/lib/supabase/client';
 import {
   fetchPublicDevices,
   fetchUserMasterKeyPub,
+  getMyWrappedRoomKey,
+  kickAndRotate,
+  listRoomMembers,
   publishUserMasterKey,
   registerDevice,
+  type RoomRow,
 } from '@/lib/supabase/queries';
-import { toBase64 } from '@/lib/e2ee-core';
 
 export function inferDeviceName(): string {
   if (typeof navigator === 'undefined') return 'device';
@@ -255,6 +266,186 @@ export async function rotateUserMasterKey(
   await putUserMasterKey(userId, newUmk);
 
   return newUmk;
+}
+
+/**
+ * Rotate one room's symmetric key — a "refresh only" variant of
+ * kick_and_rotate (no evictees, all current members retained). Each
+ * current member's active devices all get freshly-wrapped new-gen keys.
+ * Used by `rotateAllRoomsIAdmin` to cascade a UMK rotation into every
+ * room the user administrates.
+ *
+ * Caller must be the room's `created_by` and hold the local device bundle
+ * (signs the new membership wraps) + have a current-gen `room_members`
+ * row (to unwrap the existing room key for re-encrypting the room name).
+ */
+async function rotateOneRoomAsAdmin(params: {
+  userId: string;
+  device: DeviceKeyBundle;
+  room: RoomRow;
+}): Promise<void> {
+  const { userId, device, room } = params;
+
+  const myWrapped = await getMyWrappedRoomKey({
+    roomId: room.id,
+    deviceId: device.deviceId,
+    generation: room.current_generation,
+  });
+  if (!myWrapped) {
+    throw new Error(
+      `no current-gen wrapped key on this device for room ${room.id.slice(0, 8)}`,
+    );
+  }
+  const roomKey = await unwrapRoomKey(
+    { wrapped: myWrapped, generation: room.current_generation },
+    device.x25519PublicKey,
+    device.x25519PrivateKey,
+  );
+
+  const members = await listRoomMembers(room.id);
+  const currentMembers = members.filter(
+    (m) => m.generation === room.current_generation,
+  );
+  const keeperUserIds = Array.from(new Set(currentMembers.map((m) => m.user_id)));
+
+  type Target = { userId: string; device: PublicDevice };
+  const targets: Target[] = [];
+  for (const uid of keeperUserIds) {
+    if (uid === userId) {
+      targets.push({
+        userId: uid,
+        device: {
+          userId: uid,
+          deviceId: device.deviceId,
+          ed25519PublicKey: device.ed25519PublicKey,
+          x25519PublicKey: device.x25519PublicKey,
+          createdAtMs: 0,
+          issuanceSignature: new Uint8Array(0),
+          revocation: null,
+        },
+      });
+      continue;
+    }
+    const umk = await fetchUserMasterKeyPub(uid);
+    if (!umk) throw new Error(`no published UMK for keeper ${uid.slice(0, 8)}`);
+    const activeKeeperDevs = await filterActiveDevices(
+      await fetchPublicDevices(uid),
+      umk.ed25519PublicKey,
+    );
+    if (activeKeeperDevs.length === 0) {
+      throw new Error(
+        `keeper ${uid.slice(0, 8)} has no active signed devices`,
+      );
+    }
+    for (const d of activeKeeperDevs) targets.push({ userId: uid, device: d });
+  }
+
+  const { next, wraps } = await rotateRoomKey(
+    roomKey.generation,
+    targets.map((t) => t.device.x25519PublicKey),
+  );
+
+  let newNameCiphertext: Uint8Array | null = null;
+  let newNameNonce: Uint8Array | null = null;
+  if (room.name_ciphertext && room.name_nonce) {
+    try {
+      const oldName = await decryptRoomName({
+        ciphertext: await fromBase64(room.name_ciphertext),
+        nonce: await fromBase64(room.name_nonce),
+        roomId: room.id,
+        roomKey,
+      });
+      if (oldName) {
+        const enc = await encryptRoomName({
+          name: oldName,
+          roomId: room.id,
+          roomKey: next,
+        });
+        newNameCiphertext = enc.ciphertext;
+        newNameNonce = enc.nonce;
+      }
+    } catch {
+      // If name re-encrypt fails we clear the ciphertext rather than wedging.
+    }
+  }
+
+  const wrapSigs = await Promise.all(
+    targets.map((t, i) =>
+      signMembershipWrap(
+        {
+          roomId: room.id,
+          generation: next.generation,
+          memberUserId: t.userId,
+          memberDeviceId: t.device.deviceId,
+          wrappedRoomKey: wraps[i].wrapped,
+          signerDeviceId: device.deviceId,
+        },
+        device.ed25519PrivateKey,
+      ),
+    ),
+  );
+
+  await kickAndRotate({
+    roomId: room.id,
+    evicteeUserIds: [],
+    oldGeneration: roomKey.generation,
+    newGeneration: next.generation,
+    wraps: targets.map((t, i) => ({
+      userId: t.userId,
+      deviceId: t.device.deviceId,
+      wrappedRoomKey: wraps[i].wrapped,
+      wrapSignature: wrapSigs[i],
+    })),
+    signerDeviceId: device.deviceId,
+    nameCiphertext: newNameCiphertext,
+    nameNonce: newNameNonce,
+  });
+}
+
+/**
+ * Cascade a UMK rotation into room rotations for every room the user
+ * administrates. Call this AFTER `rotateUserMasterKey` succeeds — each
+ * room rotation bumps its generation, replaces its symmetric key, and
+ * purges pre-rotation wraps (via kick_and_rotate's `< new_gen - 1`
+ * clause). Partial failures are captured per-room so one bad room
+ * doesn't abort the others.
+ *
+ * Known limitation (documented, deferred): if a ghost device was added
+ * to this user's account under the old UMK, `rotateUserMasterKey`
+ * currently re-signs ALL currently-active devices under the new UMK,
+ * including the ghost — so this cascade still wraps new-gen keys for
+ * the ghost. The proper fix is an interactive "which devices do you
+ * trust?" confirmation during UMK rotation; see follow-ups.
+ */
+export async function rotateAllRoomsIAdmin(params: {
+  userId: string;
+  device: DeviceKeyBundle;
+}): Promise<{ rotated: number; failures: Array<{ roomId: string; error: string }> }> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('rooms')
+    .select('*')
+    .eq('created_by', params.userId);
+  if (error) throw error;
+  const rooms = (data ?? []) as RoomRow[];
+  let rotated = 0;
+  const failures: Array<{ roomId: string; error: string }> = [];
+  for (const room of rooms) {
+    try {
+      await rotateOneRoomAsAdmin({
+        userId: params.userId,
+        device: params.device,
+        room,
+      });
+      rotated++;
+    } catch (e) {
+      failures.push({
+        roomId: room.id,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  return { rotated, failures };
 }
 
 export { getDeviceRecord, verifyPublicDevice };
