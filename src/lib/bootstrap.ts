@@ -480,12 +480,9 @@ async function rotateOneRoomAsAdmin(params: {
   for (const uid of keeperUserIds) {
     // Treat self the same as any other keeper — wrap for ALL active
     // devices, not just the one performing the rotation.
-    const umk = await fetchUserMasterKeyPub(uid);
-    if (!umk) throw new Error(`no published UMK for keeper ${uid.slice(0, 8)}`);
-    const activeKeeperDevs = await filterActiveDevices(
-      await fetchPublicDevices(uid),
-      umk.ed25519PublicKey,
-    );
+    const { umkPub: keeperUmk, devices: activeKeeperDevs } =
+      await fetchAndVerifyDevices(uid);
+    if (!keeperUmk) throw new Error(`no published UMK for keeper ${uid.slice(0, 8)}`);
     if (activeKeeperDevs.length === 0) {
       throw new Error(
         `keeper ${uid.slice(0, 8)} has no active signed devices`,
@@ -622,11 +619,8 @@ export async function wrapRoomKeyForAllMyDevices(params: {
 }): Promise<void> {
   const { roomId, userId, roomKey, signerDevice } = params;
 
-  const umkPub = await fetchUserMasterKeyPub(userId);
-  if (!umkPub) return;
-
-  const allDevices = await fetchPublicDevices(userId);
-  const active = await filterActiveDevices(allDevices, umkPub.ed25519PublicKey);
+  const { devices: active } = await fetchAndVerifyDevices(userId);
+  if (active.length === 0) return;
 
   for (const dev of active) {
     try {
@@ -781,12 +775,7 @@ async function verifiedMemberDevices(roomId: string): Promise<
 
   const out: Array<{ userId: string; device: PublicDevice }> = [];
   for (const userId of uniqueUserIds) {
-    const umkPub = await fetchUserMasterKeyPub(userId);
-    if (!umkPub) continue;
-    const devices = await filterActiveDevices(
-      await fetchPublicDevices(userId),
-      umkPub.ed25519PublicKey,
-    );
+    const { devices } = await fetchAndVerifyDevices(userId);
     for (const d of devices) out.push({ userId, device: d });
   }
   return out;
@@ -1114,12 +1103,8 @@ export async function rotateCallKeyForCurrentMembers(params: {
   const envelopes: CallEnvelopeInput[] = [];
 
   for (const [userId, wantedDeviceIds] of membersByUser) {
-    const umkPub = await fetchUserMasterKeyPub(userId);
-    if (!umkPub) continue;
-    const active = await filterActiveDevices(
-      await fetchPublicDevices(userId),
-      umkPub.ed25519PublicKey,
-    );
+    const { devices: active } = await fetchAndVerifyDevices(userId);
+    if (active.length === 0) continue;
     for (const d of active) {
       if (!wantedDeviceIds.includes(d.deviceId)) continue;
       if (!activeMemberDeviceIds.has(d.deviceId)) continue;

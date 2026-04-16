@@ -598,6 +598,15 @@ async function resolveSenderDeviceEd(
     deviceKeyCache.set(k, null);
     return null;
   }
+  // Verify SSK cross-sig if present for v2 cert dispatch.
+  let sskPub: Uint8Array | undefined;
+  if (umk.sskPub && umk.sskCrossSignature) {
+    try {
+      const { verifySskCrossSignature: vSsk } = await import('@/lib/e2ee-core');
+      await vSsk(umk.ed25519PublicKey, umk.sskPub, umk.sskCrossSignature);
+      sskPub = umk.sskPub;
+    } catch { /* fall back to MSK-only */ }
+  }
   const devices = await fetchPublicDevices(userId);
   const dev = devices.find((d) => d.deviceId === deviceId);
   if (!dev) {
@@ -605,7 +614,7 @@ async function resolveSenderDeviceEd(
     return null;
   }
   try {
-    await verifyPublicDevice(dev, umk.ed25519PublicKey);
+    await verifyPublicDevice(dev, umk.ed25519PublicKey, sskPub);
   } catch {
     deviceKeyCache.set(k, null);
     return null;
@@ -973,15 +982,22 @@ function MemberList({
     const targets: Target[] = [];
     for (const uid of keeperUserIds) {
       // Treat self the same as any other keeper — wrap for ALL active
-      // devices, not just the one performing the rotation. Otherwise the
-      // admin's other devices lose access to the new generation.
+      // devices, not just the one performing the rotation.
       const umk = await fetchUserMasterKeyPub(uid);
       if (!umk) throw new Error(`no published UMK for keeper ${uid.slice(0, 8)}`);
+      let keeperSskPub: Uint8Array | undefined;
+      if (umk.sskPub && umk.sskCrossSignature) {
+        try {
+          const { verifySskCrossSignature: vSsk } = await import('@/lib/e2ee-core');
+          await vSsk(umk.ed25519PublicKey, umk.sskPub, umk.sskCrossSignature);
+          keeperSskPub = umk.sskPub;
+        } catch { /* fall back */ }
+      }
       const keeperDevices = await fetchPublicDevices(uid);
       let added = 0;
       for (const d of keeperDevices) {
         try {
-          await verifyPublicDevice(d, umk.ed25519PublicKey);
+          await verifyPublicDevice(d, umk.ed25519PublicKey, keeperSskPub);
         } catch {
           continue;
         }
@@ -1610,11 +1626,19 @@ function InRoomInviteForm({
 
       const inviteeUmk = await fetchUserMasterKeyPub(inviteeId);
       if (!inviteeUmk) throw new Error('that user has no published UMK');
+      let inviteeSskPub: Uint8Array | undefined;
+      if (inviteeUmk.sskPub && inviteeUmk.sskCrossSignature) {
+        try {
+          const { verifySskCrossSignature: vSsk } = await import('@/lib/e2ee-core');
+          await vSsk(inviteeUmk.ed25519PublicKey, inviteeUmk.sskPub, inviteeUmk.sskCrossSignature);
+          inviteeSskPub = inviteeUmk.sskPub;
+        } catch { /* fall back */ }
+      }
       const inviteeDevices = await fetchPublicDevices(inviteeId);
       const active: PublicDevice[] = [];
       for (const d of inviteeDevices) {
         try {
-          await verifyPublicDevice(d, inviteeUmk.ed25519PublicKey);
+          await verifyPublicDevice(d, inviteeUmk.ed25519PublicKey, inviteeSskPub);
           active.push(d);
         } catch {
           // skip revoked/invalid
