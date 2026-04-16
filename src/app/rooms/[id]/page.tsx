@@ -391,7 +391,7 @@ function RoomInner({ roomId }: { roomId: string }) {
             )}
           </h1>
           <p className="text-xs text-neutral-500">
-            {room.kind} · gen {room.current_generation} · {members.filter((m) => m.generation === room.current_generation).length} member(s)
+            {room.kind} · gen {room.current_generation} · {new Set(members.filter((m) => m.generation === room.current_generation).map((m) => m.user_id)).size} member(s)
             {roomName && (
               <>
                 {' · '}
@@ -498,19 +498,25 @@ function RoomInner({ roomId }: { roomId: string }) {
         }}
       />
 
-      {room.created_by === userId && (
-        <InRoomInviteForm
-          room={room}
-          roomName={roomName}
-          userId={userId}
-          device={device}
-          roomKey={roomKey}
-          currentMemberCount={
-            members.filter((m) => m.generation === room.current_generation).length
-          }
-          onInvited={() => void loadAll(userId, device)}
-        />
-      )}
+      <InRoomInviteForm
+        room={room}
+        roomName={roomName}
+        userId={userId}
+        device={device}
+        roomKey={roomKey}
+        currentMemberCount={
+          new Set(
+            members
+              .filter((m) => m.generation === room.current_generation)
+              .map((m) => m.user_id),
+          ).size
+        }
+        onInvited={() => void loadAll(userId, device)}
+      />
+      {/* NOTE: any current-gen member can invite (not just room creator).
+          RLS (0008: room_invites_insert via is_room_member_at) enforces it.
+          For pair rooms, the per-room members-cap trigger from 0007 rejects
+          a 3rd distinct user at DB level. */}
 
       <BlobFeed
         blobs={blobs}

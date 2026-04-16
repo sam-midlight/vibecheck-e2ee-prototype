@@ -135,12 +135,22 @@ export class LiveKitAdapter {
   private listeners = new Set<LiveKitAdapterListener>();
   private disposed = false;
   private _encryptionState: EncryptionState = 'pending';
+  private currentCallKey: CallKey;
+  /** Sliding window of recent EncryptionError timestamps (ms since epoch). */
+  private errorTimestamps: number[] = [];
+  /** Transient errors within this window don't flip state to 'failed'. */
+  private static readonly ERROR_WINDOW_MS = 10_000;
+  /** More than this many errors in the window → sustained, flip to 'failed'. */
+  private static readonly ERROR_THRESHOLD = 10;
+  /** After this many errors within the window, nudge the key provider. */
+  private static readonly ERROR_RESYNC_THRESHOLD = 3;
 
   constructor(opts: LiveKitAdapterOptions) {
     this.callId = opts.callId;
     this.deviceId = opts.deviceId;
     this.tokenFetcher = opts.tokenFetcher;
     this.renewalLeadMs = (opts.renewalLeadSeconds ?? 60) * 1000;
+    this.currentCallKey = opts.initialCallKey;
 
     this.keyProvider = new ExternalE2EEKeyProvider();
 
@@ -175,11 +185,43 @@ export class LiveKitAdapter {
       this.emit({ type: 'participant_left', identity: p.identity }),
     );
 
-    // E2EE engine errors (e.g. key mismatch, decrypt failure, worker crash).
-    // Any of these means SOMETHING about the encryption pipeline is broken
-    // — we flip to 'failed' so the UI can demand the user bail out.
+    // E2EE engine errors (key mismatch, decrypt failure, worker hiccup).
+    // Single errors happen during normal operation — a stray frame arrives
+    // with a stale keyIndex during rotation, or a momentary worker pause.
+    // Only flip to 'failed' on SUSTAINED errors (many inside a short window);
+    // on moderate error bursts, nudge the keyProvider by re-setting the key
+    // (LiveKit's internal ratchet handles most cases; this is a backup).
     this.room.on(RoomEvent.EncryptionError, (err) => {
-      this.setEncryptionState('failed', err instanceof Error ? err.message : String(err));
+      const now = Date.now();
+      this.errorTimestamps = this.errorTimestamps.filter(
+        (ts) => ts > now - LiveKitAdapter.ERROR_WINDOW_MS,
+      );
+      this.errorTimestamps.push(now);
+      const msg = err instanceof Error ? err.message : String(err);
+      const count = this.errorTimestamps.length;
+      console.warn(
+        `[LiveKitAdapter] EncryptionError (${count} in last ${
+          LiveKitAdapter.ERROR_WINDOW_MS / 1000
+        }s): ${msg}`,
+      );
+      if (count >= LiveKitAdapter.ERROR_THRESHOLD) {
+        this.setEncryptionState(
+          'failed',
+          `${count} encryption errors in ${
+            LiveKitAdapter.ERROR_WINDOW_MS / 1000
+          }s — giving up (last: ${msg})`,
+        );
+        return;
+      }
+      if (count >= LiveKitAdapter.ERROR_RESYNC_THRESHOLD) {
+        // Nudge: re-apply the current CallKey. No-op if already set, but
+        // can kick the keyProvider's internal state into re-deriving.
+        void this.keyProvider
+          .setKey(this.currentCallKey.key.buffer as ArrayBuffer)
+          .catch((nudgeErr) =>
+            console.warn('[LiveKitAdapter] re-set key failed:', nudgeErr),
+          );
+      }
     });
 
     // `room.isE2EEEnabled` is updated AFTER the E2EEManager reports a
@@ -193,12 +235,16 @@ export class LiveKitAdapter {
         if (!participant || !isLocalParticipant(participant)) return;
         if (enabled) {
           this.setEncryptionState('active');
-        } else {
+        } else if (this._encryptionState === 'active') {
+          // Downgrade: we were encrypting, and now we're not. Real failure.
           this.setEncryptionState(
             'failed',
             'local participant encryption went off mid-call',
           );
         }
+        // `pending → enabled=false` is bootstrap noise — LiveKit's
+        // E2EEManager briefly emits `false` before the first encrypted
+        // track publishes. Ignore and wait for the real `true`.
       },
     );
 
@@ -273,7 +319,31 @@ export class LiveKitAdapter {
    * encryption is not confirmed.
    */
   async publishLocalMedia(encryptionWaitMs = 15_000): Promise<void> {
-    await this.room.localParticipant.enableCameraAndMicrophone();
+    try {
+      await this.room.localParticipant.enableCameraAndMicrophone();
+    } catch (err) {
+      // Translate the common DOMException surfaces into human-friendly
+      // language. The original Error is logged for devtools.
+      if (err instanceof DOMException) {
+        console.warn('[LiveKitAdapter] enableCameraAndMicrophone:', err);
+        if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+          throw new Error(
+            'Camera or microphone access was blocked. Click the padlock or camera icon in your browser’s address bar, allow access, and try joining again.',
+          );
+        }
+        if (err.name === 'NotFoundError') {
+          throw new Error(
+            'No camera or microphone detected on this device. Plug one in (or unmute a built-in) and try again.',
+          );
+        }
+        if (err.name === 'NotReadableError') {
+          throw new Error(
+            'Your camera or microphone is already in use by another app or tab. Close the other app (Zoom, OBS, another browser tab) and retry.',
+          );
+        }
+      }
+      throw err;
+    }
     await this.awaitEncryptionActive(encryptionWaitMs);
   }
 
@@ -324,6 +394,9 @@ export class LiveKitAdapter {
    * layer, not in the SFrame layer (which is opaque to generation numbers).
    */
   async rotateKey(nextCallKey: CallKey): Promise<void> {
+    this.currentCallKey = nextCallKey;
+    // Clear transient-error window: fresh key, fresh chance.
+    this.errorTimestamps = [];
     await this.keyProvider.setKey(nextCallKey.key.buffer as ArrayBuffer);
   }
 

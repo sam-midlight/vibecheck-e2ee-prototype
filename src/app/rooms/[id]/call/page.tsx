@@ -22,12 +22,14 @@ import type { DeviceKeyBundle, CallKey } from '@/lib/e2ee-core';
 import { zeroCallKey } from '@/lib/e2ee-core';
 import {
   fetchAndUnwrapCallKey,
+  filterActiveCallMembers,
   isDesignatedRotator,
   listStaleCallDeviceIds,
   loadEnrolledDevice,
   rotateCallKeyForCurrentMembers,
   startCallInRoom,
 } from '@/lib/bootstrap';
+import { listCallMembers } from '@/lib/supabase/queries';
 import {
   broadcastCallSignaling,
   endCall as rpcEndCall,
@@ -471,7 +473,47 @@ function CallInner({ roomId }: { roomId: string }) {
           return;
         }
 
-        // Waiting for rotator — the `calls` UPDATE subscription will pick us up.
+        // No envelope for us at current_gen. Two sub-cases:
+        //
+        // (a) Another device is actively in the call — they'll pick up our
+        //     broadcast, rotate, and our `calls` UPDATE subscription will
+        //     finish the connect.
+        // (b) No one's actively there — zombie call. Nobody to rotate us in.
+        //     We self-rotate to take over, seamlessly claiming the call.
+        //
+        // We check active-ness against the heartbeat grace window so a
+        // recently-connected peer isn't mistaken for a zombie. If the
+        // other party is just slow to respond, we fall back to self-rotate
+        // after a 7s watchdog anyway (see below).
+        const members = await step('listCallMembers (zombie check)', () =>
+          listCallMembers(call.id),
+        );
+        const activeOthers = filterActiveCallMembers(members).filter(
+          (m) => m.device_id !== device.deviceId,
+        );
+
+        if (activeOthers.length === 0) {
+          // Zombie or solo — self-rotate to take ownership.
+          const newKey = await step('self-rotate (zombie takeover)', () =>
+            rotateCallKeyForCurrentMembers({
+              callId: call.id,
+              device,
+              oldGeneration: currentGeneration,
+            }),
+          );
+          callKeyRef.current = newKey;
+          keyedGenRef.current = newKey.generation;
+          await connectAdapterWith(call.id, newKey);
+          await broadcastCallSignaling(call.id, {
+            type: 'member_joined',
+            deviceId: device.deviceId,
+          });
+          return;
+        }
+
+        // Wait for the rotator to let us in. Also set a 7s watchdog: if
+        // nobody rotates us in, self-rotate as a fallback. Concurrent
+        // rotations lose on the DB's `new_gen = current + 1` check — benign.
         waitingForEnvelopeRef.current = true;
         joiningCallIdRef.current = call.id;
         await step('broadcast member_joined (awaiting rotation)', () =>
@@ -480,6 +522,43 @@ function CallInner({ roomId }: { roomId: string }) {
             deviceId: device.deviceId,
           }),
         );
+        setTimeout(() => {
+          if (
+            !waitingForEnvelopeRef.current ||
+            joiningCallIdRef.current !== call.id ||
+            adapterRef.current
+          ) {
+            return;
+          }
+          void (async () => {
+            try {
+              logDiag('info', 'watchdog: no rotation arrived in 7s — taking over');
+              const newKey = await rotateCallKeyForCurrentMembers({
+                callId: call.id,
+                device,
+                oldGeneration: currentGeneration,
+              });
+              // Only proceed if we're still waiting — the gen-bump UPDATE
+              // handler might have connected us first.
+              if (waitingForEnvelopeRef.current && !adapterRef.current) {
+                waitingForEnvelopeRef.current = false;
+                joiningCallIdRef.current = null;
+                callKeyRef.current = newKey;
+                keyedGenRef.current = newKey.generation;
+                await connectAdapterWith(call.id, newKey);
+              } else {
+                await zeroCallKey(newKey);
+              }
+            } catch (err) {
+              // Losing the race (someone rotated between our check and RPC)
+              // is benign: our subscription will pick up the new gen.
+              const msg = errorMessage(err);
+              if (!/serialization|new generation|stale/i.test(msg)) {
+                console.warn('watchdog takeover failed', msg);
+              }
+            }
+          })();
+        }, 7_000);
       } catch (e) {
         waitingForEnvelopeRef.current = false;
         joiningCallIdRef.current = null;
@@ -543,13 +622,65 @@ function CallInner({ roomId }: { roomId: string }) {
     setUiState(reason === 'ended' ? 'ended' : 'idle');
   }, []);
 
-  // cleanup on unmount
+  // cleanup on unmount — also fires leave_call so the user's call_members
+  // row gets left_at set immediately (otherwise next joiner sees them as
+  // active until the 30s heartbeat sweep).
   useEffect(() => {
     return () => {
+      const adapter = adapterRef.current;
+      const dev = deviceRef.current;
+      if (adapter && dev) {
+        rpcLeaveCall({ callId: adapter.callId, deviceId: dev.deviceId }).catch(
+          () => undefined,
+        );
+      }
       void teardown('local');
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Tab-close cleanup: on pagehide/beforeunload while in a call, fire a
+  // best-effort leave_call RPC via `fetch({keepalive: true})` so our
+  // `call_members.left_at` is set immediately instead of waiting for the
+  // 30s heartbeat grace to kick us out. keepalive fetch is the modern
+  // replacement for navigator.sendBeacon when custom headers are needed.
+  useEffect(() => {
+    if (uiState !== 'in_call' || !device || !activeCall) return;
+    const callId = activeCall.id;
+    const deviceId = device.deviceId;
+    let accessToken: string | null = null;
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    void getSupabase()
+      .auth.getSession()
+      .then(({ data }) => {
+        accessToken = data.session?.access_token ?? null;
+      });
+
+    const onPageHide = () => {
+      if (!accessToken || !supabaseUrl || !supabaseAnonKey) return;
+      try {
+        fetch(`${supabaseUrl}/rest/v1/rpc/leave_call`, {
+          method: 'POST',
+          keepalive: true,
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: supabaseAnonKey,
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify({
+            p_call_id: callId,
+            p_device_id: deviceId,
+          }),
+        });
+      } catch {
+        // page is being torn down; nothing useful we can do on error
+      }
+    };
+    window.addEventListener('pagehide', onPageHide);
+    return () => window.removeEventListener('pagehide', onPageHide);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uiState, activeCall?.id, device?.deviceId]);
 
   // ---- render --------------------------------------------------------------
   return (
