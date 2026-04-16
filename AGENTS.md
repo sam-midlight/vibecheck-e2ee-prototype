@@ -46,15 +46,18 @@ Each user has **three distinct key types** and mixing them up is the most common
 ## 4. The foundation vs. reference-UX split
 
 **Foundation (copy verbatim into any consuming app):**
-- `src/lib/e2ee-core/` — pure crypto, no React, no Supabase
+- `src/lib/e2ee-core/` — pure crypto, no React, no Supabase. Includes `call.ts` (CallKey primitive for the video-call stack).
+- `src/lib/livekit/` — LiveKit SFU adapter + silent JWT renewal loop + QVGA defaults. Peer module to `e2ee-core/`; portable as one directory. Required only if porting video calls (migration 0023).
 - `src/lib/bootstrap.ts` — app-glue helpers (requires the Supabase queries layer)
 - `src/lib/supabase/queries.ts` — typed data layer; either copy or satisfy the same contract
 - `supabase/migrations/0001..latest` — apply linearly to a fresh Postgres+Supabase project
+- `supabase/functions/livekit-token/` — Deno edge function that mints 5-min LiveKit JWTs. Required for video calls.
+- `public/livekit-e2ee-worker.mjs` — prebuilt LiveKit E2EE worker, kept in sync by `scripts/sync-livekit-worker.mjs`. Required for video calls under Turbopack.
 - `src/components/AppShell.tsx`, `PinSetupModal.tsx`, `RecoveryPhraseModal.tsx`, `RecoveryPhraseEntry.tsx`, `PendingApprovalBanner.tsx`, `KeyChangeBanner.tsx` — stateful UI that encapsulates security invariants (mandatory PIN gate, UMK-rotation cascade, ghost-session boot). Copy as starting point; changing the security semantics inside is risky.
 
 **Reference UX (feel free to rewrite in the consuming app's design system):**
 - `src/app/page.tsx` (magic-link landing)
-- `src/app/rooms/**` (rooms list, detail, invite forms, member list)
+- `src/app/rooms/**` (rooms list, detail, invite forms, member list, `[id]/call/` for video)
 - `src/app/status/page.tsx` (diagnostic probe dashboard — recommended to port as a green-dot regression harness, but the UI style is yours)
 - `src/app/settings/page.tsx` (settings surface — reuse the handlers, rewrite the presentation)
 
