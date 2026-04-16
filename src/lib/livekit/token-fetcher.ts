@@ -2,6 +2,11 @@
  * Default LiveKit token fetcher — POSTs to the edge function with the
  * caller's Supabase session token.
  *
+ * Uses plain fetch (not supabase.functions.invoke) so we can be explicit
+ * about BOTH headers the Supabase Edge gateway requires:
+ *   - apikey: the public anon key (gateway auth)
+ *   - Authorization: Bearer <user_jwt>   (our function's verify_jwt check)
+ *
  * Separated from the adapter so tests/SSR paths can supply their own fetcher.
  */
 
@@ -17,13 +22,29 @@ export function makeDefaultTokenFetcher(): LiveKitTokenFetcher {
       throw new Error('no supabase session');
     }
 
-    const { data, error } = await supabase.functions.invoke('livekit-token', {
-      body: { call_id: callId, device_id: deviceId },
-    });
-    if (error) {
-      // `FunctionsHttpError` carries the HTTP status in its message text.
-      throw new Error(error.message || 'livekit-token fetch failed');
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    if (!supabaseUrl || !supabaseAnonKey) {
+      throw new Error('supabase env vars missing');
     }
+
+    const res = await fetch(`${supabaseUrl}/functions/v1/livekit-token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: supabaseAnonKey,
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ call_id: callId, device_id: deviceId }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(
+        `livekit-token ${res.status}: ${text || res.statusText}`,
+      );
+    }
+    const data = (await res.json()) as unknown;
     if (!data || typeof data !== 'object') {
       throw new Error('livekit-token returned no data');
     }
