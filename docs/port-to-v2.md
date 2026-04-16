@@ -79,8 +79,10 @@ The LiveKit edge function (`supabase/functions/livekit-token/`) needs these env 
 ```
 LIVEKIT_API_KEY=...
 LIVEKIT_API_SECRET=...
-LIVEKIT_WS_URL=wss://<project>.livekit.cloud
+LIVEKIT_URL=wss://<project>.livekit.cloud
 ```
+
+(LiveKit Cloud's dashboard gives you these three; `LIVEKIT_URL` is the canonical name. The function also accepts the older `LIVEKIT_WS_URL` alias.)
 
 Deploy with `supabase functions deploy livekit-token`. Prototype uses LiveKit Cloud (free tier caps call duration at 60 min); V2 should self-host `livekit-server` alongside Supabase to remove that cap.
 

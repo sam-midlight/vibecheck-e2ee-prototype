@@ -106,16 +106,23 @@ Deno.serve(async (req: Request) => {
   const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY');
   const LIVEKIT_API_KEY = Deno.env.get('LIVEKIT_API_KEY');
   const LIVEKIT_API_SECRET = Deno.env.get('LIVEKIT_API_SECRET');
-  const LIVEKIT_WS_URL = Deno.env.get('LIVEKIT_WS_URL');
+  // LiveKit Cloud's canonical env-var name is `LIVEKIT_URL`; older templates
+  // sometimes call it `LIVEKIT_WS_URL`. Accept either.
+  const LIVEKIT_WS_URL =
+    Deno.env.get('LIVEKIT_URL') ?? Deno.env.get('LIVEKIT_WS_URL');
 
-  if (
-    !SUPABASE_URL ||
-    !SUPABASE_ANON_KEY ||
-    !LIVEKIT_API_KEY ||
-    !LIVEKIT_API_SECRET ||
-    !LIVEKIT_WS_URL
-  ) {
-    return jsonResponse(500, { error: 'server misconfigured' }, origin);
+  const missing: string[] = [];
+  if (!SUPABASE_URL) missing.push('SUPABASE_URL');
+  if (!SUPABASE_ANON_KEY) missing.push('SUPABASE_ANON_KEY');
+  if (!LIVEKIT_API_KEY) missing.push('LIVEKIT_API_KEY');
+  if (!LIVEKIT_API_SECRET) missing.push('LIVEKIT_API_SECRET');
+  if (!LIVEKIT_WS_URL) missing.push('LIVEKIT_URL (or LIVEKIT_WS_URL)');
+  if (missing.length > 0) {
+    return jsonResponse(
+      500,
+      { error: `server misconfigured: missing env var(s) ${missing.join(', ')}` },
+      origin,
+    );
   }
 
   const authHeader = req.headers.get('Authorization');
