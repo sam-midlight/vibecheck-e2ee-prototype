@@ -552,6 +552,24 @@ export async function deleteInvite(inviteId: string): Promise<void> {
   if (error) throw error;
 }
 
+/**
+ * Delete all invite rows for a given user in a given room. Used after
+ * accepting a per-device invite: the accepting device claims one row and
+ * the sibling rows (addressed to the user's other devices) are now stale.
+ */
+export async function deleteInvitesForUserInRoom(
+  roomId: string,
+  userId: string,
+): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from('room_invites')
+    .delete()
+    .eq('room_id', roomId)
+    .eq('invited_user_id', userId);
+  if (error) throw error;
+}
+
 /** Realtime: new invites addressed to this user. */
 export function subscribeInvites(
   userId: string,

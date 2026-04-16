@@ -23,10 +23,12 @@ import {
   putUserMasterKey,
   rotateRoomKey,
   signDeviceIssuance,
+  signInviteEnvelope,
   signMembershipWrap,
   toBase64,
   unwrapRoomKey,
   verifyPublicDevice,
+  wrapRoomKeyFor,
   type DeviceKeyBundle,
   type PublicDevice,
   type UserMasterKey,
@@ -34,6 +36,8 @@ import {
 import { getSupabase } from '@/lib/supabase/client';
 import { errorMessage } from '@/lib/errors';
 import {
+  addRoomMember,
+  createInvite,
   fetchPublicDevices,
   fetchUserMasterKeyPub,
   getMyWrappedRoomKey,
@@ -285,7 +289,7 @@ async function rotateOneRoomAsAdmin(params: {
   device: DeviceKeyBundle;
   room: RoomRow;
 }): Promise<void> {
-  const { userId, device, room } = params;
+  const { device, room } = params;
 
   const myWrapped = await getMyWrappedRoomKey({
     roomId: room.id,
@@ -312,21 +316,8 @@ async function rotateOneRoomAsAdmin(params: {
   type Target = { userId: string; device: PublicDevice };
   const targets: Target[] = [];
   for (const uid of keeperUserIds) {
-    if (uid === userId) {
-      targets.push({
-        userId: uid,
-        device: {
-          userId: uid,
-          deviceId: device.deviceId,
-          ed25519PublicKey: device.ed25519PublicKey,
-          x25519PublicKey: device.x25519PublicKey,
-          createdAtMs: 0,
-          issuanceSignature: new Uint8Array(0),
-          revocation: null,
-        },
-      });
-      continue;
-    }
+    // Treat self the same as any other keeper — wrap for ALL active
+    // devices, not just the one performing the rotation.
     const umk = await fetchUserMasterKeyPub(uid);
     if (!umk) throw new Error(`no published UMK for keeper ${uid.slice(0, 8)}`);
     const activeKeeperDevs = await filterActiveDevices(
@@ -447,6 +438,138 @@ export async function rotateAllRoomsIAdmin(params: {
     }
   }
   return { rotated, failures };
+}
+
+/**
+ * Wrap a room key for EVERY active device the user owns and insert a
+ * `room_members` row for each. This is the multi-device-aware replacement
+ * for the old pattern of wrapping only for the acting device.
+ *
+ * Skips devices that already have a row at this generation (idempotent —
+ * safe to call even if some devices were already wrapped during rotation
+ * or a prior call).
+ *
+ * `signerDevice` is the local device whose ed25519 priv signs the wraps.
+ * Typically the device performing the action (room creation, invite accept).
+ */
+export async function wrapRoomKeyForAllMyDevices(params: {
+  roomId: string;
+  userId: string;
+  roomKey: { key: Uint8Array; generation: number };
+  signerDevice: DeviceKeyBundle;
+}): Promise<void> {
+  const { roomId, userId, roomKey, signerDevice } = params;
+
+  const umkPub = await fetchUserMasterKeyPub(userId);
+  if (!umkPub) return;
+
+  const allDevices = await fetchPublicDevices(userId);
+  const active = await filterActiveDevices(allDevices, umkPub.ed25519PublicKey);
+
+  for (const dev of active) {
+    try {
+      // Skip if this device already has a wrap at this generation.
+      const existing = await getMyWrappedRoomKey({
+        roomId,
+        deviceId: dev.deviceId,
+        generation: roomKey.generation,
+      });
+      if (existing) continue;
+
+      const wrap = await wrapRoomKeyFor(roomKey, dev.x25519PublicKey);
+      const sig = await signMembershipWrap(
+        {
+          roomId,
+          generation: roomKey.generation,
+          memberUserId: userId,
+          memberDeviceId: dev.deviceId,
+          wrappedRoomKey: wrap.wrapped,
+          signerDeviceId: signerDevice.deviceId,
+        },
+        signerDevice.ed25519PrivateKey,
+      );
+      await addRoomMember({
+        roomId,
+        userId,
+        deviceId: dev.deviceId,
+        generation: roomKey.generation,
+        wrappedRoomKey: wrap.wrapped,
+        signerDeviceId: signerDevice.deviceId,
+        wrapSignature: sig,
+      });
+    } catch (err) {
+      // Per-device failure (e.g. unique constraint race) shouldn't
+      // block wrapping for the remaining devices.
+      console.warn(
+        `wrap for device ${dev.deviceId.slice(0, 8)} in room ${roomId.slice(0, 8)} failed:`,
+        errorMessage(err),
+      );
+    }
+  }
+}
+
+/**
+ * Send an invite to ALL of an invitee's active devices (Matrix-style).
+ * Creates one `room_invites` row per device, each sealed to that device's
+ * X25519 pub with its own signed envelope. This way the invitee can
+ * accept from any device — not just whichever one the inviter happened
+ * to pick.
+ *
+ * The pair-room cap trigger (0007) counts distinct `invited_user_id`,
+ * not distinct invite rows, so multiple rows for the same user are safe.
+ */
+export async function sendInviteToAllDevices(params: {
+  roomId: string;
+  generation: number;
+  roomKey: { key: Uint8Array; generation: number };
+  invitedUserId: string;
+  invitedActiveDevices: PublicDevice[];
+  inviterUserId: string;
+  inviterDevice: DeviceKeyBundle;
+  expiresAtMs: number;
+}): Promise<void> {
+  const {
+    roomId,
+    generation,
+    roomKey,
+    invitedUserId,
+    invitedActiveDevices,
+    inviterUserId,
+    inviterDevice,
+    expiresAtMs,
+  } = params;
+
+  for (const dev of invitedActiveDevices) {
+    const wrap = await wrapRoomKeyFor(roomKey, dev.x25519PublicKey);
+    const sig = await signInviteEnvelope(
+      {
+        roomId,
+        generation,
+        invitedUserId,
+        invitedDeviceId: dev.deviceId,
+        invitedDeviceEd25519PublicKey: dev.ed25519PublicKey,
+        invitedDeviceX25519PublicKey: dev.x25519PublicKey,
+        wrappedRoomKey: wrap.wrapped,
+        inviterUserId,
+        inviterDeviceId: inviterDevice.deviceId,
+        expiresAtMs,
+      },
+      inviterDevice.ed25519PrivateKey,
+    );
+    await createInvite({
+      roomId,
+      invitedUserId,
+      invitedDeviceId: dev.deviceId,
+      invitedEd25519Pub: dev.ed25519PublicKey,
+      invitedX25519Pub: dev.x25519PublicKey,
+      generation,
+      wrappedRoomKey: wrap.wrapped,
+      createdBy: inviterUserId,
+      inviterDeviceId: inviterDevice.deviceId,
+      inviterSignature: sig,
+      expiresAtMs,
+    });
+  }
 }
 
 export { getDeviceRecord, verifyPublicDevice };

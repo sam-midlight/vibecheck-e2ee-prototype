@@ -18,19 +18,16 @@ import {
   prepareImageForUpload,
   publicIdentityFingerprint,
   rotateRoomKey,
-  signInviteEnvelope,
   signMembershipWrap,
   unwrapRoomKey,
   verifyMembershipWrap,
   verifyPublicDevice,
-  wrapRoomKeyFor,
   type DeviceKeyBundle,
   type ImageAttachmentHeader,
   type PublicDevice,
   type RoomKey,
 } from '@/lib/e2ee-core';
 import {
-  createInvite,
   decodeBlobRow,
   deleteAttachment,
   deleteRoom,
@@ -49,7 +46,7 @@ import {
   type RoomMemberRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
-import { loadEnrolledDevice } from '@/lib/bootstrap';
+import { loadEnrolledDevice, sendInviteToAllDevices } from '@/lib/bootstrap';
 
 interface DecodedBlob {
   id: string;
@@ -682,26 +679,14 @@ function MemberList({
     type Target = { userId: string; device: PublicDevice };
     const targets: Target[] = [];
     for (const uid of keeperUserIds) {
-      if (uid === selfUserId) {
-        targets.push({
-          userId: uid,
-          device: {
-            userId: uid,
-            deviceId: device.deviceId,
-            ed25519PublicKey: device.ed25519PublicKey,
-            x25519PublicKey: device.x25519PublicKey,
-            createdAtMs: 0,
-            issuanceSignature: new Uint8Array(0),
-            revocation: null,
-          },
-        });
-        continue;
-      }
+      // Treat self the same as any other keeper — wrap for ALL active
+      // devices, not just the one performing the rotation. Otherwise the
+      // admin's other devices lose access to the new generation.
       const umk = await fetchUserMasterKeyPub(uid);
       if (!umk) throw new Error(`no published UMK for keeper ${uid.slice(0, 8)}`);
-      const devices = await fetchPublicDevices(uid);
+      const keeperDevices = await fetchPublicDevices(uid);
       let added = 0;
-      for (const d of devices) {
+      for (const d of keeperDevices) {
         try {
           await verifyPublicDevice(d, umk.ed25519PublicKey);
         } catch {
@@ -726,7 +711,7 @@ function MemberList({
       roomKey.generation,
       targets.map((t) => t.device.x25519PublicKey),
     );
-    void wrapRoomKeyFor; // rotateRoomKey already wraps per recipient
+    // rotateRoomKey already wraps per recipient — no extra call needed.
 
     const wrapSigs = await Promise.all(
       targets.map((t, i) =>
@@ -1216,11 +1201,10 @@ function InRoomInviteForm({
         }
       }
       if (active.length === 0) throw new Error('invitee has no active signed devices');
-      const targetDev = active[active.length - 1];
 
       const tofu = await observeContact(inviteeId, {
         ed25519PublicKey: inviteeUmk.ed25519PublicKey,
-        x25519PublicKey: targetDev.x25519PublicKey,
+        x25519PublicKey: active[0].x25519PublicKey,
         selfSignature: new Uint8Array(0),
       });
       if (tofu.status === 'changed') {
@@ -1229,35 +1213,15 @@ function InRoomInviteForm({
         );
       }
 
-      const inviteeWrap = await wrapRoomKeyFor(roomKey, targetDev.x25519PublicKey);
-      const expiresAtMs = Date.now() + 60 * 60 * 24 * 7 * 1000;
-      const envelopeSig = await signInviteEnvelope(
-        {
-          roomId: room.id,
-          generation: room.current_generation,
-          invitedUserId: inviteeId,
-          invitedDeviceId: targetDev.deviceId,
-          invitedDeviceEd25519PublicKey: targetDev.ed25519PublicKey,
-          invitedDeviceX25519PublicKey: targetDev.x25519PublicKey,
-          wrappedRoomKey: inviteeWrap.wrapped,
-          inviterUserId: userId,
-          inviterDeviceId: device.deviceId,
-          expiresAtMs,
-        },
-        device.ed25519PrivateKey,
-      );
-      await createInvite({
+      await sendInviteToAllDevices({
         roomId: room.id,
-        invitedUserId: inviteeId,
-        invitedDeviceId: targetDev.deviceId,
-        invitedEd25519Pub: targetDev.ed25519PublicKey,
-        invitedX25519Pub: targetDev.x25519PublicKey,
         generation: room.current_generation,
-        wrappedRoomKey: inviteeWrap.wrapped,
-        createdBy: userId,
-        inviterDeviceId: device.deviceId,
-        inviterSignature: envelopeSig,
-        expiresAtMs,
+        roomKey,
+        invitedUserId: inviteeId,
+        invitedActiveDevices: active,
+        inviterUserId: userId,
+        inviterDevice: device,
+        expiresAtMs: Date.now() + 60 * 60 * 24 * 7 * 1000,
       });
       setStatus('Invite sent.');
       setInviteeId('');

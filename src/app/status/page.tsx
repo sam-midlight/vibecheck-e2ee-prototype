@@ -6,7 +6,6 @@ import { StatusCheck, type CheckState } from '@/components/StatusCheck';
 import { errorMessage } from '@/lib/errors';
 import { getSupabase } from '@/lib/supabase/client';
 import {
-  addRoomMember,
   createRoom,
   decodeBlobRow,
   deleteAttachment,
@@ -39,20 +38,18 @@ import {
   isPhraseValid,
   prepareImageForUpload,
   randomBytes,
-  signMembershipWrap,
   signMessage,
   toHex,
   unwrapRoomKey,
   unwrapUserMasterKeyWithPhrase,
   verifyMessage,
   verifyPublicDevice,
-  wrapRoomKeyFor,
   wrapUserMasterKeyWithPhrase,
   type DeviceKeyBundle,
   type RoomKey,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
-import { loadEnrolledDevice } from '@/lib/bootstrap';
+import { loadEnrolledDevice, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
 
 const CHECK_NAMES = [
   'Sodium (libsodium WASM) ready',
@@ -583,26 +580,11 @@ async function findOrCreateTestRoom(
 
   const room = await createRoom({ kind: 'group', createdBy: userId });
   const roomKey = await generateRoomKey(room.current_generation);
-  const wrapped = await wrapRoomKeyFor(roomKey, device.x25519PublicKey);
-  const selfWrapSig = await signMembershipWrap(
-    {
-      roomId: room.id,
-      generation: room.current_generation,
-      memberUserId: userId,
-      memberDeviceId: device.deviceId,
-      wrappedRoomKey: wrapped.wrapped,
-      signerDeviceId: device.deviceId,
-    },
-    device.ed25519PrivateKey,
-  );
-  await addRoomMember({
+  await wrapRoomKeyForAllMyDevices({
     roomId: room.id,
     userId,
-    deviceId: device.deviceId,
-    generation: room.current_generation,
-    wrappedRoomKey: wrapped.wrapped,
-    signerDeviceId: device.deviceId,
-    wrapSignature: selfWrapSig,
+    roomKey,
+    signerDevice: device,
   });
   // Stamp the self-reference marker. Uses the existing `rooms_member_update`
   // policy — we just added ourselves as a current-gen member above.

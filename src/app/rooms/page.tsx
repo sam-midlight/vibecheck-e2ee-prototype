@@ -13,19 +13,15 @@ import {
   fromBase64,
   generateRoomKey,
   observeContact,
-  signInviteEnvelope,
-  signMembershipWrap,
   unwrapRoomKey,
   verifyInviteEnvelope,
-  wrapRoomKeyFor,
   type DeviceKeyBundle,
   type PublicDevice,
 } from '@/lib/e2ee-core';
 import {
-  addRoomMember,
-  createInvite,
   createRoom,
   deleteInvite,
+  deleteInvitesForUserInRoom,
   fetchPublicDevices,
   fetchUserMasterKeyPub,
   getMyWrappedRoomKey,
@@ -36,7 +32,7 @@ import {
   type RoomInviteRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
-import { loadEnrolledDevice } from '@/lib/bootstrap';
+import { loadEnrolledDevice, sendInviteToAllDevices, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
 import { publicIdentityFingerprint, verifyPublicDevice as verifyPublicDeviceChain } from '@/lib/e2ee-core';
 
 function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
@@ -167,20 +163,28 @@ function RoomsInner() {
         </div>
       </section>
 
-      {invites.length > 0 && device && (
-        <section className="space-y-2">
-          <h2 className="text-base font-semibold">Pending invites</h2>
-          {invites.map((invite) => (
-            <InviteCard
-              key={invite.id}
-              invite={invite}
-              userId={userId}
-              device={device}
-              onDone={() => void reload(userId)}
-            />
-          ))}
-        </section>
-      )}
+      {device && (() => {
+        // With per-device invites, multiple rows exist per invite (one per
+        // invitee device). Only show the one addressed to THIS device.
+        const myInvites = invites.filter(
+          (i) => i.invited_device_id === device.deviceId,
+        );
+        if (myInvites.length === 0) return null;
+        return (
+          <section className="space-y-2">
+            <h2 className="text-base font-semibold">Pending invites</h2>
+            {myInvites.map((invite) => (
+              <InviteCard
+                key={invite.id}
+                invite={invite}
+                userId={userId}
+                device={device}
+                onDone={() => void reload(userId)}
+              />
+            ))}
+          </section>
+        );
+      })()}
 
       <section>
         <div className="flex items-center justify-between">
@@ -296,15 +300,6 @@ function InviteCard({
     setBusy(true);
     setError(null);
     try {
-      // 0016 made these columns NOT NULL in the schema, so the legacy
-      // "unsigned invite" path is no longer reachable from normal inserts.
-      // Must be addressed to THIS device.
-      if (invite.invited_device_id !== device.deviceId) {
-        throw new Error(
-          'invite is addressed to a different device of yours — open the app on that device to accept',
-        );
-      }
-
       // Fetch inviter's UMK pub and device list; find the signing device
       // and verify its cert.
       const inviterUmk = await fetchUserMasterKeyPub(invite.created_by);
@@ -375,35 +370,23 @@ function InviteCard({
         throw err;
       }
 
-      // Unwrap the room key using this device's X25519 keypair.
+      // Unwrap the room key using this device's X25519 keypair, then
+      // wrap for ALL of our active devices so every device can read
+      // this room immediately — not just the one that accepted.
       const roomKey = await unwrapRoomKey(
         { wrapped: wrappedBytes, generation: invite.generation },
         device.x25519PublicKey,
         device.x25519PrivateKey,
       );
-      // Re-wrap for this device, sign the membership row.
-      const selfWrap = await wrapRoomKeyFor(roomKey, device.x25519PublicKey);
-      const selfWrapSig = await signMembershipWrap(
-        {
-          roomId: invite.room_id,
-          generation: invite.generation,
-          memberUserId: userId,
-          memberDeviceId: device.deviceId,
-          wrappedRoomKey: selfWrap.wrapped,
-          signerDeviceId: device.deviceId,
-        },
-        device.ed25519PrivateKey,
-      );
-      await addRoomMember({
+      await wrapRoomKeyForAllMyDevices({
         roomId: invite.room_id,
         userId,
-        deviceId: device.deviceId,
-        generation: invite.generation,
-        wrappedRoomKey: selfWrap.wrapped,
-        signerDeviceId: device.deviceId,
-        wrapSignature: selfWrapSig,
+        roomKey,
+        signerDevice: device,
       });
-      await deleteInvite(invite.id);
+      // Delete ALL sibling invite rows for this user+room (one existed
+      // per device). The accepted one is consumed; the rest are stale.
+      await deleteInvitesForUserInRoom(invite.room_id, userId);
       onDone();
     } catch (e) {
       setError(errorMessage(e));
@@ -489,26 +472,11 @@ function CreateRoomForm({
         createdBy: userId,
       });
       const roomKey = await generateRoomKey(room.current_generation);
-      const selfWrap = await wrapRoomKeyFor(roomKey, device.x25519PublicKey);
-      const selfWrapSig = await signMembershipWrap(
-        {
-          roomId: room.id,
-          generation: room.current_generation,
-          memberUserId: userId,
-          memberDeviceId: device.deviceId,
-          wrappedRoomKey: selfWrap.wrapped,
-          signerDeviceId: device.deviceId,
-        },
-        device.ed25519PrivateKey,
-      );
-      await addRoomMember({
+      await wrapRoomKeyForAllMyDevices({
         roomId: room.id,
         userId,
-        deviceId: device.deviceId,
-        generation: room.current_generation,
-        wrappedRoomKey: selfWrap.wrapped,
-        signerDeviceId: device.deviceId,
-        wrapSignature: selfWrapSig,
+        roomKey,
+        signerDevice: device,
       });
       if (name.trim()) {
         const enc = await encryptRoomName({ name, roomId: room.id, roomKey });
@@ -685,11 +653,10 @@ function InviteForm({
       if (activeDevices.length === 0) {
         throw new Error('invitee has no active signed devices');
       }
-      const targetDev = activeDevices[activeDevices.length - 1];
 
       const tofuContact = {
         ed25519PublicKey: inviteeUmk.ed25519PublicKey,
-        x25519PublicKey: targetDev.x25519PublicKey,
+        x25519PublicKey: activeDevices[0].x25519PublicKey,
         selfSignature: new Uint8Array(0),
       };
       const tofu = await observeContact(inviteeId, tofuContact);
@@ -710,35 +677,17 @@ function InviteForm({
         device.x25519PublicKey,
         device.x25519PrivateKey,
       );
-      const inviteeWrap = await wrapRoomKeyFor(roomKey, targetDev.x25519PublicKey);
-      const expiresAtMs = Date.now() + 60 * 60 * 24 * 7 * 1000;
-      const envelopeSig = await signInviteEnvelope(
-        {
-          roomId,
-          generation: room.current_generation,
-          invitedUserId: inviteeId,
-          invitedDeviceId: targetDev.deviceId,
-          invitedDeviceEd25519PublicKey: targetDev.ed25519PublicKey,
-          invitedDeviceX25519PublicKey: targetDev.x25519PublicKey,
-          wrappedRoomKey: inviteeWrap.wrapped,
-          inviterUserId: userId,
-          inviterDeviceId: device.deviceId,
-          expiresAtMs,
-        },
-        device.ed25519PrivateKey,
-      );
-      await createInvite({
+      // Matrix-style: wrap for EVERY active device the invitee has, so
+      // they can accept from any device — not just whichever one we pick.
+      await sendInviteToAllDevices({
         roomId,
-        invitedUserId: inviteeId,
-        invitedDeviceId: targetDev.deviceId,
-        invitedEd25519Pub: targetDev.ed25519PublicKey,
-        invitedX25519Pub: targetDev.x25519PublicKey,
         generation: room.current_generation,
-        wrappedRoomKey: inviteeWrap.wrapped,
-        createdBy: userId,
-        inviterDeviceId: device.deviceId,
-        inviterSignature: envelopeSig,
-        expiresAtMs,
+        roomKey,
+        invitedUserId: inviteeId,
+        invitedActiveDevices: activeDevices,
+        inviterUserId: userId,
+        inviterDevice: device,
+        expiresAtMs: Date.now() + 60 * 60 * 24 * 7 * 1000,
       });
       setStatus('Invite sent.');
       setInviteeId('');

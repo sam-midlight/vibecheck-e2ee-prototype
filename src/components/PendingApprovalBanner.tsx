@@ -25,16 +25,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   fromBase64,
+  getDeviceBundle,
   getUserMasterKey,
   hashApprovalCode,
   signDeviceIssuance,
+  signMembershipWrap,
+  unwrapRoomKey,
+  wrapRoomKeyFor,
+  type Bytes,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
 import { errorMessage } from '@/lib/errors';
 import { getSupabase } from '@/lib/supabase/client';
 import {
+  addRoomMember,
   deleteApprovalRequest,
+  getMyWrappedRoomKey,
   listPendingApprovalRequests,
+  listMyRooms,
   registerDevice,
   subscribeApprovalRequests,
   verifyApprovalCode,
@@ -173,11 +181,25 @@ function ApprovalCard({
         deviceX25519Pub: devXPub,
         issuanceCreatedAtMs: request.created_at_ms,
         issuanceSignature: issuanceSig,
-        // A (this device) can't seal B's display name — only B has the x
-        // priv for B's own device. B fills this in via
-        // setDeviceDisplayNameCiphertext after it picks up the cert.
         displayNameCiphertext: null,
       });
+
+      // Re-wrap all current room keys for the new device so it can
+      // access every room this user is already in. Without this, a
+      // freshly-approved device has zero room_members rows and sees
+      // "you're out of sync" on every room.
+      try {
+        await rewrapRoomsForNewDevice({
+          userId: request.user_id,
+          newDeviceId: request.device_id,
+          newDeviceX25519Pub: devXPub,
+        });
+      } catch (err) {
+        // Non-fatal: B can still sign in; rooms just won't be
+        // pre-loaded. A re-invite or manual rotation fixes it.
+        console.warn('room re-wrap for new device failed:', errorMessage(err));
+      }
+
       await deleteApprovalRequest(request.id);
       onResolved();
     } catch (err) {
@@ -238,4 +260,66 @@ function ApprovalCard({
       )}
     </div>
   );
+}
+
+/**
+ * After approving a new device, re-wrap every room key THIS device holds
+ * for the NEW device. Inserts one `room_members` row per room at the
+ * current generation, sealed to B's x25519 pub, signed by A's device ed
+ * priv. This gives B immediate access to all rooms A is currently in.
+ */
+async function rewrapRoomsForNewDevice(params: {
+  userId: string;
+  newDeviceId: string;
+  newDeviceX25519Pub: Bytes;
+}): Promise<void> {
+  const { userId, newDeviceId, newDeviceX25519Pub } = params;
+
+  const myBundle = await getDeviceBundle(userId);
+  if (!myBundle) throw new Error('no local device bundle');
+
+  const rooms = await listMyRooms(userId);
+  for (const room of rooms) {
+    try {
+      const myWrapped = await getMyWrappedRoomKey({
+        roomId: room.id,
+        deviceId: myBundle.deviceId,
+        generation: room.current_generation,
+      });
+      if (!myWrapped) continue;
+
+      const roomKey = await unwrapRoomKey(
+        { wrapped: myWrapped, generation: room.current_generation },
+        myBundle.x25519PublicKey,
+        myBundle.x25519PrivateKey,
+      );
+
+      const wrap = await wrapRoomKeyFor(roomKey, newDeviceX25519Pub);
+      const sig = await signMembershipWrap(
+        {
+          roomId: room.id,
+          generation: room.current_generation,
+          memberUserId: userId,
+          memberDeviceId: newDeviceId,
+          wrappedRoomKey: wrap.wrapped,
+          signerDeviceId: myBundle.deviceId,
+        },
+        myBundle.ed25519PrivateKey,
+      );
+      await addRoomMember({
+        roomId: room.id,
+        userId,
+        deviceId: newDeviceId,
+        generation: room.current_generation,
+        wrappedRoomKey: wrap.wrapped,
+        signerDeviceId: myBundle.deviceId,
+        wrapSignature: sig,
+      });
+    } catch (err) {
+      console.warn(
+        `rewrap failed for room ${room.id.slice(0, 8)}:`,
+        errorMessage(err),
+      );
+    }
+  }
 }
