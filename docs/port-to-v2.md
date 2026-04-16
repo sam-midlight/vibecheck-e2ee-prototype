@@ -29,6 +29,14 @@ Copy these things verbatim:
 
 - `supabase/migrations/0020_nullable_linking_pubkey.sql` — drops NOT NULL on the legacy `device_approval_requests.linking_pubkey` column (v3 approval flow doesn't populate it; was blocking mobile sign-in).
 
+- `supabase/migrations/0022_key_backup.sql` — adds the server-side room-key backup table (Matrix-style key-backup). `key_backup (user_id, room_id, generation, ciphertext, nonce)` stores per-generation room keys encrypted under a user-scoped 32-byte backup key. RLS: `key_backup_owner` locks SELECT/INSERT/UPDATE/DELETE to `user_id = auth.uid()`. Also adds nullable `devices.backup_key_wrap` — a sealed (`crypto_box_seal`) copy of the backup key, written by the approving device and picked up by the newly-enrolled device so it can pull and decrypt the backup on first load. The backup key itself is escrowed inside the v3 recovery blob (see §12) so recovery-phrase entry on a fresh device recovers both UMK priv AND backup key.
+
+**Crash-safe rotation + key-backup invariants (V2 must preserve):**
+- Recovery-blob write MUST precede UMK-pub publish during any rotation. The split helpers `generateRotatedUmk` / `commitRotatedUmk` in `bootstrap.ts` make this explicit. A browser crash between the blob write and the pub publish leaves the user recoverable via phrase; a crash the other way around would lock them out. Matrix-SSSS pattern.
+- Every `wrapRoomKeyForAllMyDevices` call checks `getBackupKey(userId)` and, if present, uploads an encrypted room-key to `key_backup` alongside the `room_members` inserts. New rooms, accepted invites, and rotations all take this path — no other call sites should wrap a room key.
+- Device-approval flow (A-side) reads the local backup key, seals it to the new device's x25519 pub, and writes it to `devices.backup_key_wrap`. B-side's auth callback picks it up post-enrollment and calls `putBackupKey` locally. Without this hand-off, newly-approved devices couldn't decrypt pre-existing backup rows.
+- Recovery-phrase entry (`RecoveryPhraseEntry.tsx`) calls `putBackupKey` with the blob-recovered backup key BEFORE `enrollDeviceWithUmk`, so any backup-restore logic that fires post-enrollment finds the key available.
+
 **Multi-device sync note (critical for V2):** all membership-changing actions must use `wrapRoomKeyForAllMyDevices` (not single-device `addRoomMember`) and all invite-send paths must use `sendInviteToAllDevices` (not single-device `createInvite`). These helpers in `bootstrap.ts` ensure every device on the user's account gets immediate access to every room, and invites can be accepted from any device. If you add a new room-join flow, use these helpers. See the rotation paths in `rooms/[id]/page.tsx` for how keepers' devices are enumerated during key rotation.
 
 **Additional top-level files to copy beyond `src/lib/e2ee-core/`:**
@@ -189,6 +197,50 @@ V2 implications:
 - Named group size cap: change the trigger's hard-coded `2` into a per-room column (`member_cap int`) and have the pair kind default it to 2.
 - "You've been removed" banner: when the RLS kicks in (a leaver/kickee tries to read the room), show a graceful empty-state instead of the raw "not a current-gen member" error. The bones are already in `loadAll`.
 
+## 12. Server-side room-key backup (Matrix key-backup)
+
+Migration 0022 + the v3 recovery blob format give us a cross-device history-restore path without relaxing the zero-knowledge posture. The server never sees the backup key.
+
+**Recovery blob v3 format** (backward-compatible with v2 64-byte blobs):
+
+```
+plaintext = [ UMK_ed25519_priv (64 bytes) || backup_key (32 bytes) ]   (96 bytes, v3)
+         or [ UMK_ed25519_priv (64 bytes) ]                            (64 bytes, v2)
+AD        = "vibecheck:recovery:v3:${userId}"  (v3)
+         or "vibecheck:recovery:v2:${userId}"  (v2 fallback)
+```
+
+`unwrapUserMasterKeyWithPhrase` tries v3 AD first and falls back to v2. New blobs always use v3.
+
+**Backup encryption** (`encryptRoomKeyForBackup` in `e2ee-core/recovery.ts`):
+
+```
+ciphertext = XChaCha20-Poly1305(
+  key       = backup_key,
+  nonce     = random 24 bytes,
+  plaintext = [ generation(u32be) || roomKey(32 bytes) ],
+  AD        = "vibecheck:key-backup:v1:${roomId}:${generation}",
+)
+```
+
+Row shape: `key_backup (user_id, room_id, generation, ciphertext, nonce, created_at)`. Primary key `(user_id, room_id, generation)` — re-wrapping an existing generation is idempotent.
+
+**Three paths by which a device gets the backup key:**
+
+1. **Primary device, first phrase setup** — `generateBackupKey()` in `RecoveryPhraseModal`, stashed via `putBackupKey` + baked into the v3 recovery blob.
+2. **New device via recovery phrase** — `unwrapUserMasterKeyWithPhrase` returns `{ ed25519PrivateKey, backupKey? }`; callback stores backup key locally before `enrollDeviceWithUmk` (so future restore logic can fire). Key lives on.
+3. **New device via approval flow** — A-side `PendingApprovalBanner` seals the local backup key to B's x25519 pub via `crypto_box_seal`, writes to `devices.backup_key_wrap`. B's auth callback reads the row post-enrollment, unseals with its x25519 priv, calls `putBackupKey`.
+
+**V2 port considerations:**
+
+- Backup key ≠ UMK priv. UMK signs; backup key encrypts. Don't conflate or reuse bytes across them.
+- A user who never sets up a recovery phrase never has a backup key → `key_backup` stays empty → no history restore. That's the correct behaviour; the recovery phrase IS the opt-in for key backup.
+- Losing all devices AND the phrase = permanent loss of `room_members` wraps older than `current_generation - 9`. The backup is only useful when at least one credential survives.
+- Server-side reads of `key_backup` ciphertext leak the room/generation graph (same as `room_members` already does) but not keys. Accept the shape parity.
+- If V2 adds a key-backup "prune" UX (e.g. drop old generations to limit row count), rotate the backup key first via a new recovery-blob write — otherwise a server snapshot keeps the pruned rows readable.
+
+**Check #16** in `/status` is the canary: it constructs a synthetic temp device, signs its cert with the real UMK, runs the full wrap/unwrap roundtrip, cleans up. Keep it in the V2 port.
+
 ## 8. Things to test on each port
 
 Before calling V2 ready:
@@ -198,3 +250,5 @@ Before calling V2 ready:
 - Rotate a group member out and confirm new blobs are unreadable without the new key; old blobs are still readable by historical members but not by the removed one.
 - Link a device, sign out on the primary, confirm the secondary still has full access.
 - Lose all devices (clear IndexedDB on both), confirm the user is correctly routed to "no identity on device, but identity exists on server" state — and guided to re-pair, not to a broken dead-end.
+- Rotate the recovery phrase on device A, refresh the tab between "new UMK generated" and "UMK pub published" (devtools → disable cache + throttle), then reload and re-enter the new phrase. The account should recover via the new blob rather than lock out. (Proves SSSS ordering.)
+- Create a room on A, approve a new device B, confirm B's `devices.backup_key_wrap` gets populated and B can decrypt backed-up history. Then on a third device C, enter the recovery phrase and confirm C downloads + decrypts `key_backup` rows for every room. (Proves the three backup-key paths.)

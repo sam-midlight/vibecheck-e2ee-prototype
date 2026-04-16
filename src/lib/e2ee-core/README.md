@@ -36,7 +36,7 @@ device_approval_requests, recovery_blobs
 | `linking.ts`   | Seal an Identity into a handoff payload (QR OR code approval) |
 | `approval.ts`  | 6-digit code generation + salted-SHA256 hashing for device-approval requests |
 | `recovery.ts`  | 24-word BIP-39 phrase + Argon2id-wrapped identity escrow |
-| `storage.ts`   | IndexedDB: identity, device record, known-contacts TOFU cache |
+| `storage.ts`   | IndexedDB: identity, device record, known-contacts TOFU cache, backup key |
 | `tofu.ts`      | Observe a contact's pubkey; emit key-change events     |
 | `types.ts`     | All exported types and the `CryptoError`/`TrustError` classes |
 | `index.ts`     | Barrel file that re-exports the public surface         |
@@ -179,6 +179,50 @@ const privs = await unwrapIdentityWithPhrase(await decodeRecoveryBlob(row), type
 
 `normalizePhrase` is deliberately lenient: it strips `1.`, `1)`, `(1)`, `1:` prefixes and collapses whitespace, so users can paste directly from a numbered grid. Argon2id parameters (`opslimit`, `memlimit`) are stored per row — honour the stored values at unwrap time so you can raise them for new users without orphaning old phrases.
 
+### Key backup (server-side room-key escrow)
+
+Same file. Matrix-style key-backup: every room key the user holds is encrypted under a per-user 32-byte `backupKey` and uploaded to the `key_backup` table. The backup key itself is carried inside the v3 recovery blob, so entering the phrase on a fresh device recovers BOTH the UMK priv AND the backup key in one shot.
+
+```ts
+import {
+  generateBackupKey,
+  encryptRoomKeyForBackup, decryptRoomKeyFromBackup,
+  putBackupKey, getBackupKey,
+} from '@/lib/e2ee-core';
+
+// First-time phrase setup (primary device):
+const backupKey = await generateBackupKey();                     // 32 random bytes
+await putBackupKey(userId, backupKey);
+const blob = await wrapUserMasterKeyWithPhrase(umk, phrase, userId, { backupKey });
+// upload (await encodeRecoveryBlob(blob)) to recovery_blobs
+
+// Upload a room key to the backup after any wrap:
+const { ciphertext, nonce } = await encryptRoomKeyForBackup({
+  roomKey, backupKey, roomId, generation,
+});
+// upsert key_backup { user_id, room_id, generation, ciphertext, nonce }
+
+// Restore on a fresh device (post-recovery):
+const rows = await listKeyBackups(userId);
+for (const row of rows) {
+  const roomKey = await decryptRoomKeyFromBackup({
+    ciphertext: row.ciphertext,
+    nonce:      row.nonce,
+    generation: row.generation,
+    backupKey,
+    roomId:     row.room_id,
+  });
+  // re-wrap for THIS device and insert a room_members row
+}
+```
+
+Blob format:
+
+- v3 (current): `[ UMK_priv (64) || backupKey (32) ]` (96 bytes). AD = `vibecheck:recovery:v3:${userId}`.
+- v2 (legacy): `[ UMK_priv (64) ]` (64 bytes). AD = `vibecheck:recovery:v2:${userId}`.
+- `unwrapUserMasterKeyWithPhrase` tries v3 AD first, falls back to v2. New writes always v3.
+- `encryptRoomKeyForBackup` AD = `vibecheck:key-backup:v1:${roomId}:${generation}` — distinct from all other AD tags in the app so a server can't swap key-backup ciphertext for a message or room name.
+
 ### TOFU
 
 ```ts
@@ -194,6 +238,8 @@ onKeyChange(event => { /* render banner */ });
 // When user decides to trust a change:
 await acceptKeyChange(userId, pub);
 ```
+
+`observeContact` compares **ed25519 only** in v3. The UMK pub is the stable per-user anchor; the x25519 field is whichever device the contact is acting from right now, and a device switch is NOT a trust event. The cached x25519 is refreshed silently on each sighting. Callers must verify the contact's device cert against their UMK (`verifyPublicDevice` / `verifyPublicDeviceChain`) BEFORE calling `observeContact` — that chain is what makes the silent x refresh safe.
 
 ## Conventions
 

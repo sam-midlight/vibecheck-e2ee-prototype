@@ -2,14 +2,20 @@
  * Trust-On-First-Use cache + key-change detection.
  *
  * When we fetch a contact's published pubkeys from the server, we route them
- * through `observeContact()` before using them. On first sight, the pubkeys
- * are recorded locally and accepted silently. On any subsequent sight, we
- * compare to what's cached:
- *   - if equal → silent accept
+ * through `observeContact()` before using them. On first sight, the ed25519
+ * UMK pub is recorded locally. Subsequent sightings compare ed25519 only:
+ *   - if equal → silent accept (x25519 refreshed quietly)
  *   - if different → emit a KeyChangeEvent; caller decides whether to show
  *     a banner, block the operation, re-pair, etc.
  *
- * This catches a malicious Supabase swapping a contact's pubkey AFTER first
+ * Why ed25519-only in v3: the UMK pub is a stable per-user anchor, but the
+ * x25519 field on a PublicIdentity is whichever device the contact happens
+ * to be acting from right now. A contact switching devices (phone → laptop)
+ * or approving a new device on their account must not trigger a TOFU alarm,
+ * because the UMK hasn't rotated — the device cert chain already vouches for
+ * the new x25519 against the same UMK.
+ *
+ * This catches a malicious Supabase swapping a contact's UMK AFTER first
  * contact. It does NOT catch a swap that was in place at first contact —
  * that's the TOFU tradeoff we accept for zero friction.
  */
@@ -72,9 +78,15 @@ export async function observeContact(
   }
 
   const sameEd = await bytesEqual(cached.ed25519PublicKey, pub.ed25519PublicKey);
-  const sameX = await bytesEqual(cached.x25519PublicKey, pub.x25519PublicKey);
-  if (sameEd && sameX) {
-    await putKnownContact({ ...cached, lastSeenAt: now });
+  if (sameEd) {
+    // Same UMK. The x25519 may differ because the contact is acting from a
+    // different device than before — that's normal in the v3 model, not a
+    // trust event. Refresh the cached x silently.
+    await putKnownContact({
+      ...cached,
+      x25519PublicKey: pub.x25519PublicKey,
+      lastSeenAt: now,
+    });
     return { status: 'same' };
   }
 

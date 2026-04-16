@@ -33,6 +33,8 @@ Per-room, per-generation:
   • Wrapped per-DEVICE via crypto_box_seal to each device.x25519_pub
   • Rotation: admin creates new gen, re-wraps for every current member's
     devices, atomic via kick_and_rotate RPC (also purges < new_gen - 9)
+  • Also uploaded to key_backup encrypted under a user-scoped backup key
+    (escrowed in the v3 recovery blob; sealed to new devices on approval)
 ```
 
 ### Blob wire format (v3)
@@ -75,7 +77,9 @@ AEAD plaintext (JSON envelope):
 - **Blob sigs inside AEAD** — the outer `blobs.signature` column is null on new rows; the Ed25519 signature rides inside the encrypted envelope. Server no longer stores a per-sender fingerprint linkable across blobs.
 - **Transcript-bound 6-digit approval code** — `hash = SHA-256(domain || salt || code || linking_pubkey || link_nonce)` + server-side `verify_approval_code` RPC with 5-attempt limit and 2-minute TTL. Not a PAKE (deferred), but closes the active row-swap attack.
 - **Mandatory PIN-lock** — first sign-in / first unlock / first enrollment all pass through `require-pin-setup`. Identity is Argon2id-wrapped in IndexedDB; plaintext-in-IDB is no longer the default posture.
+- **Crash-safe UMK rotation (SSSS ordering)** — the new recovery blob is persisted BEFORE the new UMK pub is published. A browser crash mid-rotation leaves the user recoverable via phrase instead of locked out. Follows Matrix's Secure Secret Storage pattern (`generateRotatedUmk` → `commitRotatedUmk` split in `bootstrap.ts`).
 - **UMK rotation cascades to room rotation** — rotating the master key also re-keys every room the user admins, so ghost devices can't retain room access.
+- **Server-side room-key backup (Matrix-style)** — an opt-in per-user backup key (escrowed inside the v3 recovery blob; sealed to new devices via `devices.backup_key_wrap`) encrypts every room key into `key_backup`. New devices restore full history without the sender having to be online.
 - **Implicit auth flow, not PKCE** — `src/lib/supabase/client.ts` uses `flowType: 'implicit'`. Email magic link comes back in URL hash rather than needing a verifier stored in the requesting browser. Lets users request in Browser B and open the email in Browser A. If porting to SSR-first, switch back to `pkce` with `@supabase/ssr` cookie storage.
 
 ## Project layout
@@ -137,6 +141,8 @@ supabase/
     0017_public_read_devices            devices SELECT = authenticated
     0018_purge_stale_invites_on_rotate  kick_and_rotate also wipes stale invites
     0019_retain_10_generations          FS window 2 → 10 gens
+    0020_nullable_linking_pubkey        drops NOT NULL on legacy v1/v2 column
+    0022_key_backup                     key_backup table + devices.backup_key_wrap
 ```
 
 ## Getting started
