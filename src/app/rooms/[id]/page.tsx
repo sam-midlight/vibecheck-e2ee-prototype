@@ -16,6 +16,7 @@ import {
   fromBase64,
   observeContact,
   prepareImageForUpload,
+  publicIdentityFingerprint,
   rotateRoomKey,
   signInviteEnvelope,
   signMembershipWrap,
@@ -590,6 +591,39 @@ function MemberList({
   const [nickDraft, setNickDraft] = useState(selfNick);
   const [nickBusy, setNickBusy] = useState(false);
   const [nickError, setNickError] = useState<string | null>(null);
+
+  // Fingerprints are derived from each member's published UMK pub. Loaded
+  // once per member when the list mounts; displayed inline under the name
+  // so users can compare them out-of-band to confirm no one's impersonating.
+  const [fingerprints, setFingerprints] = useState<Map<string, string>>(() => new Map());
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const entries = await Promise.all(
+        members.map(async (m): Promise<[string, string] | null> => {
+          try {
+            const umk = await fetchUserMasterKeyPub(m.user_id);
+            if (!umk) return null;
+            const fp = await publicIdentityFingerprint({
+              ed25519PublicKey: umk.ed25519PublicKey,
+              x25519PublicKey: umk.ed25519PublicKey,
+              selfSignature: new Uint8Array(0),
+            });
+            return [m.user_id, fp];
+          } catch {
+            return null;
+          }
+        }),
+      );
+      if (cancelled) return;
+      setFingerprints(
+        new Map(entries.filter((e): e is [string, string] => e !== null)),
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [members]);
   // Keep the edit box in sync if realtime delivers a new value for self.
   useEffect(() => {
     setNickDraft(selfNick);
@@ -880,21 +914,31 @@ function MemberList({
           return (
             <li
               key={`${m.user_id}-${m.generation}`}
-              className="flex items-center justify-between"
+              className="flex items-start justify-between gap-2"
             >
-              <span className="flex min-w-0 items-baseline gap-2">
-                <span className="truncate font-medium">
-                  {nick ?? `${m.user_id.slice(0, 8)}…`}
-                  {self ? ' (you)' : ''}
-                  {m.user_id === room.created_by ? ' · admin' : ''}
+              <div className="flex min-w-0 flex-col gap-0.5">
+                <span className="flex min-w-0 items-baseline gap-2">
+                  <span className="truncate font-medium">
+                    {nick ?? `${m.user_id.slice(0, 8)}…`}
+                    {self ? ' (you)' : ''}
+                    {m.user_id === room.created_by ? ' · admin' : ''}
+                  </span>
+                  <code
+                    className="font-mono text-[10px] text-neutral-500"
+                    title={m.user_id}
+                  >
+                    {m.user_id.slice(0, 8)}
+                  </code>
                 </span>
-                <code
-                  className="font-mono text-[10px] text-neutral-500"
-                  title={m.user_id}
-                >
-                  {m.user_id.slice(0, 8)}
-                </code>
-              </span>
+                {fingerprints.get(m.user_id) && (
+                  <code
+                    className="font-mono text-[10px] text-neutral-400"
+                    title="safety number — compare out-of-band (phone, in person) to confirm identity"
+                  >
+                    🔑 {fingerprints.get(m.user_id)}
+                  </code>
+                )}
+              </div>
               {isAdmin && !self && (
                 <button
                   onClick={() => void kickMember(m.user_id)}

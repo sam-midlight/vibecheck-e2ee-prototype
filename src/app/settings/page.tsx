@@ -2,21 +2,33 @@
 
 import { useEffect, useState } from 'react';
 import { AppShell } from '@/components/AppShell';
+import { PinSetupModal } from '@/components/PinSetupModal';
 import { RecoveryPhraseModal } from '@/components/RecoveryPhraseModal';
 import {
   clearDeviceBundle,
   clearWrappedIdentity,
+  decryptDeviceDisplayName,
+  fromBase64,
   getDeviceBundle,
   getUserMasterKey,
   hasWrappedIdentity,
+  publicIdentityFingerprint,
   putWrappedIdentity,
+  signDeviceRevocation,
   wrapDeviceStateWithPin,
   type DeviceKeyBundle,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
 import { useRouter } from 'next/navigation';
 import { getSupabase } from '@/lib/supabase/client';
-import { hasRecoveryBlob } from '@/lib/supabase/queries';
+import {
+  fetchUserMasterKeyPub,
+  fetchPublicDevices,
+  hasRecoveryBlob,
+  listDevices,
+  revokeDevice,
+  type DeviceRow,
+} from '@/lib/supabase/queries';
 
 export default function SettingsPage() {
   return (
@@ -33,6 +45,9 @@ function SettingsInner() {
   const [umk, setUmk] = useState<UserMasterKey | null>(null);
   const [hasPhrase, setHasPhrase] = useState<boolean | null>(null);
   const [pinEnabled, setPinEnabled] = useState<boolean | null>(null);
+  const [myFingerprint, setMyFingerprint] = useState<string | null>(null);
+  const [devices, setDevices] = useState<DeviceRow[]>([]);
+  const [deviceLabels, setDeviceLabels] = useState<Map<string, string>>(() => new Map());
   const [showModal, setShowModal] = useState(false);
   const [showPinSetup, setShowPinSetup] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -48,14 +63,65 @@ function SettingsInner() {
       setUmk(await getUserMasterKey(data.user.id));
       setHasPhrase(await hasRecoveryBlob(data.user.id));
       setPinEnabled(await hasWrappedIdentity(data.user.id));
+      // Compute own UMK-derived safety number for the "your number" strip.
+      try {
+        const umkPub = await fetchUserMasterKeyPub(data.user.id);
+        if (umkPub) {
+          setMyFingerprint(
+            await publicIdentityFingerprint({
+              ed25519PublicKey: umkPub.ed25519PublicKey,
+              x25519PublicKey: umkPub.ed25519PublicKey,
+              selfSignature: new Uint8Array(0),
+            }),
+          );
+        }
+      } catch {
+        // non-fatal
+      }
+      await reloadDevices(data.user.id);
     })().catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, []);
 
-  async function handleDisablePin() {
-    if (!userId) return;
+  async function reloadDevices(uid: string) {
+    const rows = await listDevices(uid);
+    setDevices(rows);
+    // Decrypt each display_name_ciphertext with the local device's x25519
+    // priv. crypto_box_seal_open succeeds only for rows sealed to this
+    // device's pub — so we decrypt our own label and leave others opaque.
+    const local = await getDeviceBundle(uid);
+    if (!local) return;
+    const entries = await Promise.all(
+      rows.map(async (r): Promise<[string, string] | null> => {
+        if (!r.display_name_ciphertext) return null;
+        try {
+          const ct = await fromBase64(r.display_name_ciphertext);
+          const plain = await decryptDeviceDisplayName(
+            ct,
+            local.x25519PublicKey,
+            local.x25519PrivateKey,
+          );
+          return plain ? [r.id, plain] : null;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    setDeviceLabels(
+      new Map(entries.filter((e): e is [string, string] => e !== null)),
+    );
+  }
+
+  async function handleRevokeDevice(targetDeviceId: string) {
+    if (!userId || !umk) return;
+    if (device?.deviceId === targetDeviceId) {
+      setError(
+        'Cannot revoke the device you\u2019re currently using from itself. Revoke it from another of your devices.',
+      );
+      return;
+    }
     if (
       !confirm(
-        'Disable passphrase lock? The identity will go back to being readable from IndexedDB on this device without a passphrase.',
+        'Revoke this device? It will immediately stop being able to read new room messages, and any session it holds will fail the sanity check on next app load and be signed out.',
       )
     ) {
       return;
@@ -63,14 +129,33 @@ function SettingsInner() {
     setBusy(true);
     setError(null);
     try {
-      await clearWrappedIdentity(userId);
-      setPinEnabled(false);
+      const revokedAtMs = Date.now();
+      const signature = await signDeviceRevocation(
+        { userId, deviceId: targetDeviceId, revokedAtMs },
+        umk.ed25519PrivateKey,
+      );
+      await revokeDevice({
+        deviceId: targetDeviceId,
+        revokedAtMs,
+        revocationSignature: signature,
+      });
+      // Verify the UMK pub surfaced from our latest fetch — the active
+      // device set this query returns also powers other clients' wrap
+      // decisions, so freshness matters.
+      void fetchPublicDevices;
+      await reloadDevices(userId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   }
+
+  // NOTE: "Disable lock" was removed as part of enforcing PIN-lock as a
+  // default. Users can change their passphrase but not revert to plaintext
+  // keys. If future you needs to re-enable the escape hatch, bring back
+  // clearWrappedIdentity + a button that warns about the downgrade.
+  void clearWrappedIdentity;
 
   async function handleLockNow() {
     if (!userId) return;
@@ -107,6 +192,20 @@ function SettingsInner() {
   return (
     <div className="max-w-xl space-y-6">
       <h1 className="text-xl font-semibold">Settings</h1>
+
+      <section className="space-y-2">
+        <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">
+          Your safety number
+        </h2>
+        <p className="text-xs text-neutral-600 dark:text-neutral-400">
+          Read this out to other members over a call or in person to confirm
+          they see the same number. If the numbers don&apos;t match, someone
+          is impersonating one of you.
+        </p>
+        <code className="block rounded bg-neutral-100 px-3 py-2 font-mono text-sm tracking-wide dark:bg-neutral-900">
+          🔑 {myFingerprint ?? '(loading…)'}
+        </code>
+      </section>
 
       <section className="space-y-3">
         <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">
@@ -149,6 +248,79 @@ function SettingsInner() {
 
       <section className="space-y-3">
         <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">
+          Your devices
+        </h2>
+        <p className="text-xs text-neutral-600 dark:text-neutral-400">
+          Each device has its own keys. Revoking a device UMK-signs a
+          revocation cert that every other client will enforce — revoked
+          devices immediately fail the cert chain and can&apos;t decrypt new
+          room messages. Only labels sealed to this device are readable
+          here; others show as &ldquo;sealed.&rdquo;
+        </p>
+        {devices.length === 0 ? (
+          <p className="text-sm text-neutral-500">(no devices yet)</p>
+        ) : (
+          <ul className="space-y-2">
+            {devices.map((d) => {
+              const isSelf = device?.deviceId === d.id;
+              const revoked = d.revoked_at_ms != null;
+              const label =
+                deviceLabels.get(d.id) ??
+                (d.display_name_ciphertext ? '(sealed)' : '(no label)');
+              return (
+                <li
+                  key={d.id}
+                  className="flex items-start justify-between gap-2 rounded border border-neutral-200 px-2 py-1 text-xs dark:border-neutral-800"
+                >
+                  <div className="flex min-w-0 flex-col gap-0.5">
+                    <span className="flex items-baseline gap-2">
+                      <span className="font-medium">{label}</span>
+                      {isSelf && (
+                        <span className="text-[10px] uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
+                          this device
+                        </span>
+                      )}
+                      {revoked && (
+                        <span className="text-[10px] uppercase tracking-wide text-red-700 dark:text-red-400">
+                          revoked
+                        </span>
+                      )}
+                    </span>
+                    <code
+                      className="font-mono text-[10px] text-neutral-500"
+                      title={d.id}
+                    >
+                      {d.id.slice(0, 8)}
+                    </code>
+                    <span className="text-[10px] text-neutral-500">
+                      added {new Date(d.created_at).toLocaleDateString()}
+                    </span>
+                  </div>
+                  {!isSelf && !revoked && umk && (
+                    <button
+                      onClick={() => void handleRevokeDevice(d.id)}
+                      disabled={busy}
+                      className="shrink-0 rounded border border-red-300 px-2 py-0.5 text-[11px] text-red-700 disabled:opacity-50 dark:border-red-800 dark:text-red-400"
+                    >
+                      revoke
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {!umk && (
+          <p className="text-[11px] text-neutral-500">
+            Revoking requires the User Master Key. Open the app on your
+            primary device (or enter your recovery phrase) to revoke from
+            there.
+          </p>
+        )}
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">
           Device passphrase lock
         </h2>
         <p className="text-xs text-neutral-600 dark:text-neutral-400">
@@ -173,21 +345,24 @@ function SettingsInner() {
                 lock now
               </button>
               <button
-                onClick={() => void handleDisablePin()}
+                onClick={() => setShowPinSetup(true)}
                 disabled={busy}
-                className="rounded border border-red-300 px-3 py-1.5 text-xs text-red-700 dark:border-red-800 dark:text-red-400"
+                className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
               >
-                disable lock
+                change passphrase
               </button>
             </div>
           </div>
         ) : (
-          <div className="rounded-md border border-neutral-300 bg-neutral-50 p-3 dark:border-neutral-700 dark:bg-neutral-900">
+          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950">
+            <p className="text-xs text-amber-900 dark:text-amber-200">
+              No passphrase lock set. A passphrase is required.
+            </p>
             <button
               onClick={() => setShowPinSetup(true)}
-              className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white dark:bg-white dark:text-neutral-900"
+              className="mt-2 rounded bg-neutral-900 px-3 py-1.5 text-xs text-white dark:bg-white dark:text-neutral-900"
             >
-              Set passphrase
+              Set passphrase now
             </button>
           </div>
         )}
@@ -235,90 +410,3 @@ function SettingsInner() {
   );
 }
 
-function PinSetupModal({
-  onCancel,
-  onSave,
-}: {
-  onCancel: () => void;
-  onSave: (passphrase: string) => Promise<void>;
-}) {
-  const [passphrase, setPassphrase] = useState('');
-  const [confirmPassphrase, setConfirmPassphrase] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    setErr(null);
-    if (passphrase.length < 4) {
-      setErr('passphrase must be at least 4 characters (8+ strongly recommended)');
-      return;
-    }
-    if (passphrase !== confirmPassphrase) {
-      setErr('passphrases do not match');
-      return;
-    }
-    setBusy(true);
-    try {
-      await onSave(passphrase);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <form
-        onSubmit={submit}
-        className="w-full max-w-sm space-y-3 rounded bg-white p-4 text-sm dark:bg-neutral-900"
-      >
-        <h3 className="text-base font-semibold">Set a device passphrase</h3>
-        <p className="text-xs text-neutral-600 dark:text-neutral-400">
-          Used to unlock your identity on this device. Argon2id-based — brute-force
-          is slow but not impossible for short PINs; pick 8+ characters if you can.
-          If you forget it and don\u2019t have a recovery phrase, this device is
-          unrecoverable.
-        </p>
-        <div>
-          <label className="text-xs text-neutral-500">passphrase</label>
-          <input
-            type="password"
-            autoFocus
-            value={passphrase}
-            onChange={(e) => setPassphrase(e.target.value)}
-            className="mt-1 block w-full rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700 dark:bg-neutral-900"
-          />
-        </div>
-        <div>
-          <label className="text-xs text-neutral-500">confirm</label>
-          <input
-            type="password"
-            value={confirmPassphrase}
-            onChange={(e) => setConfirmPassphrase(e.target.value)}
-            className="mt-1 block w-full rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700 dark:bg-neutral-900"
-          />
-        </div>
-        {err && <p className="text-xs text-red-600">{err}</p>}
-        <div className="flex gap-2">
-          <button
-            type="submit"
-            disabled={busy}
-            className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
-          >
-            {busy ? 'saving…' : 'save'}
-          </button>
-          <button
-            type="button"
-            onClick={onCancel}
-            disabled={busy}
-            className="rounded border border-neutral-300 px-3 py-1.5 text-xs disabled:opacity-50 dark:border-neutral-700"
-          >
-            cancel
-          </button>
-        </div>
-      </form>
-    </div>
-  );
-}

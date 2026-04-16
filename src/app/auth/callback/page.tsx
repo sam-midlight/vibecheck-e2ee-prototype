@@ -19,9 +19,11 @@ import {
   hashApprovalCode,
   putDeviceBundle,
   putDeviceRecord,
+  putWrappedIdentity,
   signDeviceIssuance,
   unwrapDeviceStateWithPin,
   verifyDeviceIssuance,
+  wrapDeviceStateWithPin,
   type DeviceKeyBundle,
 } from '@/lib/e2ee-core';
 import {
@@ -30,6 +32,7 @@ import {
   loadEnrolledDevice,
   type EnrolledDevice,
 } from '@/lib/bootstrap';
+import { PinSetupModal } from '@/components/PinSetupModal';
 import {
   createApprovalRequest,
   deleteApprovalRequest,
@@ -47,6 +50,7 @@ type Step =
   | 'publishing-identity'
   | 'registering-device'
   | 'offer-recovery-setup'
+  | 'require-pin-setup'
   | 'device-linking-chooser'
   | 'awaiting-approval'
   | 'entering-recovery'
@@ -63,8 +67,26 @@ export default function AuthCallbackPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [enrolled, setEnrolled] = useState<EnrolledDevice | null>(null);
   const [recoveryBlobExists, setRecoveryBlobExists] = useState(false);
+  /** Navigation target once the mandatory PIN setup finishes. */
+  const [pendingDest, setPendingDest] = useState<'/rooms' | '/status'>('/rooms');
 
   const ranRef = useRef(false);
+
+  /**
+   * Gate for the final "navigate into the app" moment. If a wrapped
+   * identity doesn't exist for this user on this device, the user must
+   * set a passphrase before proceeding (enforced default — Point 19).
+   */
+  async function proceedOrRequirePin(uid: string, dest: '/rooms' | '/status') {
+    const wrapped = await hasWrappedIdentity(uid);
+    if (!wrapped) {
+      setPendingDest(dest);
+      setStep('require-pin-setup');
+      return;
+    }
+    setStep('done');
+    router.replace(dest);
+  }
 
   useEffect(() => {
     if (ranRef.current) return;
@@ -155,8 +177,7 @@ export default function AuthCallbackPage() {
 
         if (!cancelled) {
           setEnrolled(local);
-          setStep('done');
-          router.replace('/rooms');
+          await proceedOrRequirePin(uid, '/rooms');
         }
         return;
       }
@@ -190,26 +211,30 @@ export default function AuthCallbackPage() {
     return () => {
       cancelled = true;
     };
+    // proceedOrRequirePin is defined in this component; including it would
+    // trip the exhaustive-deps rule without adding meaningful tracking
+    // (the ref-like ranRef already gates this effect to a single run).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router]);
 
   const handleRecoveryDone = useCallback(
-    (result: 'saved' | 'skipped') => {
+    async (result: 'saved' | 'skipped') => {
       if (result === 'skipped' && userId) {
         localStorage.setItem(`recovery_skipped_${userId}`, '1');
       }
-      setStep('done');
-      router.replace('/status');
+      if (userId) await proceedOrRequirePin(userId, '/status');
     },
-    [router, userId],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [userId],
   );
 
   const handleRecovered = useCallback(
-    (recovered: EnrolledDevice) => {
+    async (recovered: EnrolledDevice) => {
       setEnrolled(recovered);
-      setStep('done');
-      router.replace('/rooms');
+      if (userId) await proceedOrRequirePin(userId, '/rooms');
     },
-    [router],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [userId],
   );
 
   const handleNuclearConfirmed = useCallback(async () => {
@@ -318,6 +343,25 @@ export default function AuthCallbackPage() {
           onError={(msg) => {
             setError(msg);
             setStep('error');
+          }}
+        />
+      )}
+
+      {step === 'require-pin-setup' && userId && enrolled && (
+        <PinSetupModal
+          mandatory
+          heading="Set a passphrase to protect this device"
+          blurb="A passphrase is required. Without it, your identity keys would sit in this browser's IndexedDB as plaintext and be readable by browser extensions, disk forensics, or anyone else using this profile. Pick something you'll remember — if you forget it, recovery requires your 24-word phrase."
+          onSave={async (passphrase) => {
+            const blob = await wrapDeviceStateWithPin(
+              enrolled.deviceBundle,
+              enrolled.umk,
+              passphrase,
+              userId,
+            );
+            await putWrappedIdentity(userId, blob);
+            setStep('done');
+            router.replace(pendingDest);
           }}
         />
       )}
