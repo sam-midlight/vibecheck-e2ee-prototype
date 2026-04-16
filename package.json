@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "postinstall": "node scripts/sync-livekit-worker.mjs",
+    "prebuild": "node scripts/sync-livekit-worker.mjs"
   },
   "dependencies": {
     "@scure/bip39": "^2.0.1",

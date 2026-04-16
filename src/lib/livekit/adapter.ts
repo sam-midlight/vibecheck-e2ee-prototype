@@ -113,16 +113,15 @@ export class LiveKitAdapter {
 
     this.keyProvider = new ExternalE2EEKeyProvider();
 
-    // e2ee worker url — webpack/turbopack picks this up via the URL import.
-    const workerUrl = new URL(
-      'livekit-client/e2ee-worker',
-      import.meta.url,
-    );
-
+    // E2EE worker URL — served from /public so Turbopack / webpack / Next.js
+    // don't need to resolve a bare module specifier for the Worker
+    // constructor (that path throws a minified `e.indexOf is not a function`
+    // at runtime under Turbopack). `scripts/sync-livekit-worker.mjs` keeps
+    // this file in sync with the installed livekit-client version.
     this.room = new Room({
       encryption: {
         keyProvider: this.keyProvider,
-        worker: new Worker(workerUrl, { type: 'module' }),
+        worker: new Worker('/livekit-e2ee-worker.mjs', { type: 'module' }),
       },
       videoCaptureDefaults: QVGA_VIDEO_CONSTRAINTS,
       publishDefaults: QVGA_PUBLISH_DEFAULTS,
