@@ -15,6 +15,7 @@ import {
   getMyWrappedRoomKey,
   insertBlob,
   listDevices,
+  registerDevice,
   subscribeBlobs,
   uploadAttachment,
   type BlobRow,
@@ -27,6 +28,7 @@ import {
   decryptDeviceDisplayName,
   decryptImageAttachment,
   encryptBlob,
+  generateDeviceKeyBundle,
   fromBase64,
   generateApprovalCode,
   generateApprovalSalt,
@@ -38,6 +40,7 @@ import {
   isPhraseValid,
   prepareImageForUpload,
   randomBytes,
+  signDeviceIssuance,
   signMessage,
   toHex,
   unwrapRoomKey,
@@ -67,6 +70,7 @@ const CHECK_NAMES = [
   'Approval code hash round-trip',
   'Recovery phrase wrap + unwrap (local)',
   'Image attachment roundtrip (encrypt → upload → download → decrypt)',
+  'Multi-device room key wrap + unwrap',
 ] as const;
 
 type CheckName = (typeof CHECK_NAMES)[number];
@@ -475,6 +479,64 @@ export default function StatusPage() {
         };
       } finally {
         await deleteAttachment({ roomId: ctx.roomId!, blobId: probeBlobId }).catch(
+          () => undefined,
+        );
+      }
+    });
+
+    await runStep(CHECK_NAMES[15], async () => {
+      // Create a temporary second device, sign its cert with UMK, verify
+      // that wrapRoomKeyForAllMyDevices wraps for it, and confirm the
+      // temp device can unwrap the room key. Full multi-device roundtrip.
+      if (!ctx.umk) {
+        return { detail: 'skipped — UMK not on this device' };
+      }
+      const tempId = crypto.randomUUID();
+      const tempBundle = await generateDeviceKeyBundle(tempId);
+      const tempCertSig = await signDeviceIssuance(
+        {
+          userId,
+          deviceId: tempId,
+          deviceEd25519PublicKey: tempBundle.ed25519PublicKey,
+          deviceX25519PublicKey: tempBundle.x25519PublicKey,
+          createdAtMs: Date.now(),
+        },
+        ctx.umk.ed25519PrivateKey,
+      );
+      // Register the temp device on the server so fetchPublicDevices
+      // returns it, then wrap the test room's key for all devices.
+      await registerDevice({
+        userId,
+        deviceId: tempId,
+        deviceEd25519Pub: tempBundle.ed25519PublicKey,
+        deviceX25519Pub: tempBundle.x25519PublicKey,
+        issuanceCreatedAtMs: Date.now(),
+        issuanceSignature: tempCertSig,
+      });
+      try {
+        await wrapRoomKeyForAllMyDevices({
+          roomId: ctx.roomId!,
+          userId,
+          roomKey: ctx.roomKey!,
+          signerDevice: ctx.device!,
+        });
+        const tempWrapped = await getMyWrappedRoomKey({
+          roomId: ctx.roomId!,
+          deviceId: tempId,
+          generation: ctx.roomKey!.generation,
+        });
+        if (!tempWrapped) throw new Error('no wrap created for temp device');
+        const tempRk = await unwrapRoomKey(
+          { wrapped: tempWrapped, generation: ctx.roomKey!.generation },
+          tempBundle.x25519PublicKey,
+          tempBundle.x25519PrivateKey,
+        );
+        const keysMatch = await bytesEqual(tempRk.key, ctx.roomKey!.key);
+        if (!keysMatch) throw new Error('temp device unwrapped a different key');
+        return { detail: `temp device ${tempId.slice(0, 8)} wrapped + unwrapped OK` };
+      } finally {
+        await getSupabase().from('devices').delete().eq('id', tempId).then(
+          () => undefined,
           () => undefined,
         );
       }

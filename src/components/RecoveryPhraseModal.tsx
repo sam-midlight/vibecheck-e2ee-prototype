@@ -15,13 +15,20 @@ import { useState } from 'react';
 import { errorMessage } from '@/lib/errors';
 import {
   encodeRecoveryBlob,
+  generateBackupKey,
   generateRecoveryPhrase,
+  getBackupKey,
+  putBackupKey,
   splitPhrase,
   wrapUserMasterKeyWithPhrase,
   type DeviceKeyBundle,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
-import { rotateAllRoomsIAdmin, rotateUserMasterKey } from '@/lib/bootstrap';
+import {
+  commitRotatedUmk,
+  generateRotatedUmk,
+  rotateAllRoomsIAdmin,
+} from '@/lib/bootstrap';
 import { putRecoveryBlob } from '@/lib/supabase/queries';
 
 interface Props {
@@ -62,32 +69,62 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
     setStage('uploading');
     setError(null);
     try {
-      const umkToWrap = rotate
-        ? await rotateUserMasterKey(userId, umk)
-        : umk;
-      const blob = await wrapUserMasterKeyWithPhrase(umkToWrap, phrase, userId);
+      // SSSS ordering (Matrix-style): escrow the new UMK priv in the
+      // recovery blob BEFORE publishing the new UMK pub. This way, if
+      // the browser crashes mid-flow, the user can always recover by
+      // entering the phrase they just wrote down.
+      let umkToWrap: UserMasterKey;
+      let pendingCerts: Awaited<ReturnType<typeof generateRotatedUmk>>['reissuedCerts'] | null = null;
+
+      if (rotate) {
+        // Step 1: generate new UMK + re-sign certs IN MEMORY ONLY.
+        const rotated = await generateRotatedUmk(userId, umk);
+        umkToWrap = rotated.newUmk;
+        pendingCerts = rotated.reissuedCerts;
+      } else {
+        umkToWrap = umk;
+      }
+
+      // Step 2: wrap the new UMK with the phrase. Also include the
+      // backup key (generate one if none exists yet — first-time setup).
+      let backupKey = await getBackupKey(userId);
+      if (!backupKey) {
+        backupKey = await generateBackupKey();
+        await putBackupKey(userId, backupKey);
+      }
+      const blob = await wrapUserMasterKeyWithPhrase(
+        umkToWrap,
+        phrase,
+        userId,
+        { backupKey },
+      );
       const encoded = await encodeRecoveryBlob(blob);
+
+      // Step 3: COMMIT POINT — upload recovery blob. After this succeeds,
+      // the new UMK priv is recoverable even if we crash before publish.
       await putRecoveryBlob({ userId, ...encoded });
 
-      // Cascade: when we just rotated UMK, also rotate every room this
-      // user administrates so their symmetric keys + generations bump.
-      // Without this, room keys stay the same across a UMK rotation,
-      // leaving a ghost device (if one existed) still able to read
-      // in-flight messages until the next rotation.
-      if (rotate && device) {
-        try {
-          const result = await rotateAllRoomsIAdmin({ userId, device });
-          if (result.failures.length > 0) {
-            console.warn(
-              `[recovery] ${result.rotated} room(s) rotated; ${result.failures.length} failed:`,
-              result.failures,
-            );
+      if (rotate && pendingCerts) {
+        // Step 4: save to local IDB (so this device has the new UMK).
+        const { putUserMasterKey: saveUmk } = await import('@/lib/e2ee-core');
+        await saveUmk(userId, umkToWrap);
+
+        // Step 5: publish new UMK pub + write re-signed device certs.
+        await commitRotatedUmk(userId, umkToWrap, pendingCerts);
+
+        // Step 6: cascade room rotations.
+        if (device) {
+          try {
+            const result = await rotateAllRoomsIAdmin({ userId, device });
+            if (result.failures.length > 0) {
+              console.warn(
+                `[recovery] ${result.rotated} room(s) rotated; ${result.failures.length} failed:`,
+                result.failures,
+              );
+            }
+          } catch (err) {
+            console.warn('[recovery] room cascade failed', err);
           }
-        } catch (err) {
-          // Cascade failure shouldn't block the phrase setup itself;
-          // log + let the user move on. They can re-trigger rotation
-          // from each affected room manually.
-          console.warn('[recovery] room cascade failed', err);
         }
       }
       onDone('saved');

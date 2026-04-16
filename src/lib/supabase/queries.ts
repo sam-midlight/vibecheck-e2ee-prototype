@@ -50,8 +50,19 @@ export interface DeviceRow {
   issuance_signature: string;
   revoked_at_ms: number | null;
   revocation_signature: string | null;
+  /** Sealed backup key for this device, written by the approving device. */
+  backup_key_wrap: string | null;
   created_at: string;
   last_seen_at: string;
+}
+
+export interface KeyBackupRow {
+  user_id: string;
+  room_id: string;
+  generation: number;
+  ciphertext: string;
+  nonce: string;
+  created_at: string;
 }
 
 export interface DeviceLinkHandoffRow {
@@ -1060,6 +1071,40 @@ export async function deleteRecoveryBlob(userId: string): Promise<void> {
  * can decrypt anymore; they are append-only and there's no policy to delete
  * them, which is the intended trust model.
  */
+// ---------------------------------------------------------------------------
+// key_backup (server-side room-key backup)
+// ---------------------------------------------------------------------------
+
+export async function upsertKeyBackup(params: {
+  userId: string;
+  roomId: string;
+  generation: number;
+  ciphertext: Bytes;
+  nonce: Bytes;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.from('key_backup').upsert({
+    user_id: params.userId,
+    room_id: params.roomId,
+    generation: params.generation,
+    ciphertext: await toBase64(params.ciphertext),
+    nonce: await toBase64(params.nonce),
+  });
+  if (error) throw error;
+}
+
+export async function listKeyBackups(
+  userId: string,
+): Promise<KeyBackupRow[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('key_backup')
+    .select('*')
+    .eq('user_id', userId);
+  if (error) throw error;
+  return (data ?? []) as KeyBackupRow[];
+}
+
 export async function nukeIdentityServer(userId: string): Promise<void> {
   const supabase = getSupabase();
 

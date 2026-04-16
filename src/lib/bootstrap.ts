@@ -11,8 +11,10 @@ import {
   decryptRoomName,
   encryptDeviceDisplayName,
   encryptRoomName,
+  encryptRoomKeyForBackup,
   filterActiveDevices,
   fromBase64,
+  getBackupKey,
   generateDeviceKeyBundle,
   generateUserMasterKey,
   getDeviceBundle,
@@ -45,6 +47,7 @@ import {
   listRoomMembers,
   publishUserMasterKey,
   registerDevice,
+  upsertKeyBackup,
   type RoomRow,
 } from '@/lib/supabase/queries';
 
@@ -202,13 +205,22 @@ export async function fetchAndVerifyDevices(userId: string) {
  *
  * Must be called from a device that currently holds the UMK priv.
  */
-export async function rotateUserMasterKey(
+/** Result of the generate-only half of UMK rotation. */
+export interface RotatedUmkResult {
+  newUmk: UserMasterKey;
+  reissuedCerts: Array<{ deviceId: string; issuanceSignature: Uint8Array }>;
+}
+
+/**
+ * Generate a fresh UMK and re-sign all active device issuance certs in
+ * memory. This is the PURE-COMPUTATION half of UMK rotation — no server
+ * writes, no local saves. Callers use it with `commitRotatedUmk` to
+ * control the exact ordering of escrow → save → publish (SSSS pattern).
+ */
+export async function generateRotatedUmk(
   userId: string,
   oldUmk: UserMasterKey,
-): Promise<UserMasterKey> {
-  // Sanity: make sure the caller really has the current UMK priv. We derive
-  // the pub from the priv and compare to published — if they differ, we're
-  // already on a fork.
+): Promise<RotatedUmkResult> {
   const publishedOld = await fetchUserMasterKeyPub(userId);
   if (!publishedOld) throw new Error('no published UMK — nothing to rotate');
   if (!bytesEq(publishedOld.ed25519PublicKey, oldUmk.ed25519PublicKey)) {
@@ -217,8 +229,6 @@ export async function rotateUserMasterKey(
     );
   }
 
-  // Fetch + verify all current devices under the OLD UMK. Revoked/broken
-  // ones are skipped so we don't re-issue certs for ghost rows.
   const activeDevices = await filterActiveDevices(
     await fetchPublicDevices(userId),
     oldUmk.ed25519PublicKey,
@@ -229,9 +239,7 @@ export async function rotateUserMasterKey(
 
   const newUmk = await generateUserMasterKey();
 
-  // Re-sign each device's issuance cert with the new UMK priv, keeping
-  // everything else about the device stable.
-  const reissued = await Promise.all(
+  const reissuedCerts = await Promise.all(
     activeDevices.map(async (d) => {
       const sig = await signDeviceIssuance(
         {
@@ -247,18 +255,30 @@ export async function rotateUserMasterKey(
     }),
   );
 
-  // Publish the new UMK pub. The bump_identity_epoch trigger fires on this
-  // UPDATE (ed25519_pub changed), so every stale client that caches a
-  // previous epoch will be detectable.
-  await publishUserMasterKey(userId, { ed25519PublicKey: newUmk.ed25519PublicKey });
+  return { newUmk, reissuedCerts };
+}
 
-  // Write the new issuance signatures back to the device rows. Each row is
-  // this user's own, so RLS (devices_update_self) permits the updates. We
-  // issue them in parallel — any individual failure leaves the account in
-  // a partially-rotated state, which the next rotation will converge.
+/**
+ * Publish a previously-generated UMK: update the identities row (which
+ * triggers identity_epoch bump), write re-issued device certs, and save
+ * the new UMK to local IDB.
+ *
+ * MUST be called AFTER the recovery blob has been committed (SSSS
+ * pattern: escrow before publish). Otherwise a crash between publish
+ * and save leaves the user locked out.
+ */
+export async function commitRotatedUmk(
+  userId: string,
+  newUmk: UserMasterKey,
+  reissuedCerts: Array<{ deviceId: string; issuanceSignature: Uint8Array }>,
+): Promise<void> {
+  await publishUserMasterKey(userId, {
+    ed25519PublicKey: newUmk.ed25519PublicKey,
+  });
+
   const supabase = getSupabase();
   await Promise.all(
-    reissued.map(async ({ deviceId, issuanceSignature }) => {
+    reissuedCerts.map(async ({ deviceId, issuanceSignature }) => {
       const { error } = await supabase
         .from('devices')
         .update({ issuance_signature: await toBase64(issuanceSignature) })
@@ -267,9 +287,22 @@ export async function rotateUserMasterKey(
     }),
   );
 
-  // Replace the locally-held UMK with the new one.
   await putUserMasterKey(userId, newUmk);
+}
 
+/**
+ * Convenience wrapper that calls both halves sequentially — for callers
+ * that don't need to interleave escrow between generate and publish.
+ * The recovery blob is NOT committed here; callers who need crash safety
+ * should use `generateRotatedUmk` + `commitRotatedUmk` directly.
+ */
+export async function rotateUserMasterKey(
+  userId: string,
+  oldUmk: UserMasterKey,
+): Promise<UserMasterKey> {
+  const { newUmk, reissuedCerts } = await generateRotatedUmk(userId, oldUmk);
+  await putUserMasterKey(userId, newUmk);
+  await commitRotatedUmk(userId, newUmk, reissuedCerts);
   return newUmk;
 }
 
@@ -505,6 +538,30 @@ export async function wrapRoomKeyForAllMyDevices(params: {
         errorMessage(err),
       );
     }
+  }
+
+  // Server-side key backup: if a backup key is available, encrypt the
+  // room key under it and upload. This lets a new device (via recovery
+  // phrase or approval-with-backup-key-wrap) restore historical room
+  // keys without requiring per-room re-invites.
+  try {
+    const bk = await getBackupKey(userId);
+    if (bk) {
+      const { ciphertext, nonce } = await encryptRoomKeyForBackup({
+        roomKey,
+        backupKey: bk,
+        roomId,
+      });
+      await upsertKeyBackup({
+        userId,
+        roomId,
+        generation: roomKey.generation,
+        ciphertext,
+        nonce,
+      });
+    }
+  } catch (err) {
+    console.warn('key backup upload failed:', errorMessage(err));
   }
 }
 

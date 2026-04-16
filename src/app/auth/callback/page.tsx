@@ -143,7 +143,11 @@ export default function AuthCallbackPage() {
           const hasPhrase = await hasRecoveryBlob(uid);
           if (!cancelled) {
             setRecoveryBlobExists(hasPhrase);
-            setStep('device-linking-chooser');
+            // If a recovery blob exists, go straight to phrase entry —
+            // user can resync by entering their phrase (Option B /
+            // graceful orphan recovery). Falls back to linking chooser
+            // via the back button on RecoveryPhraseEntry.
+            setStep(hasPhrase ? 'entering-recovery' : 'device-linking-chooser');
           }
           return;
         }
@@ -158,7 +162,7 @@ export default function AuthCallbackPage() {
           const hasPhrase = await hasRecoveryBlob(uid);
           if (!cancelled) {
             setRecoveryBlobExists(hasPhrase);
-            setStep('device-linking-chooser');
+            setStep(hasPhrase ? 'entering-recovery' : 'device-linking-chooser');
           }
           return;
         }
@@ -178,7 +182,11 @@ export default function AuthCallbackPage() {
           console.warn('local device cert failed to verify against published UMK — orphan');
           await clearDeviceBundle(uid);
           await clearUserMasterKey(uid);
-          setStep('device-linking-chooser');
+          const hasPhrase = await hasRecoveryBlob(uid);
+          if (!cancelled) {
+            setRecoveryBlobExists(hasPhrase);
+            setStep(hasPhrase ? 'entering-recovery' : 'device-linking-chooser');
+          }
           return;
         }
 
@@ -694,6 +702,25 @@ function AwaitingApproval({
             });
           } catch (err) {
             console.warn('display-name seal failed (row stays unlabeled)', err);
+          }
+          // Pick up the backup key if the approving device shared one.
+          try {
+            const { listDevices: listDeviceRows } = await import('@/lib/supabase/queries');
+            const myRows = await listDeviceRows(userId);
+            const myRow = myRows.find((r) => r.id === deviceId);
+            if (myRow?.backup_key_wrap) {
+              const sealedBk = await fromBase64(myRow.backup_key_wrap);
+              const sodium = await (await import('@/lib/e2ee-core')).getSodium();
+              const bk = sodium.crypto_box_seal_open(
+                sealedBk,
+                bundle.x25519PublicKey,
+                bundle.x25519PrivateKey,
+              );
+              const { putBackupKey } = await import('@/lib/e2ee-core');
+              await putBackupKey(userId, bk);
+            }
+          } catch (err) {
+            console.warn('backup key pickup failed:', err);
           }
           await deleteApprovalRequest(request.id).catch(() => {});
           if (!cancelled) onInstalled({ userId, deviceBundle: bundle, umk: null });

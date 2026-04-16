@@ -24,16 +24,23 @@ import type { DeviceKeyBundle, KnownContact, UserMasterKey } from './types';
 import type { PinWrappedIdentity } from './pin-lock';
 
 const DB_NAME = 'e2ee-core';
-// v3: restructured stores for per-device identities.
-const DB_VERSION = 3;
+// v4: adds backupKey store for server-side room-key backup.
+const DB_VERSION = 4;
 
 const STORE_DEVICE_BUNDLE = 'deviceBundle';
 const STORE_USER_MASTER_KEY = 'userMasterKey';
 const STORE_DEVICE = 'device';
 const STORE_KNOWN_CONTACTS = 'knownContacts';
 const STORE_WRAPPED_IDENTITY = 'wrappedIdentity';
+const STORE_BACKUP_KEY = 'backupKey';
 // Legacy (v1/v2) store name, still recognized so we can delete it on upgrade.
 const LEGACY_STORE_IDENTITY = 'identity';
+
+interface BackupKeyRow {
+  userId: string;
+  key: Uint8Array;
+  createdAt: number;
+}
 
 interface DeviceBundleRow {
   userId: string;
@@ -90,6 +97,9 @@ function getDb(): Promise<IDBPDatabase> {
         }
         if (!db.objectStoreNames.contains(STORE_WRAPPED_IDENTITY)) {
           db.createObjectStore(STORE_WRAPPED_IDENTITY, { keyPath: 'userId' });
+        }
+        if (!db.objectStoreNames.contains(STORE_BACKUP_KEY)) {
+          db.createObjectStore(STORE_BACKUP_KEY, { keyPath: 'userId' });
         }
       },
     });
@@ -277,7 +287,36 @@ export async function wipeAll(): Promise<void> {
     db.clear(STORE_DEVICE),
     db.clear(STORE_KNOWN_CONTACTS),
     db.clear(STORE_WRAPPED_IDENTITY),
+    db.clear(STORE_BACKUP_KEY),
   ]);
+}
+
+// ---------------------------------------------------------------------------
+// Backup key (server-side room-key backup)
+// ---------------------------------------------------------------------------
+
+export async function putBackupKey(
+  userId: string,
+  key: Uint8Array,
+): Promise<void> {
+  const db = await getDb();
+  const row: BackupKeyRow = { userId, key, createdAt: Date.now() };
+  await db.put(STORE_BACKUP_KEY, row);
+}
+
+export async function getBackupKey(
+  userId: string,
+): Promise<Uint8Array | null> {
+  const db = await getDb();
+  const row = (await db.get(STORE_BACKUP_KEY, userId)) as
+    | BackupKeyRow
+    | undefined;
+  return row?.key ?? null;
+}
+
+export async function clearBackupKey(userId: string): Promise<void> {
+  const db = await getDb();
+  await db.delete(STORE_BACKUP_KEY, userId);
 }
 
 // ---------------------------------------------------------------------------

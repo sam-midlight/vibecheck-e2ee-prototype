@@ -25,11 +25,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   fromBase64,
+  getBackupKey,
   getDeviceBundle,
+  getSodium,
   getUserMasterKey,
   hashApprovalCode,
   signDeviceIssuance,
   signMembershipWrap,
+  toBase64,
   unwrapRoomKey,
   wrapRoomKeyFor,
   type Bytes,
@@ -184,10 +187,7 @@ function ApprovalCard({
         displayNameCiphertext: null,
       });
 
-      // Re-wrap all current room keys for the new device so it can
-      // access every room this user is already in. Without this, a
-      // freshly-approved device has zero room_members rows and sees
-      // "you're out of sync" on every room.
+      // Re-wrap all current room keys for the new device.
       try {
         await rewrapRoomsForNewDevice({
           userId: request.user_id,
@@ -195,9 +195,26 @@ function ApprovalCard({
           newDeviceX25519Pub: devXPub,
         });
       } catch (err) {
-        // Non-fatal: B can still sign in; rooms just won't be
-        // pre-loaded. A re-invite or manual rotation fixes it.
         console.warn('room re-wrap for new device failed:', errorMessage(err));
+      }
+
+      // Share the backup key with the new device by sealing it to
+      // B's X25519 pub and writing to devices.backup_key_wrap. When B
+      // picks up its device row, it can unseal and store the backup key
+      // locally, enabling full key-backup restore.
+      try {
+        const bk = await getBackupKey(request.user_id);
+        if (bk) {
+          const sodium = await getSodium();
+          const sealed = sodium.crypto_box_seal(bk, devXPub);
+          const supabaseLocal = (await import('@/lib/supabase/client')).getSupabase();
+          await supabaseLocal
+            .from('devices')
+            .update({ backup_key_wrap: await toBase64(sealed) })
+            .eq('id', request.device_id);
+        }
+      } catch (err) {
+        console.warn('backup key share failed:', errorMessage(err));
       }
 
       await deleteApprovalRequest(request.id);

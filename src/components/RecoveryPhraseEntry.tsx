@@ -82,6 +82,15 @@ export function RecoveryPhraseEntry({ userId, onRecovered, onBack }: Props) {
         ed25519PublicKey: derivedPub,
         ed25519PrivateKey: unwrapped.ed25519PrivateKey,
       };
+
+      // If the recovery blob carried a backup key (v3 format), store it
+      // so this device can download and decrypt server-side room-key
+      // backups after enrollment.
+      if (unwrapped.backupKey) {
+        const { putBackupKey } = await import('@/lib/e2ee-core');
+        await putBackupKey(userId, unwrapped.backupKey);
+      }
+
       const enrolled = await enrollDeviceWithUmk(userId, umk);
       onRecovered(enrolled);
     } catch (err) {
