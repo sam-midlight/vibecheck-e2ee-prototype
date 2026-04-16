@@ -278,12 +278,14 @@ On rotation: `await keyProvider.setKey(newCallKey, newGeneration)`. LiveKit hand
 ## 10. Foundation vs reference-UX split
 
 **Foundation — lift verbatim into V2:**
-- `src/lib/e2ee-core/call.ts` — `generateCallKey`, `wrapCallKeyForDevice`, `unwrapCallKey`, `signCallEnvelope`, `verifyCallEnvelope`
-- `src/lib/bootstrap.ts` additions — `startCall`, `joinCall`, `rotateCallKeyForMembers`, `cascadeRevocationIntoActiveCalls`; LiveKit key-provider adapter binding CallKey → `ExternalE2EEKeyProvider`
-- `src/lib/supabase/queries.ts` additions — CRUD + RPC wrappers for `calls` / `call_members` / `call_key_envelopes`
-- `src/lib/livekit-adapter.ts` — thin client SDK wrapper; hardcodes QVGA defaults, key-provider wiring, **and the silent token-renewal loop (§7.3)**
-- `supabase/migrations/0023_calls.sql`
-- `supabase/functions/livekit-token/index.ts` — edge function
+- `src/lib/e2ee-core/call.ts` — `generateCallKey`, `wrapCallKeyForDevice`, `unwrapCallKey`, `signCallEnvelope`, `verifyCallEnvelope`, `wrapAndSignCallEnvelope`
+- `src/lib/bootstrap.ts` additions — `startCallInRoom`, `fetchAndUnwrapCallKey`, `rotateCallKeyForCurrentMembers`, `cascadeRevocationIntoActiveCalls`, `isDesignatedRotator`, `filterActiveCallMembers`, `listStaleCallDeviceIds`
+- `src/lib/supabase/queries.ts` additions — CRUD + RPC wrappers for `calls` / `call_members` / `call_key_envelopes`; `subscribeRoomCalls`, `subscribeCallSignaling`, `broadcastCallSignaling`
+- **`src/lib/livekit/`** (new peer module — directory, not single file) — `adapter.ts` with QVGA defaults + silent JWT renewal loop + encryption-error tolerance window + browser-support check; `token-fetcher.ts` with explicit `apikey` + `Authorization` headers via plain `fetch` (`supabase.functions.invoke` is unreliable for this). Exports: `LiveKitAdapter`, `browserSupportsE2EE`, `makeDefaultTokenFetcher`, `EncryptionState`
+- **`public/livekit-e2ee-worker.mjs`** (static asset) — prebuilt LiveKit SFrame worker, served from `/public` to sidestep Turbopack's inability to resolve bare-module Worker URLs. Synced by `scripts/sync-livekit-worker.mjs` via `postinstall` + `prebuild` npm hooks
+- `supabase/migrations/0023_calls.sql` — schema + RPCs
+- `supabase/migrations/0024_one_active_call_per_room.sql` — partial unique index preventing duplicate active calls
+- `supabase/functions/livekit-token/index.ts` — edge function. **Must deploy with `verify_jwt: false`**: the gateway is HS256-only and projects using ES256 auth keys get rejected upstream; our function verifies the session internally via `supabase.auth.getUser()`
 - Addition to `src/lib/bootstrap.ts::revokeDevice` — the revocation cascade
 
 **Reference UX — rewrite in consuming app's design system:**
@@ -330,3 +332,28 @@ On rotation: `await keyProvider.setKey(newCallKey, newGeneration)`. LiveKit hand
 - Existing TOFU (`observeContact`): reused for envelope signature verification. No new trust primitive.
 
 The entire design is additive. No existing invariant changes.
+
+## 14. Post-launch deltas (2026-04-16, same-day)
+
+Things that differ from the design as originally drafted — captured here so future readers don't chase "why didn't we do X." See `memory/project_video_calls_2026_04_16.md` for the session arc.
+
+- **Edge function `verify_jwt` is `false`, not `true`.** Supabase Edge gateway is HS256-only; projects with ES256-signed auth tokens (the newer default) get rejected upstream with `UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM`. Our function verifies the session *inside the handler* via `supabase.auth.getUser()`, which is algorithm-agnostic. Functional equivalence to `verify_jwt: true` with broader project compatibility.
+- **Env var is `LIVEKIT_URL`, not `LIVEKIT_WS_URL`.** LiveKit Cloud's dashboard ships `LIVEKIT_URL`; the function accepts either for backward-compat.
+- **Token fetcher uses plain `fetch` with explicit `apikey` + `Authorization` headers**, not `supabase.functions.invoke`. The invoke helper omits `apikey` on some SDK versions and gets gateway-rejected. Lesson for V2: for any future edge function relying on user auth, use the same pattern.
+- **E2EE worker is a static asset at `public/livekit-e2ee-worker.mjs`.** Turbopack can't resolve bare module specifiers for `new Worker(new URL('livekit-client/e2ee-worker', import.meta.url))` and throws cryptic `e.indexOf is not a function`. A `postinstall` + `prebuild` script copies the SDK's worker into `public/`.
+- **Encryption-error tolerance window.** The adapter now treats a burst of `RoomEvent.EncryptionError` (up to 10 in 10s) as transient — nudging the key provider at 3 errors, only flipping to 'failed' at 10. A single `InvalidKey: Decryption failed` during rotation is normal; treating it as terminal would kill otherwise-healthy calls.
+- **`room.isE2EEEnabled` cannot be asserted synchronously after `setE2EEEnabled(true)`.** The flag flips asynchronously via the `ParticipantEncryptionStatusChanged(local, enabled=true)` event, which only fires once the first encrypted track publishes. The adapter now listens for the event and `publishLocalMedia` awaits it with a 15s timeout.
+- **Zombie-call seamless takeover.** If `fetchAndUnwrapCallKey` returns null on join AND no other active members are present (per `filterActiveCallMembers` + 30s heartbeat grace), the joiner self-rotates to take ownership. If others exist but fail to rotate us in within 7s, a watchdog self-rotates as fallback. This wasn't in the original §6 flow; added after testing.
+- **Tab-close / unmount cleanup.** `pagehide` fires a `fetch({keepalive: true})` leave_call; component unmount also calls `leave_call` RPC. Cuts the zombie-member window from 30s (heartbeat grace) to ~0.
+- **Migration 0024 partial unique index** prevents two simultaneous `start_call` RPCs from producing parallel active call rows. Not in the original schema; added as reliability polish.
+- **Status probe "Browser supports E2EE insertable streams"** added as probe #17 — fails loudly if the browser lacks the API entirely, since LiveKit would silently fall back to plaintext SRTP in that case.
+- **In-call E2EE badge** in the UI. Green "E2EE active" / red "FAILED / UNSUPPORTED" with a forced "leave now" affordance if anything but active while connected.
+
+### Open items from this phase (deferred to product roadmap)
+
+- Incoming-call notifications outside the room page (toast + sound).
+- Mute + camera toggle controls.
+- Diagnostics panel behind a dev flag (currently on by default).
+- Speaking indicator glow on tiles.
+- HD mode toggle (QVGA-only is a strong aesthetic, may feel broken for some use cases).
+- Wire-level verification that published frames are opaque (currently we trust LiveKit's `isE2EEEnabled` post-condition).

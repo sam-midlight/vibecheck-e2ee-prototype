@@ -47,7 +47,7 @@ Each user has **three distinct key types** and mixing them up is the most common
 
 **Foundation (copy verbatim into any consuming app):**
 - `src/lib/e2ee-core/` — pure crypto, no React, no Supabase. Includes `call.ts` (CallKey primitive for the video-call stack).
-- `src/lib/livekit/` — LiveKit SFU adapter + silent JWT renewal loop + QVGA defaults. Peer module to `e2ee-core/`; portable as one directory. Required only if porting video calls (migration 0023).
+- `src/lib/livekit/` — LiveKit SFU adapter + silent JWT renewal loop + QVGA defaults + encryption-error tolerance window + browser-capability check. Peer module to `e2ee-core/`; portable as one directory. Required only if porting video calls (migrations 0023 + 0024).
 - `src/lib/bootstrap.ts` — app-glue helpers (requires the Supabase queries layer)
 - `src/lib/supabase/queries.ts` — typed data layer; either copy or satisfy the same contract
 - `supabase/migrations/0001..latest` — apply linearly to a fresh Postgres+Supabase project
