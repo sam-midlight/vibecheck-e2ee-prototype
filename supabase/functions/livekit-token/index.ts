@@ -10,7 +10,13 @@
 // current connection is still open.
 //
 // POST body: { call_id: string (uuid), device_id: string (uuid) }
-// Auth:      standard Supabase user JWT in Authorization header
+// Auth:      standard Supabase user JWT in Authorization header (verified
+//            INSIDE the function via supabase.auth.getUser() — that call
+//            hits the auth service and works regardless of JWT algorithm,
+//            which is why we deploy with verify_jwt: false at the gateway
+//            layer: the gateway is HS256-only and ES256-signed projects
+//            would otherwise be rejected upstream with
+//            UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM).
 // Response:  { jwt, url, expiresAt } — expiresAt is epoch millis for client
 //            renewal scheduling
 //
