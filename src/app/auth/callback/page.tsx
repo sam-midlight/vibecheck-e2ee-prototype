@@ -9,6 +9,7 @@ import {
   bytesEqual,
   clearDeviceBundle,
   clearUserMasterKey,
+  clearWrappedIdentity,
   encryptDeviceDisplayName,
   fromBase64,
   generateApprovalCode,
@@ -61,6 +62,58 @@ type Step =
   | 'done'
   | 'error';
 
+/**
+ * Verify that a local device state (from plaintext IDB or from an unlock) still
+ * chains to the user's currently-published UMK. Returns:
+ *
+ *   - 'ok'            — cert chain valid; safe to proceed.
+ *   - 'orphan'        — this device is definitively dead: UMK was rotated
+ *                       elsewhere, device row was revoked, or the cert no
+ *                       longer verifies. Caller MUST wipe local state and
+ *                       route to recovery.
+ *   - 'indeterminate' — could not establish a verdict (no published UMK row
+ *                       when we expected one). Caller should surface an error
+ *                       rather than wipe.
+ *
+ * Network errors propagate — let the outer run()'s catch send the user to the
+ * `error` step rather than silently mis-classifying a flake as orphan.
+ */
+async function verifyLocalChainOrMarkOrphan(
+  uid: string,
+  local: EnrolledDevice,
+): Promise<'ok' | 'orphan' | 'indeterminate'> {
+  const publishedUmk = await fetchUserMasterKeyPub(uid);
+  if (!publishedUmk) return 'indeterminate';
+  const umkPubsMatch =
+    local.umk == null ||
+    (await bytesEqual(
+      local.umk.ed25519PublicKey,
+      publishedUmk.ed25519PublicKey,
+    ));
+  if (!umkPubsMatch) return 'orphan';
+  const devices = await fetchPublicDevices(uid);
+  const myDevice = devices.find(
+    (d) => d.deviceId === local.deviceBundle.deviceId,
+  );
+  if (!myDevice) return 'orphan';
+  try {
+    await verifyDeviceIssuance(
+      {
+        userId: uid,
+        deviceId: myDevice.deviceId,
+        deviceEd25519PublicKey: myDevice.ed25519PublicKey,
+        deviceX25519PublicKey: myDevice.x25519PublicKey,
+        createdAtMs: myDevice.createdAtMs,
+      },
+      myDevice.issuanceSignature,
+      publishedUmk.ed25519PublicKey,
+    );
+  } catch {
+    return 'orphan';
+  }
+  return 'ok';
+}
+
 export default function AuthCallbackPage() {
   const router = useRouter();
   const [step, setStep] = useState<Step>('exchanging-code');
@@ -87,6 +140,26 @@ export default function AuthCallbackPage() {
     }
     setStep('done');
     router.replace(dest);
+  }
+
+  /**
+   * Definitive orphan — wipe all three local artefacts (plaintext bundle,
+   * plaintext UMK, AND the wrapped blob) and route to recovery. We clear the
+   * wrapped blob here because its contents are stale (the UMK priv inside is
+   * either the pre-rotation one or the cert it signs is revoked); leaving it
+   * would just re-prompt for a passphrase on next sign-in that would re-detect
+   * the orphan state and loop.
+   *
+   * NOT used by the "I forgot my passphrase" escape hatch — the blob might
+   * still be valid there and the user may remember the passphrase later.
+   */
+  async function routeToOrphanRecovery(uid: string) {
+    await clearDeviceBundle(uid);
+    await clearUserMasterKey(uid);
+    await clearWrappedIdentity(uid);
+    const hasPhrase = await hasRecoveryBlob(uid);
+    setRecoveryBlobExists(hasPhrase);
+    setStep(hasPhrase ? 'entering-recovery' : 'device-linking-chooser');
   }
 
   useEffect(() => {
@@ -126,74 +199,22 @@ export default function AuthCallbackPage() {
       }
 
       if (publishedUmk && local) {
-        // Orphan-device guard: does our local UMK pub (if any) or our device
-        // cert still chain to the published UMK pub?
-        const umkPubsMatch =
-          local.umk == null ||
-          (await bytesEqual(
-            local.umk.ed25519PublicKey,
-            publishedUmk.ed25519PublicKey,
-          ));
-        if (!umkPubsMatch) {
-          console.warn(
-            'local UMK does not match published UMK — orphan device; wiping local state',
-          );
-          await clearDeviceBundle(uid);
-          await clearUserMasterKey(uid);
-          const hasPhrase = await hasRecoveryBlob(uid);
-          if (!cancelled) {
-            setRecoveryBlobExists(hasPhrase);
-            // If a recovery blob exists, go straight to phrase entry —
-            // user can resync by entering their phrase (Option B /
-            // graceful orphan recovery). Falls back to linking chooser
-            // via the back button on RecoveryPhraseEntry.
-            setStep(hasPhrase ? 'entering-recovery' : 'device-linking-chooser');
-          }
+        const verdict = await verifyLocalChainOrMarkOrphan(uid, local);
+        if (cancelled) return;
+        if (verdict === 'orphan') {
+          console.warn('local device no longer chains to published UMK — orphan; wiping');
+          await routeToOrphanRecovery(uid);
           return;
         }
-
-        // Also verify our device cert still chains to the published UMK.
-        const devices = await fetchPublicDevices(uid);
-        const myDevice = devices.find((d) => d.deviceId === local.deviceBundle.deviceId);
-        if (!myDevice) {
-          console.warn('local device_id not present in published device list — orphan');
-          await clearDeviceBundle(uid);
-          await clearUserMasterKey(uid);
-          const hasPhrase = await hasRecoveryBlob(uid);
-          if (!cancelled) {
-            setRecoveryBlobExists(hasPhrase);
-            setStep(hasPhrase ? 'entering-recovery' : 'device-linking-chooser');
-          }
+        if (verdict === 'indeterminate') {
+          // Shouldn't happen here — we're inside `publishedUmk && local` —
+          // but be defensive rather than silently proceed.
+          setError('could not verify this device against the server');
+          setStep('error');
           return;
         }
-        try {
-          await verifyDeviceIssuance(
-            {
-              userId: uid,
-              deviceId: myDevice.deviceId,
-              deviceEd25519PublicKey: myDevice.ed25519PublicKey,
-              deviceX25519PublicKey: myDevice.x25519PublicKey,
-              createdAtMs: myDevice.createdAtMs,
-            },
-            myDevice.issuanceSignature,
-            publishedUmk.ed25519PublicKey,
-          );
-        } catch {
-          console.warn('local device cert failed to verify against published UMK — orphan');
-          await clearDeviceBundle(uid);
-          await clearUserMasterKey(uid);
-          const hasPhrase = await hasRecoveryBlob(uid);
-          if (!cancelled) {
-            setRecoveryBlobExists(hasPhrase);
-            setStep(hasPhrase ? 'entering-recovery' : 'device-linking-chooser');
-          }
-          return;
-        }
-
-        if (!cancelled) {
-          setEnrolled(local);
-          await proceedOrRequirePin(uid, '/rooms');
-        }
+        setEnrolled(local);
+        await proceedOrRequirePin(uid, '/rooms');
         return;
       }
 
@@ -246,11 +267,62 @@ export default function AuthCallbackPage() {
   const handleRecovered = useCallback(
     async (recovered: EnrolledDevice) => {
       setEnrolled(recovered);
-      if (userId) await proceedOrRequirePin(userId, '/rooms');
+      if (!userId) return;
+      // The device state we just installed is brand new (from recovery phrase
+      // or device approval). Any pre-existing wrapped blob belongs to the old,
+      // now-abandoned identity — stale device priv / stale UMK priv. Clear it
+      // so proceedOrRequirePin forces a fresh passphrase setup rather than
+      // skipping the gate because a stale blob happens to exist.
+      await clearWrappedIdentity(userId);
+      await proceedOrRequirePin(userId, '/rooms');
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [userId],
   );
+
+  /**
+   * Unlock path — unlike recovery/approval (which install fresh state that is
+   * by construction valid), a wrapped blob may be stale: the user could have
+   * rotated UMK or been revoked from another device while this one was idle.
+   * We MUST chain-check before navigating, otherwise AppShell catches the
+   * stale cert post-nav, signs the user out, and the next magic-link sign-in
+   * routes straight back to this unlock screen — an infinite loop.
+   */
+  const handleUnlocked = useCallback(
+    async (recovered: EnrolledDevice) => {
+      setEnrolled(recovered);
+      if (!userId) return;
+      const verdict = await verifyLocalChainOrMarkOrphan(userId, recovered);
+      if (verdict === 'orphan') {
+        console.warn('unlocked device is orphan (stale UMK or revoked) — routing to recovery');
+        await routeToOrphanRecovery(userId);
+        return;
+      }
+      if (verdict === 'indeterminate') {
+        setError('could not verify this device against the server — please refresh and try again');
+        setStep('error');
+        return;
+      }
+      await proceedOrRequirePin(userId, '/rooms');
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [userId],
+  );
+
+  /**
+   * "I forgot my passphrase" — functionally equivalent to orphan recovery
+   * from the user's point of view, but we do NOT delete the wrapped blob:
+   * the blob may still hold valid keys (it's just the user's memory that's
+   * failed), and the user might remember the passphrase later. If they
+   * complete recovery here, the subsequent PIN-setup re-wraps fresh state
+   * and overwrites the blob anyway.
+   */
+  const handleForgotPassphrase = useCallback(async () => {
+    if (!userId) return;
+    const hasPhrase = await hasRecoveryBlob(userId);
+    setRecoveryBlobExists(hasPhrase);
+    setStep('device-linking-chooser');
+  }, [userId]);
 
   const handleNuclearConfirmed = useCallback(async () => {
     if (!userId) return;
@@ -259,6 +331,11 @@ export default function AuthCallbackPage() {
     try {
       await clearDeviceBundle(userId);
       await clearUserMasterKey(userId);
+      // Nuclear means the wrapped blob's contents are useless too — clearing
+      // it here prevents `proceedOrRequirePin` (post-recovery-setup) from
+      // finding a stale blob and skipping the mandatory PIN prompt for the
+      // brand-new identity.
+      await clearWrappedIdentity(userId);
       await nukeIdentityServer(userId);
       const fresh = await bootstrapNewUser(userId);
       localStorage.removeItem(`recovery_skipped_${userId}`);
@@ -354,7 +431,8 @@ export default function AuthCallbackPage() {
       {step === 'unlock-passphrase' && userId && (
         <UnlockPassphrase
           userId={userId}
-          onUnlocked={handleRecovered}
+          onUnlocked={handleUnlocked}
+          onForgot={handleForgotPassphrase}
           onError={(msg) => {
             setError(msg);
             setStep('error');
@@ -391,10 +469,12 @@ export default function AuthCallbackPage() {
 function UnlockPassphrase({
   userId,
   onUnlocked,
+  onForgot,
   onError,
 }: {
   userId: string;
   onUnlocked: (enrolled: EnrolledDevice) => void;
+  onForgot: () => void;
   onError: (msg: string) => void;
 }) {
   const [passphrase, setPassphrase] = useState('');
@@ -444,13 +524,27 @@ function UnlockPassphrase({
         className="block w-full rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700 dark:bg-neutral-900"
       />
       {err && <p className="text-xs text-red-600">{err}</p>}
-      <button
-        type="submit"
-        disabled={busy}
-        className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
-      >
-        {busy ? 'unlocking…' : 'unlock'}
-      </button>
+      <div className="flex items-center justify-between gap-3 pt-1">
+        <button
+          type="submit"
+          disabled={busy}
+          className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+        >
+          {busy ? 'unlocking…' : 'unlock'}
+        </button>
+        <button
+          type="button"
+          onClick={onForgot}
+          disabled={busy}
+          className="text-xs text-neutral-500 underline underline-offset-2 hover:text-neutral-800 disabled:opacity-50 dark:text-neutral-400 dark:hover:text-neutral-200"
+        >
+          Forgot your passphrase?
+        </button>
+      </div>
+      <p className="pt-1 text-[11px] text-neutral-500">
+        If you&apos;ve forgotten it, you can recover using another signed-in
+        device, your 24-word recovery phrase, or reset your identity.
+      </p>
     </form>
   );
 }

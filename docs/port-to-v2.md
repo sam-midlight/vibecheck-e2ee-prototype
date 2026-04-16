@@ -72,11 +72,14 @@ The critical path is in `src/app/auth/callback/page.tsx`:
 1. Let Supabase's `detectSessionInUrl` parse the implicit-flow hash during client init. **Do not** manually strip `window.location.hash` before awaiting the session — it races the parser and kills the sign-in. Instead call `await supabase.auth.getSession()` to gate on init completion, then call `getUser()`.
 2. Fetch the user's row from `identities`.
 3. Check IndexedDB for a local identity copy.
-4. Four cases:
-   - **server yes + local yes** → returning user, ensure device registered, continue.
-   - **server yes + local no** → user is on a new device. Show the chooser: "request approval from another device" (6-digit code path — `device_approval_requests`) or "enter recovery phrase" (`recovery_blobs`, only enabled if one exists).
+4. Five cases:
+   - **server yes + local yes** → returning user. **Must** chain-check the local device cert against the published UMK (`verifyLocalChainOrMarkOrphan` helper); if orphan, wipe local state and route to recovery before attempting to navigate.
+   - **server yes + local-plaintext no + wrapped-blob yes** → passphrase lock engaged; show the unlock form. **After a successful unlock**, run the same chain-check as above: the wrapped blob may hold stale keys (UMK rotated elsewhere, device revoked), and skipping the check causes an infinite sign-in loop (AppShell's post-mount guard kicks the user back to `/`, where the still-present wrapped blob routes them right back to unlock). On orphan verdict, also delete the wrapped blob — its contents are dead and keeping it would re-trigger the loop on next sign-in.
+   - **server yes + local no + no wrapped blob** → new device. Show the chooser: "request approval from another device" (6-digit code path — `device_approval_requests`) or "enter recovery phrase" (`recovery_blobs`, only enabled if one exists).
    - **server no + local no** → first sign-in, generate identity, publish pubkeys, register device, then offer to set up a recovery phrase.
    - **server no + local yes** → shouldn't happen, but treat as "first sign-in" safely.
+
+The unlock form must also expose a "forgot passphrase" affordance that routes to the same chooser the "server yes + local no" case uses — same three options (approve from another device / 24-word phrase / nuclear reset). A pin-locked device with no escape hatch is a lockout footgun.
 
 V2 should keep this exact decision tree. Any variation risks dropping users into the wrong funnel.
 
