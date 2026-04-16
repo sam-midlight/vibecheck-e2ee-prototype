@@ -73,6 +73,9 @@ interface ParticipantTile {
   identity: string;
   /** null until a video track is subscribed. */
   videoTrack: Track | null;
+  /** All audio tracks currently subscribed for this participant. Remote only;
+   *  local audio is never played back (would echo into the mic). */
+  audioTracks: Track[];
   isLocal: boolean;
 }
 
@@ -389,12 +392,14 @@ function CallInner({ roomId }: { roomId: string }) {
       next.push({
         identity: local.identity,
         videoTrack: firstVideoTrack(local),
+        audioTracks: [], // never play local audio — would echo
         isLocal: true,
       });
       room.remoteParticipants.forEach((p: RemoteParticipant) => {
         next.push({
           identity: p.identity,
           videoTrack: firstVideoTrack(p),
+          audioTracks: subscribedAudioTracks(p),
           isLocal: false,
         });
       });
@@ -795,8 +800,23 @@ function firstVideoTrack(p: Participant): Track | null {
   return null;
 }
 
+/** All subscribed audio tracks for a participant. Used for remote playback. */
+function subscribedAudioTracks(p: Participant): Track[] {
+  const out: Track[] = [];
+  for (const pub of p.trackPublications.values()) {
+    if (pub.kind !== 'audio') continue;
+    const track = pub.track;
+    if (!track) continue;
+    const isSubscribed =
+      !('isSubscribed' in pub) || (pub as RemoteTrackPublication).isSubscribed;
+    if (isSubscribed) out.push(track);
+  }
+  return out;
+}
+
 function VideoTile({ tile }: { tile: ParticipantTile }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const audioContainerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const el = videoRef.current;
@@ -816,6 +836,42 @@ function VideoTile({ tile }: { tile: ParticipantTile }) {
       }
     };
   }, [tile.videoTrack]);
+
+  // Remote audio playback. Each subscribed audio track gets its own
+  // <audio> element (created by track.attach() when we pass null — LiveKit
+  // builds the element for us). We attach to a container we control so
+  // cleanup on unsubscribe is easy.
+  useEffect(() => {
+    const container = audioContainerRef.current;
+    if (!container || tile.isLocal) return;
+    const elements: HTMLMediaElement[] = [];
+    for (const track of tile.audioTracks) {
+      try {
+        const el = track.attach();
+        el.autoplay = true;
+        container.appendChild(el);
+        elements.push(el);
+      } catch (err) {
+        console.warn('audio attach failed', err);
+      }
+    }
+    return () => {
+      for (const el of elements) {
+        try {
+          el.remove();
+        } catch {
+          /* ignore */
+        }
+      }
+      for (const track of tile.audioTracks) {
+        try {
+          track.detach();
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+  }, [tile.audioTracks, tile.isLocal]);
 
   // Retro CRT look: thin horizontal scanlines + slight green tint + pixelated
   // upscale. Pure CSS (no canvas pipeline) so it composes cleanly with the
@@ -857,7 +913,12 @@ function VideoTile({ tile }: { tile: ParticipantTile }) {
       />
       <div className="absolute bottom-1 left-1 rounded bg-black/70 text-green-400 text-[10px] px-1.5 py-0.5 font-mono border border-green-700/40">
         {tile.isLocal ? 'YOU' : tile.identity.slice(0, 16).toUpperCase()}
+        {!tile.isLocal && tile.audioTracks.length > 0 && (
+          <span className="ml-1" title="Audio subscribed">♪</span>
+        )}
       </div>
+      {/* Hidden container for LiveKit-created <audio> elements. */}
+      <div ref={audioContainerRef} className="hidden" aria-hidden="true" />
     </div>
   );
 }
