@@ -446,11 +446,15 @@ export default function AuthCallbackPage() {
           heading="Set a passphrase to protect this device"
           blurb="A passphrase is required. Without it, your identity keys would sit in this browser's IndexedDB as plaintext and be readable by browser extensions, disk forensics, or anyone else using this profile. Pick something you'll remember — if you forget it, recovery requires your 24-word phrase."
           onSave={async (passphrase) => {
+            const { getSelfSigningKey, getUserSigningKey } = await import('@/lib/e2ee-core');
+            const localSsk = await getSelfSigningKey(userId);
+            const localUsk = await getUserSigningKey(userId);
             const blob = await wrapDeviceStateWithPin(
               enrolled.deviceBundle,
               enrolled.umk,
               passphrase,
               userId,
+              { ssk: localSsk, usk: localUsk },
             );
             await putWrappedIdentity(userId, blob);
             setStep('done');
@@ -497,6 +501,14 @@ function UnlockPassphrase({
       if (state.umk) {
         const { putUserMasterKey } = await import('@/lib/e2ee-core');
         await putUserMasterKey(userId, state.umk);
+      }
+      if (state.ssk) {
+        const { putSelfSigningKey } = await import('@/lib/e2ee-core');
+        await putSelfSigningKey(userId, state.ssk);
+      }
+      if (state.usk) {
+        const { putUserSigningKey } = await import('@/lib/e2ee-core');
+        await putUserSigningKey(userId, state.usk);
       }
       onUnlocked({ userId, deviceBundle: state.deviceBundle, umk: state.umk });
     } catch (e) {
@@ -797,14 +809,52 @@ function AwaitingApproval({
           } catch (err) {
             console.warn('display-name seal failed (row stays unlabeled)', err);
           }
-          // Pick up the backup key if the approving device shared one.
+          // Pick up sealed keys from the approving device's device row.
           try {
             const { listDevices: listDeviceRows } = await import('@/lib/supabase/queries');
             const myRows = await listDeviceRows(userId);
             const myRow = myRows.find((r) => r.id === deviceId);
+            const sodium = await (await import('@/lib/e2ee-core')).getSodium();
+
+            // SSK + USK → signing_key_wrap
+            if (myRow?.signing_key_wrap) {
+              try {
+                const sealedKeys = await fromBase64(myRow.signing_key_wrap);
+                const packed = sodium.crypto_box_seal_open(
+                  sealedKeys,
+                  bundle.x25519PublicKey,
+                  bundle.x25519PrivateKey,
+                );
+                // packed = ssk_priv(64) || usk_priv(64)
+                const sskPriv = packed.slice(0, 64);
+                const uskPriv = packed.slice(64, 128);
+                const sskPub = sodium.crypto_sign_ed25519_sk_to_pk(sskPriv);
+                const uskPub = sodium.crypto_sign_ed25519_sk_to_pk(uskPriv);
+                sodium.memzero(packed);
+                const { putSelfSigningKey, putUserSigningKey } =
+                  await import('@/lib/e2ee-core');
+                await putSelfSigningKey(userId, {
+                  ed25519PublicKey: sskPub,
+                  ed25519PrivateKey: sskPriv,
+                });
+                await putUserSigningKey(userId, {
+                  ed25519PublicKey: uskPub,
+                  ed25519PrivateKey: uskPriv,
+                });
+                // Defense-in-depth: null out signing_key_wrap after pickup.
+                const supabaseLocal = (await import('@/lib/supabase/client')).getSupabase();
+                await supabaseLocal
+                  .from('devices')
+                  .update({ signing_key_wrap: null })
+                  .eq('id', deviceId);
+              } catch (err) {
+                console.warn('SSK/USK pickup failed:', err);
+              }
+            }
+
+            // Backup key → backup_key_wrap
             if (myRow?.backup_key_wrap) {
               const sealedBk = await fromBase64(myRow.backup_key_wrap);
-              const sodium = await (await import('@/lib/e2ee-core')).getSodium();
               const bk = sodium.crypto_box_seal_open(
                 sealedBk,
                 bundle.x25519PublicKey,
@@ -814,7 +864,7 @@ function AwaitingApproval({
               await putBackupKey(userId, bk);
             }
           } catch (err) {
-            console.warn('backup key pickup failed:', err);
+            console.warn('key pickup from device row failed:', err);
           }
           await deleteApprovalRequest(request.id).catch(() => {});
           if (!cancelled) onInstalled({ userId, deviceBundle: bundle, umk: null });

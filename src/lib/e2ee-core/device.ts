@@ -1,33 +1,17 @@
 /**
- * Per-device identity primitives (v2).
+ * Per-device identity primitives.
  *
- * A user has:
- *   - exactly one UserMasterKey (UMK): an Ed25519 keypair whose private half
- *     lives on the primary device (and, via recovery, can be re-materialised
- *     on a new device). The UMK signs ONLY device certificates + revocations.
- *   - N DeviceKeyBundles, one per device: Ed25519 for operational signing
- *     (blobs, membership ops) + X25519 for receiving sealed room keys. Each
- *     device generates its own bundle locally; the private halves never
- *     leave the device.
+ * Cert versions:
+ *   v1 (domain "vibecheck:devcert:v1") — signed by UMK/MSK. Pre-cross-signing.
+ *   v2 (domain "vibecheck:devcert:v2") — signed by SSK. Requires MSK→SSK
+ *       cross-sig chain for verification. Same byte layout as v1 modulo domain.
  *
- * A device is "trusted" iff its issuance certificate verifies against the
- * user's published UMK pub, AND there is no valid revocation cert against it.
+ * Revocation versions:
+ *   v1 (domain "vibecheck:devrev:v1") — signed by UMK/MSK.
+ *   v2 (domain "vibecheck:devrev:v2") — signed by SSK.
  *
- * Canonical byte layouts (domain-tagged, fixed-width fields):
- *
- *   Issuance:
- *     "vibecheck:devcert:v1" ||
- *     user_id (16 bytes) || device_id (16 bytes) ||
- *     device_ed_pub (32 bytes) || device_x_pub (32 bytes) ||
- *     created_at_ms (8 bytes BE u64)
- *
- *   Revocation:
- *     "vibecheck:devrev:v1"  ||
- *     user_id (16 bytes) || device_id (16 bytes) ||
- *     revoked_at_ms (8 bytes BE u64)
- *
- * Verifiers must reject malformed input (wrong lengths, unparsable UUIDs)
- * before attempting signature verification.
+ * verifyPublicDevice accepts optional sskPub: if present, tries v2 cert
+ * domain first; falls back to v1 (MSK-signed) for backward compat.
  */
 
 import {
@@ -49,8 +33,10 @@ import { signMessage, verifyMessageOrThrow } from './identity';
 
 const DEVICE_NAME_MAX_BYTES = 128;
 
-const CERT_DOMAIN = stringToBytes('vibecheck:devcert:v1');
-const REVOCATION_DOMAIN = stringToBytes('vibecheck:devrev:v1');
+const CERT_DOMAIN_V1 = stringToBytes('vibecheck:devcert:v1');
+const CERT_DOMAIN_V2 = stringToBytes('vibecheck:devcert:v2');
+const REVOCATION_DOMAIN_V1 = stringToBytes('vibecheck:devrev:v1');
+const REVOCATION_DOMAIN_V2 = stringToBytes('vibecheck:devrev:v2');
 
 async function uuidBytes(id: string): Promise<Bytes> {
   return fromHex(id.replaceAll('-', ''));
@@ -120,9 +106,12 @@ export interface IssuanceFields {
   createdAtMs: number;
 }
 
-async function canonicalIssuanceMessage(f: IssuanceFields): Promise<Bytes> {
+async function canonicalIssuanceMessage(
+  f: IssuanceFields,
+  domain: Bytes,
+): Promise<Bytes> {
   return concatBytes(
-    CERT_DOMAIN,
+    domain,
     await uuidBytes(f.userId),
     await uuidBytes(f.deviceId),
     f.deviceEd25519PublicKey,
@@ -131,26 +120,54 @@ async function canonicalIssuanceMessage(f: IssuanceFields): Promise<Bytes> {
   );
 }
 
-/** Sign an issuance certificate with the UMK priv. */
+/** Sign an issuance certificate with the UMK/MSK priv (v1 cert). */
 export async function signDeviceIssuance(
   fields: IssuanceFields,
   umkPrivateKey: Bytes,
 ): Promise<Bytes> {
-  return signMessage(await canonicalIssuanceMessage(fields), umkPrivateKey);
+  return signMessage(
+    await canonicalIssuanceMessage(fields, CERT_DOMAIN_V1),
+    umkPrivateKey,
+  );
+}
+
+/** Sign an issuance certificate with the SSK priv (v2 cert). */
+export async function signDeviceIssuanceV2(
+  fields: IssuanceFields,
+  sskPrivateKey: Bytes,
+): Promise<Bytes> {
+  return signMessage(
+    await canonicalIssuanceMessage(fields, CERT_DOMAIN_V2),
+    sskPrivateKey,
+  );
 }
 
 /**
- * Verify an issuance certificate against a user's UMK pub. Throws
- * `CERT_INVALID` on mismatch — caller refuses to trust the device.
+ * Verify an issuance certificate. Tries v2 (SSK-signed) first if sskPub
+ * is provided; falls back to v1 (MSK-signed). Throws CERT_INVALID on
+ * mismatch.
  */
 export async function verifyDeviceIssuance(
   fields: IssuanceFields,
   signature: Bytes,
   umkPublicKey: Bytes,
+  sskPublicKey?: Bytes,
 ): Promise<void> {
+  if (sskPublicKey) {
+    try {
+      await verifyMessageOrThrow(
+        await canonicalIssuanceMessage(fields, CERT_DOMAIN_V2),
+        signature,
+        sskPublicKey,
+      );
+      return;
+    } catch {
+      // v2 failed — fall through to v1
+    }
+  }
   try {
     await verifyMessageOrThrow(
-      await canonicalIssuanceMessage(fields),
+      await canonicalIssuanceMessage(fields, CERT_DOMAIN_V1),
       signature,
       umkPublicKey,
     );
@@ -172,39 +189,65 @@ export interface RevocationFields {
   revokedAtMs: number;
 }
 
-async function canonicalRevocationMessage(f: RevocationFields): Promise<Bytes> {
+async function canonicalRevocationMessage(
+  f: RevocationFields,
+  domain: Bytes,
+): Promise<Bytes> {
   return concatBytes(
-    REVOCATION_DOMAIN,
+    domain,
     await uuidBytes(f.userId),
     await uuidBytes(f.deviceId),
     u64BE(f.revokedAtMs),
   );
 }
 
-/** Sign a revocation certificate with UMK priv. */
+/** Sign a revocation certificate with UMK/MSK priv (v1). */
 export async function signDeviceRevocation(
   fields: RevocationFields,
   umkPrivateKey: Bytes,
 ): Promise<Bytes> {
-  return signMessage(await canonicalRevocationMessage(fields), umkPrivateKey);
+  return signMessage(
+    await canonicalRevocationMessage(fields, REVOCATION_DOMAIN_V1),
+    umkPrivateKey,
+  );
+}
+
+/** Sign a revocation certificate with SSK priv (v2). */
+export async function signDeviceRevocationV2(
+  fields: RevocationFields,
+  sskPrivateKey: Bytes,
+): Promise<Bytes> {
+  return signMessage(
+    await canonicalRevocationMessage(fields, REVOCATION_DOMAIN_V2),
+    sskPrivateKey,
+  );
 }
 
 /**
- * Verify a revocation certificate against UMK pub. Throws on mismatch.
- * Callers that find a revocation signature present but failing verification
- * should treat it as "revocation not proven" — they do NOT get to fall back
- * to trusting the device, because that would let an attacker present a bogus
- * revocation to re-activate a device. Instead: treat any unverifiable
- * revocation as a server-tampering signal and abort.
+ * Verify a revocation certificate. Tries v2 (SSK-signed) first if sskPub
+ * is provided; falls back to v1 (MSK-signed).
  */
 export async function verifyDeviceRevocation(
   fields: RevocationFields,
   signature: Bytes,
   umkPublicKey: Bytes,
+  sskPublicKey?: Bytes,
 ): Promise<void> {
+  if (sskPublicKey) {
+    try {
+      await verifyMessageOrThrow(
+        await canonicalRevocationMessage(fields, REVOCATION_DOMAIN_V2),
+        signature,
+        sskPublicKey,
+      );
+      return;
+    } catch {
+      // v2 failed — fall through to v1
+    }
+  }
   try {
     await verifyMessageOrThrow(
-      await canonicalRevocationMessage(fields),
+      await canonicalRevocationMessage(fields, REVOCATION_DOMAIN_V1),
       signature,
       umkPublicKey,
     );
@@ -221,14 +264,19 @@ export async function verifyDeviceRevocation(
 // ---------------------------------------------------------------------------
 
 /**
- * Verify a PublicDevice end-to-end against a UMK pub. Returns normally iff
- * the device is currently trustworthy (valid issuance + no revocation).
- * Throws `CERT_INVALID` on any signature failure or `DEVICE_REVOKED` if the
+ * Verify a PublicDevice end-to-end. Returns normally iff the device is
+ * currently trustworthy (valid issuance + no revocation). Throws
+ * CERT_INVALID on any signature failure or DEVICE_REVOKED if the
  * revocation cert is present and verifies.
+ *
+ * If `sskPublicKey` is provided, v2 certs (SSK-signed) are tried first,
+ * falling back to v1 (MSK-signed). This keeps backward compat with
+ * pre-cross-signing devices.
  */
 export async function verifyPublicDevice(
   device: PublicDevice,
   umkPublicKey: Bytes,
+  sskPublicKey?: Bytes,
 ): Promise<void> {
   await verifyDeviceIssuance(
     {
@@ -240,6 +288,7 @@ export async function verifyPublicDevice(
     },
     device.issuanceSignature,
     umkPublicKey,
+    sskPublicKey,
   );
   if (device.revocation) {
     await verifyDeviceRevocation(
@@ -250,6 +299,7 @@ export async function verifyPublicDevice(
       },
       device.revocation.signature,
       umkPublicKey,
+      sskPublicKey,
     );
     throw new CryptoError(
       `device ${device.deviceId} is revoked (since ${new Date(device.revocation.revokedAtMs).toISOString()})`,
@@ -262,11 +312,12 @@ export async function verifyPublicDevice(
 export async function filterActiveDevices(
   devices: PublicDevice[],
   umkPublicKey: Bytes,
+  sskPublicKey?: Bytes,
 ): Promise<PublicDevice[]> {
   const out: PublicDevice[] = [];
   for (const d of devices) {
     try {
-      await verifyPublicDevice(d, umkPublicKey);
+      await verifyPublicDevice(d, umkPublicKey, sskPublicKey);
       out.push(d);
     } catch (err) {
       if (

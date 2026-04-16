@@ -69,48 +69,62 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
     setStage('uploading');
     setError(null);
     try {
-      // SSSS ordering (Matrix-style): escrow the new UMK priv in the
-      // recovery blob BEFORE publishing the new UMK pub. This way, if
-      // the browser crashes mid-flow, the user can always recover by
-      // entering the phrase they just wrote down.
+      // SSSS ordering (Matrix-style): escrow the new keys in the
+      // recovery blob BEFORE publishing pubs. If the browser crashes
+      // mid-flow, the user recovers via the phrase they just wrote down.
       let umkToWrap: UserMasterKey;
-      let pendingCerts: Awaited<ReturnType<typeof generateRotatedUmk>>['reissuedCerts'] | null = null;
+      let rotated: Awaited<ReturnType<typeof generateRotatedUmk>> | null = null;
 
       if (rotate) {
-        // Step 1: generate new UMK + re-sign certs IN MEMORY ONLY.
-        const rotated = await generateRotatedUmk(userId, umk);
+        // Step 1: generate new MSK + SSK + USK + re-sign certs IN MEMORY ONLY.
+        rotated = await generateRotatedUmk(userId, umk);
         umkToWrap = rotated.newUmk;
-        pendingCerts = rotated.reissuedCerts;
       } else {
         umkToWrap = umk;
       }
 
-      // Step 2: wrap the new UMK with the phrase. Also include the
-      // backup key (generate one if none exists yet — first-time setup).
+      // Step 2: wrap all keys with the phrase. v4 blob includes SSK+USK.
       let backupKey = await getBackupKey(userId);
       if (!backupKey) {
         backupKey = await generateBackupKey();
         await putBackupKey(userId, backupKey);
       }
+      // Include SSK+USK in the blob if we have them (rotation generates
+      // fresh ones; non-rotation wraps whatever this device holds).
+      const { getSelfSigningKey: loadSsk, getUserSigningKey: loadUsk } =
+        await import('@/lib/e2ee-core');
+      const localSsk = rotated?.newSsk ?? (await loadSsk(userId));
+      const localUsk = rotated?.newUsk ?? (await loadUsk(userId));
       const blob = await wrapUserMasterKeyWithPhrase(
         umkToWrap,
         phrase,
         userId,
-        { backupKey },
+        {
+          backupKey,
+          sskPriv: localSsk?.ed25519PrivateKey,
+          uskPriv: localUsk?.ed25519PrivateKey,
+        },
       );
       const encoded = await encodeRecoveryBlob(blob);
 
-      // Step 3: COMMIT POINT — upload recovery blob. After this succeeds,
-      // the new UMK priv is recoverable even if we crash before publish.
+      // Step 3: COMMIT POINT — upload recovery blob.
       await putRecoveryBlob({ userId, ...encoded });
 
-      if (rotate && pendingCerts) {
-        // Step 4: save to local IDB (so this device has the new UMK).
-        const { putUserMasterKey: saveUmk } = await import('@/lib/e2ee-core');
+      if (rotate && rotated) {
+        // Step 4: save to local IDB.
+        const { putUserMasterKey: saveUmk, putSelfSigningKey: saveSsk, putUserSigningKey: saveUsk } =
+          await import('@/lib/e2ee-core');
         await saveUmk(userId, umkToWrap);
+        await saveSsk(userId, rotated.newSsk);
+        await saveUsk(userId, rotated.newUsk);
 
-        // Step 5: publish new UMK pub + write re-signed device certs.
-        await commitRotatedUmk(userId, umkToWrap, pendingCerts);
+        // Step 5: publish new pubs + write re-signed device certs.
+        await commitRotatedUmk(userId, umkToWrap, rotated.reissuedCerts, {
+          ssk: rotated.newSsk,
+          usk: rotated.newUsk,
+          sskCrossSignature: rotated.sskCrossSignature,
+          uskCrossSignature: rotated.uskCrossSignature,
+        });
 
         // Step 6: cascade room rotations.
         if (device) {

@@ -83,7 +83,7 @@ export function RecoveryPhraseEntry({ userId, onRecovered, onBack }: Props) {
         ed25519PrivateKey: unwrapped.ed25519PrivateKey,
       };
 
-      // If the recovery blob carried a backup key (v3 format), store it
+      // If the recovery blob carried a backup key (v3/v4 format), store it
       // so this device can download and decrypt server-side room-key
       // backups after enrollment.
       if (unwrapped.backupKey) {
@@ -91,7 +91,21 @@ export function RecoveryPhraseEntry({ userId, onRecovered, onBack }: Props) {
         await putBackupKey(userId, unwrapped.backupKey);
       }
 
-      const enrolled = await enrollDeviceWithUmk(userId, umk);
+      // If the recovery blob carried SSK+USK (v4 format), reconstruct
+      // the key objects so enrollDeviceWithUmk can reuse them.
+      let sskOpt: { ed25519PublicKey: Uint8Array; ed25519PrivateKey: Uint8Array } | undefined;
+      let uskOpt: { ed25519PublicKey: Uint8Array; ed25519PrivateKey: Uint8Array } | undefined;
+      if (unwrapped.sskPriv && unwrapped.uskPriv) {
+        const sskPub = sodium.crypto_sign_ed25519_sk_to_pk(unwrapped.sskPriv);
+        const uskPub = sodium.crypto_sign_ed25519_sk_to_pk(unwrapped.uskPriv);
+        sskOpt = { ed25519PublicKey: sskPub, ed25519PrivateKey: unwrapped.sskPriv };
+        uskOpt = { ed25519PublicKey: uskPub, ed25519PrivateKey: unwrapped.uskPriv };
+      }
+
+      const enrolled = await enrollDeviceWithUmk(userId, umk, {
+        ssk: sskOpt,
+        usk: uskOpt,
+      });
       onRecovered(enrolled);
     } catch (err) {
       setError(errorMessage(err));

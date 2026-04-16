@@ -11,22 +11,28 @@ import {
   decryptBlob,
   decryptImageAttachment,
   decryptRoomName,
-  encryptBlob,
+  deriveMessageKeyAtIndex,
+  encryptBlobV4,
   encryptRoomName,
   fromBase64,
   observeContact,
   prepareImageForUpload,
   publicIdentityFingerprint,
+  ratchetAndDerive,
   rotateRoomKey,
   signMembershipWrap,
+  unsealSessionSnapshot,
   unwrapRoomKey,
   verifyMembershipWrap,
   verifyPublicDevice,
+  putInboundSession,
+  putOutboundSession,
   type DeviceKeyBundle,
   type ImageAttachmentHeader,
   type PublicDevice,
   type RoomKey,
 } from '@/lib/e2ee-core';
+import { ensureFreshSession } from '@/lib/bootstrap';
 import {
   decodeBlobRow,
   deleteAttachment,
@@ -44,6 +50,7 @@ import {
   renameRoom,
   subscribeBlobs,
   subscribeRoomCalls,
+  listMegolmSharesForDevice,
   uploadAttachment,
   type BlobRow,
   type CallRow,
@@ -202,12 +209,36 @@ function RoomInner({ roomId }: { roomId: string }) {
         setRoomName(null);
       }
 
+      // Hydrate inbound Megolm sessions for this device in one batch.
+      // Cached in IDB so per-blob decrypt doesn't hit the server.
+      try {
+        const shares = await listMegolmSharesForDevice({
+          roomId,
+          recipientDeviceId: dev.deviceId,
+        });
+        for (const share of shares) {
+          try {
+            const sealed = await fromBase64(share.sealed_snapshot);
+            const snapshot = await unsealSessionSnapshot(
+              sealed,
+              dev.x25519PublicKey,
+              dev.x25519PrivateKey,
+            );
+            await putInboundSession(share.session_id, snapshot.senderDeviceId, snapshot);
+          } catch {
+            // skip bad shares
+          }
+        }
+      } catch (err) {
+        console.warn('Megolm session hydration failed:', errorMessage(err));
+      }
+
       const mems = await listRoomMembers(roomId);
       setMembers(mems);
 
       const rows = await listBlobs(roomId);
       const decoded = await Promise.all(
-        rows.map((row) => decodeAndVerify(row, byGen, uid)),
+        rows.map((row) => decodeAndVerify(row, byGen, uid, dev)),
       );
       setBlobs(decoded);
       // Build the nickname map from the full history — the latest ts wins
@@ -268,7 +299,7 @@ function RoomInner({ roomId }: { roomId: string }) {
     async (row: BlobRow) => {
       const byGen = roomKeysByGenRef.current;
       if (byGen.size === 0 || !device || !userId) return;
-      const decoded = await decodeAndVerify(row, byGen, userId);
+      const decoded = await decodeAndVerify(row, byGen, userId, device);
       setBlobs((prev) => {
         if (prev.some((b) => b.id === decoded.id)) return prev;
         return [...prev, decoded];
@@ -480,13 +511,12 @@ function RoomInner({ roomId }: { roomId: string }) {
         onChange={() => void loadAll(userId, device)}
         onLeft={() => router.replace('/rooms')}
         onSendNickname={async (name) => {
-          const blob = await encryptBlob({
+          const blob = await megolmEncrypt({
             payload: { type: 'nickname', name, ts: Date.now() } satisfies NicknamePayload,
             roomId,
             roomKey,
-            senderUserId: userId,
-            senderDeviceId: device.deviceId,
-            senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
+            userId,
+            device,
           });
           const row = await insertBlob({
             roomId,
@@ -594,14 +624,152 @@ async function resolveSenderDeviceEd(
   return dev.ed25519PublicKey;
 }
 
+/**
+ * Megolm key resolver: given a session_id (base64) + message_index,
+ * looks up the local inbound session snapshot (hydrated on room load)
+ * and derives the message key. Falls back to fetching from the server
+ * on cache miss.
+ */
+async function resolveMegolmMessageKey(
+  sessionIdB64: string,
+  messageIndex: number,
+  roomId: string,
+  device: DeviceKeyBundle,
+): Promise<Uint8Array | null> {
+  // IDB stores are keyed by `${sessionId}:${senderDeviceId}`. We don't
+  // know the senderDeviceId from the blob row alone, but the batch
+  // hydration in loadAll already cached it. Try a direct server fetch
+  // as fallback if the IDB lookup misses — this covers realtime blobs
+  // that arrived after the initial hydration.
+  // Quick path: check all IDB entries. Since we can't enumerate by
+  // sessionId prefix in a keyPath store, we'll try the server shares
+  // which we already cached during hydration.
+  const shares = await listMegolmSharesForDevice({
+    roomId,
+    recipientDeviceId: device.deviceId,
+  });
+  for (const share of shares) {
+    if (share.session_id !== sessionIdB64) continue;
+    // Try IDB first (already hydrated)
+    try {
+      const sealed = await fromBase64(share.sealed_snapshot);
+      const snapshot = await unsealSessionSnapshot(
+        sealed,
+        device.x25519PublicKey,
+        device.x25519PrivateKey,
+      );
+      await putInboundSession(sessionIdB64, snapshot.senderDeviceId, snapshot);
+      if (messageIndex >= snapshot.startIndex) {
+        const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
+        return mk.key;
+      }
+    } catch {
+      // try next share
+    }
+  }
+  return null;
+}
+
+/**
+ * Encrypt a payload using the Megolm send path. Creates/reuses an outbound
+ * session, ratchets, and returns a v4 EncryptedBlob. The session is saved
+ * to IDB after each send so the ratchet state persists.
+ */
+async function megolmEncrypt<T>(params: {
+  payload: T;
+  roomId: string;
+  roomKey: RoomKey;
+  userId: string;
+  device: DeviceKeyBundle;
+}): Promise<import('@/lib/e2ee-core').EncryptedBlob> {
+  const { payload, roomId, roomKey, userId, device } = params;
+  const session = await ensureFreshSession({
+    roomId,
+    generation: roomKey.generation,
+    userId,
+    device,
+  });
+  const messageKey = await ratchetAndDerive(session);
+  const blob = await encryptBlobV4({
+    payload,
+    roomId,
+    messageKey,
+    sessionId: session.sessionId,
+    generation: session.generation,
+    senderUserId: userId,
+    senderDeviceId: device.deviceId,
+    senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
+  });
+  // Persist updated session (ratchet advanced).
+  await putOutboundSession(roomId, device.deviceId, session);
+
+  // Back up the session snapshot to key_backup if a backup key exists.
+  try {
+    const { getBackupKey, encryptSessionSnapshotForBackup, toBase64: b64 } =
+      await import('@/lib/e2ee-core');
+    const { upsertKeyBackup } = await import('@/lib/supabase/queries');
+    const bk = await getBackupKey(userId);
+    if (bk) {
+      const sessionIdB64 = await b64(session.sessionId);
+      const enc = await encryptSessionSnapshotForBackup({
+        snapshot: {
+          chainKeyAtIndex: session.chainKey,
+          startIndex: session.messageIndex, // current index after ratchet
+          senderUserId: userId,
+          senderDeviceId: device.deviceId,
+        },
+        sessionId: sessionIdB64,
+        backupKey: bk,
+        roomId,
+      });
+      await upsertKeyBackup({
+        userId,
+        roomId,
+        generation: session.generation,
+        ciphertext: await b64(enc.ciphertext),
+        nonce: await b64(enc.nonce),
+        sessionId: sessionIdB64,
+        startIndex: session.messageIndex,
+      });
+    }
+  } catch (err) {
+    console.warn('Megolm session backup failed:', err);
+  }
+
+  return blob;
+}
+
 async function decodeAndVerify(
   row: BlobRow,
   roomKeysByGen: Map<number, RoomKey>,
   viewerUserId: string,
+  device?: DeviceKeyBundle | null,
 ): Promise<DecodedBlob> {
   void viewerUserId;
   try {
     const blob = await decodeBlobRow(row);
+
+    // v4 (Megolm) path
+    if (blob.sessionId && blob.messageIndex != null && device) {
+      const decoded = await decryptBlob<unknown>({
+        blob,
+        roomId: row.room_id,
+        roomKey: { key: new Uint8Array(0), generation: blob.generation }, // unused for v4
+        resolveSenderDeviceEd25519Pub: resolveSenderDeviceEd,
+        resolveMegolmKey: (sid, mi) =>
+          resolveMegolmMessageKey(sid, mi, row.room_id, device),
+      });
+      return {
+        id: row.id,
+        senderId: decoded.senderUserId ?? row.sender_id,
+        createdAt: row.created_at,
+        generation: blob.generation,
+        payload: decoded.payload,
+        verified: true,
+      };
+    }
+
+    // v3/v2/v1 flat-key path
     const rk = roomKeysByGen.get(blob.generation);
     if (!rk) {
       return {
@@ -677,6 +845,46 @@ function MemberList({
   // Fingerprints are derived from each member's published UMK pub. Loaded
   // once per member when the list mounts; displayed inline under the name
   // so users can compare them out-of-band to confirm no one's impersonating.
+  const [verifyingUserId, setVerifyingUserId] = useState<string | null>(null);
+  const [pendingVerification, setPendingVerification] =
+    useState<import('@/lib/supabase/queries').SasVerificationSessionRow | null>(null);
+  const [verifiedUsers, setVerifiedUsers] = useState<Set<string>>(() => new Set());
+
+  // Load verified status for all members from cross_user_signatures.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { getCrossUserSignature } = await import('@/lib/supabase/queries');
+      const verified = new Set<string>();
+      for (const m of members) {
+        if (m.user_id === selfUserId) continue;
+        const sig = await getCrossUserSignature(selfUserId, m.user_id);
+        if (sig) verified.add(m.user_id);
+      }
+      if (!cancelled) setVerifiedUsers(verified);
+    })();
+    return () => { cancelled = true; };
+  }, [members, selfUserId]);
+
+  // Listen for incoming SAS verification requests.
+  useEffect(() => {
+    const { listPendingSasSessions, subscribeSasSessions } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('@/lib/supabase/queries') as typeof import('@/lib/supabase/queries');
+    let cancelled = false;
+    (async () => {
+      const pending = await listPendingSasSessions(selfUserId);
+      if (!cancelled && pending.length > 0) setPendingVerification(pending[0]);
+    })();
+    const unsub = subscribeSasSessions(selfUserId, (row) => {
+      if (cancelled) return;
+      if (row.responder_user_id === selfUserId && row.state === 'initiated') {
+        setPendingVerification(row);
+      }
+    });
+    return () => { cancelled = true; unsub(); };
+  }, [selfUserId]);
+
   const [fingerprints, setFingerprints] = useState<Map<string, string>>(() => new Map());
   useEffect(() => {
     let cancelled = false;
@@ -1026,7 +1234,25 @@ function MemberList({
                       🔑 {fingerprints.get(u.userId)}
                     </code>
                   )}
+                  {verifiedUsers.has(u.userId) && (
+                    <span
+                      className="text-[10px] text-emerald-600 dark:text-emerald-400"
+                      title="identity verified via SAS emoji comparison"
+                    >
+                      verified
+                    </span>
+                  )}
                 </div>
+                <div className="flex shrink-0 gap-1">
+                {!self && !verifiedUsers.has(u.userId) && (
+                  <button
+                    onClick={() => setVerifyingUserId(u.userId)}
+                    disabled={busy}
+                    className="rounded border border-emerald-300 px-2 py-0.5 text-[11px] text-emerald-700 disabled:opacity-50 dark:border-emerald-800 dark:text-emerald-400"
+                  >
+                    verify
+                  </button>
+                )}
                 {isAdmin && !self && (
                   <button
                     onClick={() => void kickMember(u.userId)}
@@ -1045,6 +1271,7 @@ function MemberList({
                     leave
                   </button>
                 )}
+                </div>
               </li>
             );
           });
@@ -1057,8 +1284,87 @@ function MemberList({
         </p>
       )}
       {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
+
+      {pendingVerification && (
+        <div className="mt-2 rounded-md border border-emerald-300 bg-emerald-50 p-2 text-xs dark:border-emerald-800 dark:bg-emerald-950">
+          <p>
+            <strong>{pendingVerification.initiator_user_id.slice(0, 8)}...</strong>
+            {' '}wants to verify your identity.
+          </p>
+          <button
+            onClick={() => {
+              // Will render the responder modal
+              setPendingVerification(pendingVerification);
+              setVerifyingUserId(`respond:${pendingVerification.id}`);
+            }}
+            className="mt-1 rounded bg-emerald-700 px-2 py-0.5 text-[11px] text-white dark:bg-emerald-600"
+          >
+            accept verification
+          </button>
+        </div>
+      )}
+
+      {verifyingUserId && !verifyingUserId.startsWith('respond:') && (
+        <VerifyContactModalLazy
+          userId={selfUserId}
+          peerUserId={verifyingUserId}
+          onDone={async (result) => {
+            setVerifyingUserId(null);
+            if (result === 'verified') {
+              setVerifiedUsers((prev) => new Set([...prev, verifyingUserId]));
+              const { markContactVerified } = await import('@/lib/e2ee-core');
+              await markContactVerified(verifyingUserId);
+            }
+          }}
+        />
+      )}
+
+      {verifyingUserId?.startsWith('respond:') && pendingVerification && (
+        <RespondVerificationModalLazy
+          userId={selfUserId}
+          session={pendingVerification}
+          onDone={async (result) => {
+            setVerifyingUserId(null);
+            setPendingVerification(null);
+            if (result === 'verified') {
+              setVerifiedUsers((prev) => new Set([...prev, pendingVerification.initiator_user_id]));
+              const { markContactVerified } = await import('@/lib/e2ee-core');
+              await markContactVerified(pendingVerification.initiator_user_id);
+            }
+          }}
+        />
+      )}
     </section>
   );
+}
+
+// Lazy-loaded modals to avoid pulling SAS crypto into the main bundle.
+function VerifyContactModalLazy(props: {
+  userId: string;
+  peerUserId: string;
+  onDone: (result: 'verified' | 'cancelled' | 'failed') => void;
+}) {
+  const [Comp, setComp] = useState<React.ComponentType<typeof props> | null>(null);
+  useEffect(() => {
+    void import('@/components/VerifyContactModal').then((m) =>
+      setComp(() => m.VerifyContactModal),
+    );
+  }, []);
+  return Comp ? <Comp {...props} /> : null;
+}
+
+function RespondVerificationModalLazy(props: {
+  userId: string;
+  session: import('@/lib/supabase/queries').SasVerificationSessionRow;
+  onDone: (result: 'verified' | 'cancelled' | 'failed') => void;
+}) {
+  const [Comp, setComp] = useState<React.ComponentType<typeof props> | null>(null);
+  useEffect(() => {
+    void import('@/components/RespondVerificationModal').then((m) =>
+      setComp(() => m.RespondVerificationModal),
+    );
+  }, []);
+  return Comp ? <Comp {...props} /> : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,13 +1896,12 @@ function Composer({
       });
       await uploadAttachment({ roomId, blobId, encryptedBytes });
       uploaded = true;
-      const blob = await encryptBlob({
+      const blob = await megolmEncrypt({
         payload: header,
         roomId,
         roomKey,
-        senderUserId: userId,
-        senderDeviceId: device.deviceId,
-        senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
+        userId,
+        device,
       });
       const row = await insertBlob({
         roomId,
@@ -1622,13 +1927,12 @@ function Composer({
   async function sendText() {
     const trimmed = text.trim();
     if (!trimmed) return;
-    const blob = await encryptBlob({
+    const blob = await megolmEncrypt({
       payload: { text: trimmed, ts: Date.now() },
       roomId,
       roomKey,
-      senderUserId: userId,
-      senderDeviceId: device.deviceId,
-      senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
+      userId,
+      device,
     });
     const row = await insertBlob({
       roomId,

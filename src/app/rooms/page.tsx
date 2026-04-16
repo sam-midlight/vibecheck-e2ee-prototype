@@ -591,8 +591,10 @@ function InviteForm({
 
   // For each room, check whether it's already at capacity (only meaningful
   // for kind='pair' — groups have no cap in this prototype). A room counts
-  // as "full" if members + pending invites >= 2. We compute this client-side
-  // so the UX can disable the pair row before the server trigger rejects it.
+  // as "full" if it already has 2 distinct user_ids across members + pending
+  // invites — matching the DB trigger (0007) which dedupes by user_id. Since
+  // 0015 a single user has one row per device, so counting rows would flag a
+  // pair with one multi-device user as full.
   useEffect(() => {
     if (!userId || rooms.length === 0) {
       setFullness(new Map());
@@ -604,19 +606,25 @@ function InviteForm({
       const entries = await Promise.all(
         rooms.map(async (r): Promise<[string, boolean]> => {
           if (r.kind !== 'pair') return [r.id, false];
-          const [{ count: memberCount }, { count: inviteCount }] = await Promise.all([
+          const [members, invites] = await Promise.all([
             supabase
               .from('room_members')
-              .select('user_id', { count: 'exact', head: true })
+              .select('user_id')
               .eq('room_id', r.id)
               .eq('generation', r.current_generation),
             supabase
               .from('room_invites')
-              .select('id', { count: 'exact', head: true })
+              .select('invited_user_id')
               .eq('room_id', r.id),
           ]);
-          const total = (memberCount ?? 0) + (inviteCount ?? 0);
-          return [r.id, total >= 2];
+          const users = new Set<string>();
+          for (const row of (members.data ?? []) as { user_id: string }[]) {
+            users.add(row.user_id);
+          }
+          for (const row of (invites.data ?? []) as { invited_user_id: string }[]) {
+            users.add(row.invited_user_id);
+          }
+          return [r.id, users.size >= 2];
         }),
       );
       if (cancelled) return;

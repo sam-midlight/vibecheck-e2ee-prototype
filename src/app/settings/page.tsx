@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { AppShell } from '@/components/AppShell';
 import { PinSetupModal } from '@/components/PinSetupModal';
+import { PromoteDeviceModal } from '@/components/PromoteDeviceModal';
 import { RecoveryPhraseModal } from '@/components/RecoveryPhraseModal';
 import { errorMessage } from '@/lib/errors';
 import {
@@ -15,14 +16,19 @@ import {
   decryptDeviceDisplayName,
   fromBase64,
   getDeviceBundle,
+  getSelfSigningKey,
   getUserMasterKey,
+  getUserSigningKey,
   hasWrappedIdentity,
   publicIdentityFingerprint,
   putWrappedIdentity,
   signDeviceRevocation,
+  signDeviceRevocationV2,
   wrapDeviceStateWithPin,
   type DeviceKeyBundle,
+  type SelfSigningKey,
   type UserMasterKey,
+  type UserSigningKey,
 } from '@/lib/e2ee-core';
 import { useRouter } from 'next/navigation';
 import { getSupabase } from '@/lib/supabase/client';
@@ -47,6 +53,8 @@ function SettingsInner() {
   const [userId, setUserId] = useState<string | null>(null);
   const [device, setDevice] = useState<DeviceKeyBundle | null>(null);
   const [umk, setUmk] = useState<UserMasterKey | null>(null);
+  const [ssk, setSsk] = useState<SelfSigningKey | null>(null);
+  const [usk, setUsk] = useState<UserSigningKey | null>(null);
   const [hasPhrase, setHasPhrase] = useState<boolean | null>(null);
   const [pinEnabled, setPinEnabled] = useState<boolean | null>(null);
   const [myFingerprint, setMyFingerprint] = useState<string | null>(null);
@@ -54,6 +62,7 @@ function SettingsInner() {
   const [deviceLabels, setDeviceLabels] = useState<Map<string, string>>(() => new Map());
   const [showModal, setShowModal] = useState(false);
   const [showPinSetup, setShowPinSetup] = useState(false);
+  const [showPromote, setShowPromote] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -65,6 +74,8 @@ function SettingsInner() {
       setUserId(data.user.id);
       setDevice(await getDeviceBundle(data.user.id));
       setUmk(await getUserMasterKey(data.user.id));
+      setSsk(await getSelfSigningKey(data.user.id));
+      setUsk(await getUserSigningKey(data.user.id));
       setHasPhrase(await hasRecoveryBlob(data.user.id));
       setPinEnabled(await hasWrappedIdentity(data.user.id));
       // Compute own UMK-derived safety number for the "your number" strip.
@@ -115,8 +126,11 @@ function SettingsInner() {
     );
   }
 
+  // Can revoke if we hold SSK (preferred) or UMK (pre-cross-signing).
+  const canRevoke = !!(ssk || umk);
+
   async function handleRevokeDevice(targetDeviceId: string) {
-    if (!userId || !umk) return;
+    if (!userId || !canRevoke) return;
     if (device?.deviceId === targetDeviceId) {
       setError(
         'Cannot revoke the device you\u2019re currently using from itself. Revoke it from another of your devices.',
@@ -134,10 +148,15 @@ function SettingsInner() {
     setError(null);
     try {
       const revokedAtMs = Date.now();
-      const signature = await signDeviceRevocation(
-        { userId, deviceId: targetDeviceId, revokedAtMs },
-        umk.ed25519PrivateKey,
-      );
+      const signature = ssk
+        ? await signDeviceRevocationV2(
+            { userId, deviceId: targetDeviceId, revokedAtMs },
+            ssk.ed25519PrivateKey,
+          )
+        : await signDeviceRevocation(
+            { userId, deviceId: targetDeviceId, revokedAtMs },
+            umk!.ed25519PrivateKey,
+          );
       await revokeDevice({
         deviceId: targetDeviceId,
         revokedAtMs,
@@ -206,10 +225,13 @@ function SettingsInner() {
     setError(null);
     try {
       await clearDeviceBundle(userId);
-      // Also drop UMK priv from memory (if this device held it); unlock
-      // will re-materialize it from the wrapped blob using the passphrase.
-      const { clearUserMasterKey } = await import('@/lib/e2ee-core');
+      // Drop all signing key privs from plaintext IDB; unlock will
+      // re-materialize them from the wrapped blob using the passphrase.
+      const { clearUserMasterKey, clearSelfSigningKey, clearUserSigningKey } =
+        await import('@/lib/e2ee-core');
       await clearUserMasterKey(userId);
+      await clearSelfSigningKey(userId);
+      await clearUserSigningKey(userId);
       router.replace('/auth/callback');
     } catch (e) {
       setError(errorMessage(e));
@@ -250,12 +272,44 @@ function SettingsInner() {
         {hasPhrase === null ? (
           <p className="text-sm text-neutral-500">checking…</p>
         ) : !umk ? (
-          <p className="text-xs text-neutral-600 dark:text-neutral-400">
-            This device doesn&apos;t hold the User Master Key, so it can&apos;t
-            rotate it. Open the app on your primary device (the one that
-            created this account, or the one you last used to enter a recovery
-            phrase) and rotate from there.
-          </p>
+          <div className="space-y-2">
+            {ssk ? (
+              <p className="text-xs text-neutral-600 dark:text-neutral-400">
+                This device holds the Self-Signing Key (can approve devices
+                and revoke), but not the Master Signing Key. To rotate
+                the recovery phrase or the MSK itself, enter your 24-word
+                phrase below to promote to full primary.
+              </p>
+            ) : (
+              <p className="text-xs text-neutral-600 dark:text-neutral-400">
+                This device doesn&apos;t hold any signing keys — it was
+                linked from a pre-cross-signing primary that didn&apos;t
+                share them. Approve this device again from a co-primary,
+                or enter your recovery phrase below.
+              </p>
+            )}
+            {hasPhrase ? (
+              <>
+                <p className="text-xs text-neutral-600 dark:text-neutral-400">
+                  Enter your 24-word recovery phrase to promote this device
+                  to full primary (MSK + SSK + USK).
+                </p>
+                <button
+                  onClick={() => setShowPromote(true)}
+                  disabled={busy}
+                  className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+                >
+                  Promote with recovery phrase
+                </button>
+              </>
+            ) : (
+              <p className="text-xs text-neutral-600 dark:text-neutral-400">
+                No recovery phrase is set up either. Open the app on your
+                primary device (the one that created this account) to set
+                one up from there.
+              </p>
+            )}
+          </div>
         ) : (
           <div className="space-y-2">
             <p className="text-sm">
@@ -332,7 +386,7 @@ function SettingsInner() {
                       added {new Date(d.created_at).toLocaleDateString()}
                     </span>
                   </div>
-                  {!isSelf && !revoked && umk && (
+                  {!isSelf && !revoked && canRevoke && (
                     <button
                       onClick={() => void handleRevokeDevice(d.id)}
                       disabled={busy}
@@ -346,11 +400,10 @@ function SettingsInner() {
             })}
           </ul>
         )}
-        {!umk && (
+        {!canRevoke && (
           <p className="text-[11px] text-neutral-500">
-            Revoking requires the User Master Key. Open the app on your
-            primary device (or enter your recovery phrase) to revoke from
-            there.
+            Revoking requires the Self-Signing Key. Approve this device from
+            a co-primary, or enter your recovery phrase to promote it.
           </p>
         )}
       </section>
@@ -413,10 +466,27 @@ function SettingsInner() {
           onCancel={() => setShowPinSetup(false)}
           onSave={async (passphrase) => {
             if (!userId || !device) return;
-            const blob = await wrapDeviceStateWithPin(device, umk, passphrase, userId);
+            const blob = await wrapDeviceStateWithPin(device, umk, passphrase, userId, { ssk, usk });
             await putWrappedIdentity(userId, blob);
             setPinEnabled(true);
             setShowPinSetup(false);
+          }}
+        />
+      )}
+
+      {showPromote && (
+        <PromoteDeviceModal
+          userId={userId}
+          pinEnabled={pinEnabled ?? false}
+          onDone={async (result) => {
+            setShowPromote(false);
+            if (result === 'promoted') {
+              const { getUserMasterKey, getSelfSigningKey, getUserSigningKey } =
+                await import('@/lib/e2ee-core');
+              setUmk(await getUserMasterKey(userId));
+              setSsk(await getSelfSigningKey(userId));
+              setUsk(await getUserSigningKey(userId));
+            }
           }}
         />
       )}
@@ -432,9 +502,12 @@ function SettingsInner() {
             setShowModal(false);
             if (result === 'saved') {
               setHasPhrase(true);
-              // The rotation swapped the locally-held UMK; pick up the new one.
-              const { getUserMasterKey } = await import('@/lib/e2ee-core');
+              // The rotation swapped the locally-held keys; pick up the new ones.
+              const { getUserMasterKey, getSelfSigningKey, getUserSigningKey } =
+                await import('@/lib/e2ee-core');
               setUmk(await getUserMasterKey(userId));
+              setSsk(await getSelfSigningKey(userId));
+              setUsk(await getUserSigningKey(userId));
               if (typeof window !== 'undefined') {
                 localStorage.removeItem(`recovery_skipped_${userId}`);
               }

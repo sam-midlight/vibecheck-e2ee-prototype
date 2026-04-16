@@ -4,38 +4,66 @@
  * All byte sequences are Uint8Array in runtime code. Types that cross the
  * Supabase boundary are encoded to/from base64 at the edges (see `sodium.ts`).
  *
- * Identity model (v2, per-device):
- *   - UserMasterKey (UMK): a single Ed25519 keypair per user. Signs device
- *     certificates and revocations. Never signs messages or wraps keys
- *     directly. Private half lives on whichever device holds it (typically
- *     the account-creation device) and is transferable via recovery phrase.
+ * Identity model (v3, cross-signing — Matrix-aligned):
+ *   - MasterSigningKey (MSK): Ed25519. Signs SSK and USK cross-signatures
+ *     only. Stays cold on the original primary device + recovery blob.
+ *     Conceptually the same key as v2's UMK; the column stays.
+ *   - SelfSigningKey (SSK): Ed25519. Signs device issuance + revocation
+ *     certs. Present on every co-primary device (shared via sealed box
+ *     during device approval). Replaces UMK's day-to-day role.
+ *   - UserSigningKey (USK): Ed25519. Signs other users' MSK pubs after
+ *     SAS verification. Present on co-primaries alongside SSK.
  *   - DeviceKeyBundle: per-device Ed25519 (signing) + X25519 (DH) keypair.
  *     Generated locally on each device; private halves never leave the
  *     device. Signs blobs, wraps room keys, signs membership ops.
- *   - DeviceCertificate: UMK signature binding a device_id to its pubkeys.
- *     Required for any device to participate.
+ *   - DeviceCertificate: SSK signature (v2 certs) or UMK/MSK signature
+ *     (v1 certs) binding a device_id to its pubkeys.
+ *
+ * Backward compat: UserMasterKey is a type alias for MasterSigningKey.
+ *   v1 device certs (signed by UMK/MSK) still verify. v2 certs (signed
+ *   by SSK) verify via the MSK→SSK cross-sig chain.
  */
 
 export type Bytes = Uint8Array;
 
 // ---------------------------------------------------------------------------
-// Identity v2 — per-device
+// Cross-signing key hierarchy (Matrix-aligned)
 // ---------------------------------------------------------------------------
 
-/**
- * A user's root signing authority. The private half is rare and precious —
- * it lives on one device (the UMK-holder, typically the account creator)
- * plus any recovery-phrase-wrapped copy. Linked devices do NOT receive it.
- */
-export interface UserMasterKey {
+/** Master Signing Key — root of user identity. Signs SSK and USK only. */
+export interface MasterSigningKey {
   ed25519PublicKey: Bytes;
   ed25519PrivateKey: Bytes;
 }
 
-/** The public half of a UMK — canonical identity of a user on the server. */
-export interface PublicUserMasterKey {
+/** Public half of MSK — the canonical TOFU anchor (= identities.ed25519_pub). */
+export interface PublicMasterSigningKey {
   ed25519PublicKey: Bytes;
 }
+
+/** Self-Signing Key — signs own device issuance + revocation certs. */
+export interface SelfSigningKey {
+  ed25519PublicKey: Bytes;
+  ed25519PrivateKey: Bytes;
+}
+
+/** User-Signing Key — signs other users' MSK pubs (cross-user verification). */
+export interface UserSigningKey {
+  ed25519PublicKey: Bytes;
+  ed25519PrivateKey: Bytes;
+}
+
+/** SSK + USK bundle, present on co-primary devices. */
+export interface SigningKeySet {
+  ssk: SelfSigningKey;
+  usk: UserSigningKey;
+}
+
+// Backward-compat aliases — existing code uses these names everywhere.
+/** @alias MasterSigningKey */
+export type UserMasterKey = MasterSigningKey;
+/** @alias PublicMasterSigningKey */
+export type PublicUserMasterKey = PublicMasterSigningKey;
 
 /** A single device's long-term key bundle. Never copied between devices. */
 export interface DeviceKeyBundle {
@@ -46,23 +74,22 @@ export interface DeviceKeyBundle {
   x25519PrivateKey: Bytes;
 }
 
-/** Public halves of a device bundle + its UMK-issued certificate. */
+/** Public halves of a device bundle + its SSK/UMK-issued certificate. */
 export interface PublicDevice {
   deviceId: string;
   userId: string;
   ed25519PublicKey: Bytes;
   x25519PublicKey: Bytes;
   createdAtMs: number;
-  /** Ed25519 signature by UMK over canonical cert tuple. */
+  /** Ed25519 signature over canonical cert tuple (v1: by MSK, v2: by SSK). */
   issuanceSignature: Bytes;
   /** Present iff the device has been revoked. */
   revocation: DeviceRevocation | null;
 }
 
-/** UMK-signed revocation of a previously-issued device certificate. */
+/** Revocation of a previously-issued device certificate (v1: MSK-signed, v2: SSK-signed). */
 export interface DeviceRevocation {
   revokedAtMs: number;
-  /** Ed25519 signature by UMK over canonical revocation tuple. */
   signature: Bytes;
 }
 
@@ -128,6 +155,10 @@ export interface EncryptedBlob {
   ciphertext: Bytes;
   signature: Bytes;
   generation: number;
+  /** v4 (Megolm) — session_id as base64. Null for v3/v2/v1 flat-key blobs. */
+  sessionId?: string | null;
+  /** v4 (Megolm) — message index within the session. Null for v3/v2/v1. */
+  messageIndex?: number | null;
 }
 
 /**
@@ -142,6 +173,10 @@ export interface KnownContact {
   x25519PublicKey: Bytes;
   firstSeenAt: number;
   lastSeenAt: number;
+  /** True if we hold a valid cross-user-signature for this contact's MSK. */
+  verified?: boolean;
+  /** Timestamp of last successful SAS verification. */
+  verifiedAt?: number;
 }
 
 export interface KeyChangeEvent {

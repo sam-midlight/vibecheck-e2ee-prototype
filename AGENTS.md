@@ -14,28 +14,37 @@ Everything else — the Rooms UI, the status-check page, the magic-link form —
 
 ## 3. The critical architectural facts
 
-### v3 per-device identities (the current model)
+### Cross-signing key hierarchy (Matrix-aligned, current model)
 
-Each user has **three distinct key types** and mixing them up is the most common way to break this codebase:
+Each user has **five distinct key types**. Mixing them up is the most common way to break this codebase:
 
 | Concept | What it is | Who has the priv | What it signs / does |
 |---|---|---|---|
-| **UserMasterKey (UMK)** | One Ed25519 keypair per user | Only the primary device (or transiently a recovery-restored device) | Signs device issuance certs + revocation certs. Never encrypts messages. Never wraps room keys. |
+| **MasterSigningKey (MSK)** | One Ed25519 keypair per user | Recovery blob + original primary only. Stays cold. | Signs SSK and USK cross-signatures. Never signs device certs directly (that's SSK's job). `identities.ed25519_pub` is the MSK pub. |
+| **SelfSigningKey (SSK)** | One Ed25519 keypair per user | Every co-primary device (shared via sealed box during approval). | Signs device issuance certs (v2 domain) + revocation certs. Day-to-day operational key. |
+| **UserSigningKey (USK)** | One Ed25519 keypair per user | Every co-primary device (shared alongside SSK). | Signs other users' MSK pubs after SAS emoji verification. Stored in `cross_user_signatures`. |
 | **DeviceKeyBundle** | Ed25519 + X25519 per device | Each device, locally generated, never copied | Ed signs blobs + membership-op rows. X receives sealed room-key wraps. |
-| **DeviceCertificate** | UMK signature over `(user_id, device_id, device_ed_pub, device_x_pub, created_at_ms)` | Stored in `devices` table | Proves this device belongs to this user; verifier chains back to UMK. |
+| **DeviceCertificate** | SSK signature (v2) or MSK signature (v1, legacy) over `(user_id, device_id, device_ed_pub, device_x_pub, created_at_ms)` | Stored in `devices` table | Proves this device belongs to this user; verifier chains: device cert ← SSK ← MSK cross-sig ← MSK (TOFU anchor). |
+
+**Backward compat:** `UserMasterKey` is a type alias for `MasterSigningKey`. v1 device certs (signed by MSK directly) still verify via fallback. `identities.ed25519_pub` is unchanged (= MSK pub = old UMK pub). No TOFU break.
+
+**Megolm ratchet:** Room messages use per-sender Megolm sessions (v4 blob envelope) with HMAC-SHA256 chain keys. Forward secrecy within a generation. Sessions auto-rotate at 100 messages or 7 days. Server hard-caps at 200 messages. Pre-Megolm rooms transition lazily on next generation bump.
+
+**SAS verification:** Interactive emoji-based identity verification between two users. 7 emoji from ephemeral ECDH + HKDF. On success, USK cross-signs peer's MSK pub. Verified contacts get escalated key-change alerts.
 
 **Rules of thumb that must never be violated:**
 
-- Never re-introduce "seal the root identity to a linking pubkey" — that was the v1/v2 device-approval flow and its exfil-the-root footgun is why we went per-device. B-side approval in v3 generates its OWN bundle locally; A signs B's cert; no private keys cross the network.
-- Blob signatures are by **device ed25519**, not UMK. Verifiers resolve sender via `{sender_user_id, sender_device_id}` in the v3 envelope, then chain the device's cert to the user's UMK.
+- **MSK never travels.** SSK+USK are sealed to the new device's X25519 pub during approval (via `devices.signing_key_wrap`). MSK lives only in the recovery blob and on the original primary. Do NOT re-introduce MSK transport.
+- Blob signatures are by **device ed25519**, not MSK or SSK. Verifiers resolve sender via `{sender_user_id, sender_device_id}` in the v3/v4 envelope, then chain the device's cert through SSK → MSK.
 - Membership ops (`room_invites`, `room_members`) carry `inviter_device_id` / `signer_device_id` + signatures. Service-role row injection must fail these; clients reject unsigned rows.
 - Room keys wrap per-**device**, not per-user. `room_members` PK is `(room_id, device_id, generation)`.
+- **Megolm sessions are per-sender.** Each sender has an independent outbound session. Compromising one sender's chain key does not reveal other senders' messages.
 
 ### Enforced invariants (don't regress)
 
 - **PIN-lock is mandatory, not opt-in.** `auth/callback/page.tsx` has a `require-pin-setup` gate between "ready to navigate" and actual navigation. Any new auth flow must also pass through it.
 - **Rotation is atomic via `kick_and_rotate` RPC.** Client orchestration of delete → insert → bump was the old model and was replaced because it left zombie states on partial failure. New membership-change logic goes into the RPC, not into a series of client calls.
-- **UMK rotation cascades to room rotation.** After `rotateUserMasterKey` we call `rotateAllRoomsIAdmin` so a ghost device can't retain room access. If you add a new "change my keys" flow, it must include the cascade.
+- **MSK rotation cascades to room rotation.** After `rotateUserMasterKey` we call `rotateAllRoomsIAdmin` so a ghost device can't retain room access. MSK rotation also generates fresh SSK+USK+cross-sigs. If you add a new "change my keys" flow, it must include the cascade.
 - **Retention window is 10 generations.** `kick_and_rotate`'s FS purge clause is `generation < new_gen - 9`. Widening or narrowing is a security trade-off; document and discuss before changing.
 - **`devices_read_all` must stay public.** Peers need to read each other's device_pubs to wrap room keys. The write policies stay owner-only.
 
@@ -53,7 +62,7 @@ Each user has **three distinct key types** and mixing them up is the most common
 - `supabase/migrations/0001..latest` — apply linearly to a fresh Postgres+Supabase project
 - `supabase/functions/livekit-token/` — Deno edge function that mints 5-min LiveKit JWTs. Required for video calls.
 - `public/livekit-e2ee-worker.mjs` — prebuilt LiveKit E2EE worker, kept in sync by `scripts/sync-livekit-worker.mjs`. Required for video calls under Turbopack.
-- `src/components/AppShell.tsx`, `PinSetupModal.tsx`, `RecoveryPhraseModal.tsx`, `RecoveryPhraseEntry.tsx`, `PendingApprovalBanner.tsx`, `KeyChangeBanner.tsx` — stateful UI that encapsulates security invariants (mandatory PIN gate, UMK-rotation cascade, ghost-session boot). Copy as starting point; changing the security semantics inside is risky.
+- `src/components/AppShell.tsx`, `PinSetupModal.tsx`, `RecoveryPhraseModal.tsx`, `RecoveryPhraseEntry.tsx`, `PendingApprovalBanner.tsx`, `KeyChangeBanner.tsx`, `PromoteDeviceModal.tsx`, `VerifyContactModal.tsx` — stateful UI that encapsulates security invariants (mandatory PIN gate, MSK-rotation cascade, ghost-session boot, SSK secret sharing, SAS emoji verification). Copy as starting point; changing the security semantics inside is risky.
 
 **Reference UX (feel free to rewrite in the consuming app's design system):**
 - `src/app/page.tsx` (magic-link landing)

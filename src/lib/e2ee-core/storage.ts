@@ -20,12 +20,19 @@
  */
 
 import { openDB, type IDBPDatabase } from 'idb';
-import type { DeviceKeyBundle, KnownContact, UserMasterKey } from './types';
+import type {
+  DeviceKeyBundle,
+  KnownContact,
+  SelfSigningKey,
+  UserMasterKey,
+  UserSigningKey,
+} from './types';
+import type { OutboundMegolmSession, InboundSessionSnapshot } from './megolm';
 import type { PinWrappedIdentity } from './pin-lock';
 
 const DB_NAME = 'e2ee-core';
-// v4: adds backupKey store for server-side room-key backup.
-const DB_VERSION = 4;
+// v6: adds outboundSessions + inboundSessions stores (Megolm).
+const DB_VERSION = 6;
 
 const STORE_DEVICE_BUNDLE = 'deviceBundle';
 const STORE_USER_MASTER_KEY = 'userMasterKey';
@@ -33,8 +40,36 @@ const STORE_DEVICE = 'device';
 const STORE_KNOWN_CONTACTS = 'knownContacts';
 const STORE_WRAPPED_IDENTITY = 'wrappedIdentity';
 const STORE_BACKUP_KEY = 'backupKey';
+const STORE_SELF_SIGNING_KEY = 'selfSigningKey';
+const STORE_USER_SIGNING_KEY = 'userSigningKey';
+const STORE_OUTBOUND_SESSIONS = 'outboundSessions';
+const STORE_INBOUND_SESSIONS = 'inboundSessions';
 // Legacy (v1/v2) store name, still recognized so we can delete it on upgrade.
 const LEGACY_STORE_IDENTITY = 'identity';
+
+interface SelfSigningKeyRow {
+  userId: string;
+  ssk: SelfSigningKey;
+  createdAt: number;
+}
+
+interface UserSigningKeyRow {
+  userId: string;
+  usk: UserSigningKey;
+  createdAt: number;
+}
+
+/** Keyed by `${roomId}:${deviceId}` — one outbound session per room per device. */
+interface OutboundSessionRow {
+  key: string; // `${roomId}:${deviceId}`
+  session: OutboundMegolmSession;
+}
+
+/** Keyed by `${sessionId_base64}:${senderDeviceId}` — inbound session per sender. */
+interface InboundSessionRow {
+  key: string;
+  snapshot: InboundSessionSnapshot;
+}
 
 interface BackupKeyRow {
   userId: string;
@@ -100,6 +135,18 @@ function getDb(): Promise<IDBPDatabase> {
         }
         if (!db.objectStoreNames.contains(STORE_BACKUP_KEY)) {
           db.createObjectStore(STORE_BACKUP_KEY, { keyPath: 'userId' });
+        }
+        if (!db.objectStoreNames.contains(STORE_SELF_SIGNING_KEY)) {
+          db.createObjectStore(STORE_SELF_SIGNING_KEY, { keyPath: 'userId' });
+        }
+        if (!db.objectStoreNames.contains(STORE_USER_SIGNING_KEY)) {
+          db.createObjectStore(STORE_USER_SIGNING_KEY, { keyPath: 'userId' });
+        }
+        if (!db.objectStoreNames.contains(STORE_OUTBOUND_SESSIONS)) {
+          db.createObjectStore(STORE_OUTBOUND_SESSIONS, { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains(STORE_INBOUND_SESSIONS)) {
+          db.createObjectStore(STORE_INBOUND_SESSIONS, { keyPath: 'key' });
         }
       },
     });
@@ -288,6 +335,10 @@ export async function wipeAll(): Promise<void> {
     db.clear(STORE_KNOWN_CONTACTS),
     db.clear(STORE_WRAPPED_IDENTITY),
     db.clear(STORE_BACKUP_KEY),
+    db.clear(STORE_SELF_SIGNING_KEY),
+    db.clear(STORE_USER_SIGNING_KEY),
+    db.clear(STORE_OUTBOUND_SESSIONS),
+    db.clear(STORE_INBOUND_SESSIONS),
   ]);
 }
 
@@ -317,6 +368,132 @@ export async function getBackupKey(
 export async function clearBackupKey(userId: string): Promise<void> {
   const db = await getDb();
   await db.delete(STORE_BACKUP_KEY, userId);
+}
+
+// ---------------------------------------------------------------------------
+// Self-Signing Key (co-primary devices; signs device certs)
+// ---------------------------------------------------------------------------
+
+export async function putSelfSigningKey(
+  userId: string,
+  ssk: SelfSigningKey,
+): Promise<void> {
+  const db = await getDb();
+  const row: SelfSigningKeyRow = { userId, ssk, createdAt: Date.now() };
+  await db.put(STORE_SELF_SIGNING_KEY, row);
+}
+
+export async function getSelfSigningKey(
+  userId: string,
+): Promise<SelfSigningKey | null> {
+  const db = await getDb();
+  const row = (await db.get(STORE_SELF_SIGNING_KEY, userId)) as
+    | SelfSigningKeyRow
+    | undefined;
+  return row?.ssk ?? null;
+}
+
+export async function clearSelfSigningKey(userId: string): Promise<void> {
+  const db = await getDb();
+  await db.delete(STORE_SELF_SIGNING_KEY, userId);
+}
+
+// ---------------------------------------------------------------------------
+// User-Signing Key (co-primary devices; signs other users' MSK pubs)
+// ---------------------------------------------------------------------------
+
+export async function putUserSigningKey(
+  userId: string,
+  usk: UserSigningKey,
+): Promise<void> {
+  const db = await getDb();
+  const row: UserSigningKeyRow = { userId, usk, createdAt: Date.now() };
+  await db.put(STORE_USER_SIGNING_KEY, row);
+}
+
+export async function getUserSigningKey(
+  userId: string,
+): Promise<UserSigningKey | null> {
+  const db = await getDb();
+  const row = (await db.get(STORE_USER_SIGNING_KEY, userId)) as
+    | UserSigningKeyRow
+    | undefined;
+  return row?.usk ?? null;
+}
+
+export async function clearUserSigningKey(userId: string): Promise<void> {
+  const db = await getDb();
+  await db.delete(STORE_USER_SIGNING_KEY, userId);
+}
+
+// ---------------------------------------------------------------------------
+// Megolm outbound sessions (one per room per device)
+// ---------------------------------------------------------------------------
+
+function outboundKey(roomId: string, deviceId: string): string {
+  return `${roomId}:${deviceId}`;
+}
+
+export async function putOutboundSession(
+  roomId: string,
+  deviceId: string,
+  session: OutboundMegolmSession,
+): Promise<void> {
+  const db = await getDb();
+  const row: OutboundSessionRow = { key: outboundKey(roomId, deviceId), session };
+  await db.put(STORE_OUTBOUND_SESSIONS, row);
+}
+
+export async function getOutboundSession(
+  roomId: string,
+  deviceId: string,
+): Promise<OutboundMegolmSession | null> {
+  const db = await getDb();
+  const row = (await db.get(STORE_OUTBOUND_SESSIONS, outboundKey(roomId, deviceId))) as
+    | OutboundSessionRow
+    | undefined;
+  return row?.session ?? null;
+}
+
+export async function clearOutboundSession(
+  roomId: string,
+  deviceId: string,
+): Promise<void> {
+  const db = await getDb();
+  await db.delete(STORE_OUTBOUND_SESSIONS, outboundKey(roomId, deviceId));
+}
+
+// ---------------------------------------------------------------------------
+// Megolm inbound sessions (one per sender-device per session)
+// ---------------------------------------------------------------------------
+
+function inboundKey(sessionIdBase64: string, senderDeviceId: string): string {
+  return `${sessionIdBase64}:${senderDeviceId}`;
+}
+
+export async function putInboundSession(
+  sessionIdBase64: string,
+  senderDeviceId: string,
+  snapshot: InboundSessionSnapshot,
+): Promise<void> {
+  const db = await getDb();
+  const row: InboundSessionRow = {
+    key: inboundKey(sessionIdBase64, senderDeviceId),
+    snapshot,
+  };
+  await db.put(STORE_INBOUND_SESSIONS, row);
+}
+
+export async function getInboundSession(
+  sessionIdBase64: string,
+  senderDeviceId: string,
+): Promise<InboundSessionSnapshot | null> {
+  const db = await getDb();
+  const row = (await db.get(
+    STORE_INBOUND_SESSIONS,
+    inboundKey(sessionIdBase64, senderDeviceId),
+  )) as InboundSessionRow | undefined;
+  return row?.snapshot ?? null;
 }
 
 // ---------------------------------------------------------------------------

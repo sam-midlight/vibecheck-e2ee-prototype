@@ -27,7 +27,7 @@ const ATTACHMENTS_BUCKET = 'room-attachments';
 
 export interface IdentityRow {
   user_id: string;
-  /** User Master Key (UMK) Ed25519 pub. Only signs device certs + revocations. */
+  /** Master Signing Key (MSK) Ed25519 pub. Root of trust / TOFU anchor. */
   ed25519_pub: string;
   /** LEGACY (pre-0015). Null going forward. */
   x25519_pub: string | null;
@@ -35,6 +35,14 @@ export interface IdentityRow {
   self_signature: string | null;
   identity_epoch: number;
   created_at: string;
+  /** Self-Signing Key pub (0025+). Signs device certs. Cross-signed by MSK. */
+  ssk_pub: string | null;
+  /** MSK signature over (domain || msk_pub || ssk_pub). */
+  ssk_cross_signature: string | null;
+  /** User-Signing Key pub (0025+). Signs other users' MSK pubs. Cross-signed by MSK. */
+  usk_pub: string | null;
+  /** MSK signature over (domain || msk_pub || usk_pub). */
+  usk_cross_signature: string | null;
 }
 
 export interface DeviceRow {
@@ -52,6 +60,8 @@ export interface DeviceRow {
   revocation_signature: string | null;
   /** Sealed backup key for this device, written by the approving device. */
   backup_key_wrap: string | null;
+  /** Sealed SSK+USK privs for this device, written by the approving device (0026+). */
+  signing_key_wrap: string | null;
   created_at: string;
   last_seen_at: string;
 }
@@ -128,41 +138,72 @@ export interface BlobRow {
   ciphertext: string;
   signature: string | null;
   created_at: string;
+  /** v4 (Megolm): base64 session_id. Null for v3/v2/v1 flat-key blobs. */
+  session_id: string | null;
+  /** v4 (Megolm): message index within the session. Null for v3/v2/v1. */
+  message_index: number | null;
 }
 
 // ---------------------------------------------------------------------------
 // identities
 // ---------------------------------------------------------------------------
 
-/** Publish this user's UMK pub (upsert). */
+/** Publish this user's identity keys (upsert). SSK/USK fields are optional for backward compat. */
 export async function publishUserMasterKey(
   userId: string,
   umkPub: PublicUserMasterKey,
+  crossSigning?: {
+    sskPub: Bytes;
+    sskCrossSignature: Bytes;
+    uskPub: Bytes;
+    uskCrossSignature: Bytes;
+  },
 ): Promise<void> {
   const supabase = getSupabase();
-  const row = {
+  const row: Record<string, unknown> = {
     user_id: userId,
     ed25519_pub: await toBase64(umkPub.ed25519PublicKey),
     x25519_pub: null,
     self_signature: null,
   };
+  if (crossSigning) {
+    row.ssk_pub = await toBase64(crossSigning.sskPub);
+    row.ssk_cross_signature = await toBase64(crossSigning.sskCrossSignature);
+    row.usk_pub = await toBase64(crossSigning.uskPub);
+    row.usk_cross_signature = await toBase64(crossSigning.uskCrossSignature);
+  }
   const { error } = await supabase.from('identities').upsert(row);
   if (error) throw error;
 }
 
-/** Fetch a user's UMK pub. Returns null if the user has no identity row. */
+/** Published identity keys — MSK pub + optional SSK/USK pubs with cross-sigs. */
+export interface PublicIdentityKeys extends PublicUserMasterKey {
+  sskPub?: Bytes;
+  sskCrossSignature?: Bytes;
+  uskPub?: Bytes;
+  uskCrossSignature?: Bytes;
+}
+
+/** Fetch a user's published identity keys. Returns null if no identity row. */
 export async function fetchUserMasterKeyPub(
   userId: string,
-): Promise<PublicUserMasterKey | null> {
+): Promise<PublicIdentityKeys | null> {
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from('identities')
-    .select('ed25519_pub')
+    .select('ed25519_pub, ssk_pub, ssk_cross_signature, usk_pub, usk_cross_signature')
     .eq('user_id', userId)
-    .maybeSingle<Pick<IdentityRow, 'ed25519_pub'>>();
+    .maybeSingle<Pick<IdentityRow, 'ed25519_pub' | 'ssk_pub' | 'ssk_cross_signature' | 'usk_pub' | 'usk_cross_signature'>>();
   if (error) throw error;
   if (!data) return null;
-  return { ed25519PublicKey: await fromBase64(data.ed25519_pub) };
+  const result: PublicIdentityKeys = {
+    ed25519PublicKey: await fromBase64(data.ed25519_pub),
+  };
+  if (data.ssk_pub) result.sskPub = await fromBase64(data.ssk_pub);
+  if (data.ssk_cross_signature) result.sskCrossSignature = await fromBase64(data.ssk_cross_signature);
+  if (data.usk_pub) result.uskPub = await fromBase64(data.usk_pub);
+  if (data.usk_cross_signature) result.uskCrossSignature = await fromBase64(data.usk_cross_signature);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +756,8 @@ export async function insertBlob(params: {
       params.blob.signature && params.blob.signature.byteLength > 0
         ? await toBase64(params.blob.signature)
         : null,
+    session_id: params.blob.sessionId ?? null,
+    message_index: params.blob.messageIndex ?? null,
   };
   if (params.id) row.id = params.id;
   const { data, error } = await supabase
@@ -779,7 +822,239 @@ export async function decodeBlobRow(row: BlobRow): Promise<EncryptedBlob> {
     ciphertext: await fromBase64(row.ciphertext),
     signature: row.signature ? await fromBase64(row.signature) : new Uint8Array(0),
     generation: row.generation,
+    sessionId: row.session_id ?? null,
+    messageIndex: row.message_index ?? null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Megolm sessions + shares
+// ---------------------------------------------------------------------------
+
+export async function insertMegolmSession(params: {
+  roomId: string;
+  senderUserId: string;
+  senderDeviceId: string;
+  sessionId: string;
+  generation: number;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.from('megolm_sessions').insert({
+    room_id: params.roomId,
+    sender_user_id: params.senderUserId,
+    sender_device_id: params.senderDeviceId,
+    session_id: params.sessionId,
+    generation: params.generation,
+  });
+  if (error) throw error;
+}
+
+export async function insertMegolmSessionShare(params: {
+  sessionId: string;
+  recipientDeviceId: string;
+  sealedSnapshot: string;
+  startIndex: number;
+  signerDeviceId: string;
+  shareSignature: string;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.from('megolm_session_shares').upsert({
+    session_id: params.sessionId,
+    recipient_device_id: params.recipientDeviceId,
+    sealed_snapshot: params.sealedSnapshot,
+    start_index: params.startIndex,
+    signer_device_id: params.signerDeviceId,
+    share_signature: params.shareSignature,
+  });
+  if (error) throw error;
+}
+
+export interface MegolmSessionShareRow {
+  session_id: string;
+  recipient_device_id: string;
+  sealed_snapshot: string;
+  start_index: number;
+  signer_device_id: string;
+  share_signature: string;
+  created_at: string;
+}
+
+/** Fetch all Megolm session shares addressed to a specific device for a room. */
+export async function listMegolmSharesForDevice(params: {
+  roomId: string;
+  recipientDeviceId: string;
+}): Promise<MegolmSessionShareRow[]> {
+  const supabase = getSupabase();
+  // We need to join through megolm_sessions to filter by room_id,
+  // but session_shares doesn't carry room_id directly. Query sessions
+  // for this room first, then fetch shares for those session_ids.
+  const { data: sessions, error: sessErr } = await supabase
+    .from('megolm_sessions')
+    .select('session_id')
+    .eq('room_id', params.roomId);
+  if (sessErr) throw sessErr;
+  if (!sessions || sessions.length === 0) return [];
+  const sessionIds = sessions.map((s) => s.session_id);
+  const { data, error } = await supabase
+    .from('megolm_session_shares')
+    .select('*')
+    .in('session_id', sessionIds)
+    .eq('recipient_device_id', params.recipientDeviceId);
+  if (error) throw error;
+  return (data ?? []) as MegolmSessionShareRow[];
+}
+
+// ---------------------------------------------------------------------------
+// SAS verification sessions + cross-user signatures
+// ---------------------------------------------------------------------------
+
+export interface SasVerificationSessionRow {
+  id: string;
+  initiator_user_id: string;
+  responder_user_id: string;
+  initiator_device_id: string;
+  responder_device_id: string | null;
+  state: 'initiated' | 'key_exchanged' | 'sas_compared' | 'completed' | 'cancelled';
+  initiator_commitment: string | null;
+  initiator_ephemeral_pub: string | null;
+  responder_ephemeral_pub: string | null;
+  initiator_mac: string | null;
+  responder_mac: string | null;
+  created_at: string;
+  expires_at: string;
+}
+
+export async function createSasSession(params: {
+  initiatorUserId: string;
+  responderUserId: string;
+  initiatorDeviceId: string;
+  commitment: string;
+}): Promise<SasVerificationSessionRow> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('sas_verification_sessions')
+    .insert({
+      initiator_user_id: params.initiatorUserId,
+      responder_user_id: params.responderUserId,
+      initiator_device_id: params.initiatorDeviceId,
+      initiator_commitment: params.commitment,
+      state: 'initiated',
+    })
+    .select()
+    .single<SasVerificationSessionRow>();
+  if (error) throw error;
+  return data;
+}
+
+export async function updateSasSession(
+  id: string,
+  updates: Partial<Pick<SasVerificationSessionRow,
+    'state' | 'responder_device_id' | 'responder_ephemeral_pub' |
+    'initiator_ephemeral_pub' | 'initiator_mac' | 'responder_mac'
+  >>,
+): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from('sas_verification_sessions')
+    .update(updates)
+    .eq('id', id);
+  if (error) throw error;
+}
+
+export async function getSasSession(
+  id: string,
+): Promise<SasVerificationSessionRow | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('sas_verification_sessions')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle<SasVerificationSessionRow>();
+  if (error) throw error;
+  return data;
+}
+
+export async function listPendingSasSessions(
+  userId: string,
+): Promise<SasVerificationSessionRow[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('sas_verification_sessions')
+    .select('*')
+    .eq('responder_user_id', userId)
+    .eq('state', 'initiated')
+    .gt('expires_at', new Date().toISOString());
+  if (error) throw error;
+  return (data ?? []) as SasVerificationSessionRow[];
+}
+
+export function subscribeSasSessions(
+  userId: string,
+  onRow: (row: SasVerificationSessionRow) => void,
+): () => void {
+  const supabase = getSupabase();
+  const channel = supabase
+    .channel(`sas:${userId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'sas_verification_sessions',
+        filter: `responder_user_id=eq.${userId}`,
+      },
+      (payload) => onRow(payload.new as SasVerificationSessionRow),
+    )
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'sas_verification_sessions',
+        filter: `initiator_user_id=eq.${userId}`,
+      },
+      (payload) => onRow(payload.new as SasVerificationSessionRow),
+    )
+    .subscribe();
+  return () => {
+    void supabase.removeChannel(channel);
+  };
+}
+
+export interface CrossUserSignatureRow {
+  signer_user_id: string;
+  signed_user_id: string;
+  signature: string;
+  signed_at: string;
+}
+
+export async function insertCrossUserSignature(params: {
+  signerUserId: string;
+  signedUserId: string;
+  signature: string;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.from('cross_user_signatures').upsert({
+    signer_user_id: params.signerUserId,
+    signed_user_id: params.signedUserId,
+    signature: params.signature,
+  });
+  if (error) throw error;
+}
+
+export async function getCrossUserSignature(
+  signerUserId: string,
+  signedUserId: string,
+): Promise<CrossUserSignatureRow | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('cross_user_signatures')
+    .select('*')
+    .eq('signer_user_id', signerUserId)
+    .eq('signed_user_id', signedUserId)
+    .maybeSingle<CrossUserSignatureRow>();
+  if (error) throw error;
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,17 +1354,30 @@ export async function upsertKeyBackup(params: {
   userId: string;
   roomId: string;
   generation: number;
-  ciphertext: Bytes;
-  nonce: Bytes;
+  ciphertext: Bytes | string;
+  nonce: Bytes | string;
+  /** Megolm session_id (base64). Null for flat-key backups. */
+  sessionId?: string | null;
+  /** Megolm start_index. Null for flat-key backups. */
+  startIndex?: number | null;
 }): Promise<void> {
   const supabase = getSupabase();
-  const { error } = await supabase.from('key_backup').upsert({
+  const ct = typeof params.ciphertext === 'string'
+    ? params.ciphertext
+    : await toBase64(params.ciphertext);
+  const nc = typeof params.nonce === 'string'
+    ? params.nonce
+    : await toBase64(params.nonce);
+  const row: Record<string, unknown> = {
     user_id: params.userId,
     room_id: params.roomId,
     generation: params.generation,
-    ciphertext: await toBase64(params.ciphertext),
-    nonce: await toBase64(params.nonce),
-  });
+    ciphertext: ct,
+    nonce: nc,
+  };
+  if (params.sessionId != null) row.session_id = params.sessionId;
+  if (params.startIndex != null) row.start_index = params.startIndex;
+  const { error } = await supabase.from('key_backup').upsert(row);
   if (error) throw error;
 }
 

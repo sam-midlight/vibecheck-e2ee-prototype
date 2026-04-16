@@ -57,4 +57,7 @@ export * from './attachment';
 export * from './membership';
 export * from './pin-lock';
 export * from './device';
+export * from './cross-signing';
+export * from './megolm';
+export * from './sas';
 export * from './call';

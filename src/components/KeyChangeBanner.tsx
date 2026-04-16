@@ -1,7 +1,13 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { onKeyChange, acceptKeyChange, type KeyChangeEvent } from '@/lib/e2ee-core';
+import {
+  onKeyChange,
+  onVerificationBreak,
+  acceptKeyChange,
+  type KeyChangeEvent,
+  type VerificationBreakEvent,
+} from '@/lib/e2ee-core';
 import { getSupabase } from '@/lib/supabase/client';
 import { fetchPublicDevices, fetchUserMasterKeyPub } from '@/lib/supabase/queries';
 
@@ -12,6 +18,7 @@ import { fetchPublicDevices, fetchUserMasterKeyPub } from '@/lib/supabase/querie
  */
 export function KeyChangeBanner() {
   const [events, setEvents] = useState<KeyChangeEvent[]>([]);
+  const [breakEvents, setBreakEvents] = useState<VerificationBreakEvent[]>([]);
   const selfUidRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -50,7 +57,18 @@ export function KeyChangeBanner() {
     return unsub;
   }, []);
 
-  if (events.length === 0) return null;
+  useEffect(() => {
+    const unsub = onVerificationBreak((event) => {
+      // Don't also show the amber banner for the same event
+      setEvents((prev) => prev.filter((e) => e.userId !== event.userId));
+      setBreakEvents((prev) =>
+        prev.length >= 50 ? [...prev.slice(-49), event] : [...prev, event],
+      );
+    });
+    return unsub;
+  }, []);
+
+  if (events.length === 0 && breakEvents.length === 0) return null;
 
   async function trust(e: KeyChangeEvent) {
     const umk = await fetchUserMasterKeyPub(e.userId);
@@ -72,13 +90,48 @@ export function KeyChangeBanner() {
 
   return (
     <div className="space-y-2">
+      {breakEvents.map((event, i) => (
+        <div
+          key={`break-${i}`}
+          className="rounded-md border border-red-400 bg-red-50 p-3 text-sm dark:border-red-800 dark:bg-red-950"
+        >
+          <p>
+            <strong className="text-red-800 dark:text-red-200">
+              Security alert: verified contact&apos;s identity changed
+            </strong>
+            {' '}for user{' '}
+            <code className="font-mono text-xs">{event.userId}</code>. You
+            previously verified this person via emoji comparison. Their
+            encryption keys have changed — this could mean they reset their
+            account, OR someone is impersonating them. <strong>Do not send
+            sensitive messages until you re-verify.</strong>
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              onClick={() => {
+                void trust(event);
+                setBreakEvents((prev) => prev.filter((x) => x !== event));
+              }}
+              className="rounded bg-red-700 px-2 py-1 text-xs text-white"
+            >
+              trust + re-verify later
+            </button>
+            <button
+              onClick={() => setBreakEvents((prev) => prev.filter((x) => x !== event))}
+              className="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
+            >
+              dismiss
+            </button>
+          </div>
+        </div>
+      ))}
       {events.map((event, i) => (
         <div
-          key={i}
+          key={`change-${i}`}
           className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950"
         >
           <p>
-            <strong>⚠ Encryption key changed</strong> for user{' '}
+            <strong>Encryption key changed</strong> for user{' '}
             <code className="font-mono text-xs">{event.userId}</code>. This
             usually means they reinstalled or reset their account. If you
             weren&apos;t expecting this, confirm with them through another

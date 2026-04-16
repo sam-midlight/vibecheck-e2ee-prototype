@@ -24,18 +24,22 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  concatBytes,
   fromBase64,
   getBackupKey,
   getDeviceBundle,
+  getSelfSigningKey,
   getSodium,
   getUserMasterKey,
+  getUserSigningKey,
   hashApprovalCode,
-  signDeviceIssuance,
+  signDeviceIssuanceV2,
   signMembershipWrap,
   toBase64,
   unwrapRoomKey,
   wrapRoomKeyFor,
   type Bytes,
+  type SelfSigningKey,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
 import { errorMessage } from '@/lib/errors';
@@ -55,6 +59,7 @@ import {
 export function PendingApprovalBanner() {
   const [userId, setUserId] = useState<string | null>(null);
   const [umk, setUmk] = useState<UserMasterKey | null>(null);
+  const [ssk, setSsk] = useState<SelfSigningKey | null>(null);
   const [requests, setRequests] = useState<DeviceApprovalRequestRow[]>([]);
 
   useEffect(() => {
@@ -66,6 +71,8 @@ export function PendingApprovalBanner() {
       setUserId(data.user.id);
       const k = await getUserMasterKey(data.user.id);
       if (!cancelled && k) setUmk(k);
+      const s = await getSelfSigningKey(data.user.id);
+      if (!cancelled && s) setSsk(s);
     })();
     return () => {
       cancelled = true;
@@ -83,8 +90,11 @@ export function PendingApprovalBanner() {
     setRequests((prev) => prev.filter((r) => r.id !== id));
   }, []);
 
+  // Can approve if we hold SSK (cross-signing) or UMK (pre-cross-signing).
+  const canSign = !!(ssk || umk);
+
   useEffect(() => {
-    if (!userId || !umk) return;
+    if (!userId || !canSign) return;
     let cancelled = false;
     (async () => {
       try {
@@ -100,9 +110,9 @@ export function PendingApprovalBanner() {
       cancelled = true;
       unsub();
     };
-  }, [userId, umk, addRequest]);
+  }, [userId, canSign, addRequest]);
 
-  if (!umk || requests.length === 0) return null;
+  if (!canSign || requests.length === 0) return null;
 
   return (
     <div className="space-y-2">
@@ -111,6 +121,7 @@ export function PendingApprovalBanner() {
           key={req.id}
           request={req}
           umk={umk}
+          ssk={ssk}
           onResolved={() => dropRequest(req.id)}
         />
       ))}
@@ -121,10 +132,12 @@ export function PendingApprovalBanner() {
 function ApprovalCard({
   request,
   umk,
+  ssk,
   onResolved,
 }: {
   request: DeviceApprovalRequestRow;
-  umk: UserMasterKey;
+  umk: UserMasterKey | null;
+  ssk: SelfSigningKey | null;
   onResolved: () => void;
 }) {
   const [code, setCode] = useState('');
@@ -167,16 +180,35 @@ function ApprovalCard({
       }
 
       // Sign an issuance cert for B's device bundle.
-      const issuanceSig = await signDeviceIssuance(
-        {
-          userId: request.user_id,
-          deviceId: request.device_id,
-          deviceEd25519PublicKey: devEdPub,
-          deviceX25519PublicKey: devXPub,
-          createdAtMs: request.created_at_ms,
-        },
-        umk.ed25519PrivateKey,
-      );
+      // Prefer SSK (v2 cert) if available; fall back to UMK/MSK (v1 cert).
+      const signingKey = ssk?.ed25519PrivateKey ?? umk?.ed25519PrivateKey;
+      if (!signingKey) {
+        throw new Error('no signing key available (need SSK or UMK)');
+      }
+      const issuanceSig = ssk
+        ? await signDeviceIssuanceV2(
+            {
+              userId: request.user_id,
+              deviceId: request.device_id,
+              deviceEd25519PublicKey: devEdPub,
+              deviceX25519PublicKey: devXPub,
+              createdAtMs: request.created_at_ms,
+            },
+            ssk.ed25519PrivateKey,
+          )
+        : await (async () => {
+            const { signDeviceIssuance } = await import('@/lib/e2ee-core');
+            return signDeviceIssuance(
+              {
+                userId: request.user_id,
+                deviceId: request.device_id!,
+                deviceEd25519PublicKey: devEdPub,
+                deviceX25519PublicKey: devXPub,
+                createdAtMs: request.created_at_ms!,
+              },
+              umk!.ed25519PrivateKey,
+            );
+          })();
       await registerDevice({
         userId: request.user_id,
         deviceId: request.device_id,
@@ -198,23 +230,41 @@ function ApprovalCard({
         console.warn('room re-wrap for new device failed:', errorMessage(err));
       }
 
-      // Share the backup key with the new device by sealing it to
-      // B's X25519 pub and writing to devices.backup_key_wrap. When B
-      // picks up its device row, it can unseal and store the backup key
-      // locally, enabling full key-backup restore.
+      // Share SSK+USK with the new device by sealing to B's X25519 pub.
+      // Also share the backup key. Both go on B's device row.
       try {
+        const sodium = await getSodium();
+        const supabaseLocal = (await import('@/lib/supabase/client')).getSupabase();
+        const updates: Record<string, string> = {};
+
+        // SSK + USK → signing_key_wrap
+        const localSsk = await getSelfSigningKey(request.user_id);
+        const localUsk = await getUserSigningKey(request.user_id);
+        if (localSsk && localUsk) {
+          const packed = concatBytes(
+            localSsk.ed25519PrivateKey,
+            localUsk.ed25519PrivateKey,
+          );
+          const sealedKeys = sodium.crypto_box_seal(packed, devXPub);
+          sodium.memzero(packed);
+          updates.signing_key_wrap = await toBase64(sealedKeys);
+        }
+
+        // Backup key → backup_key_wrap
         const bk = await getBackupKey(request.user_id);
         if (bk) {
-          const sodium = await getSodium();
-          const sealed = sodium.crypto_box_seal(bk, devXPub);
-          const supabaseLocal = (await import('@/lib/supabase/client')).getSupabase();
+          const sealedBk = sodium.crypto_box_seal(bk, devXPub);
+          updates.backup_key_wrap = await toBase64(sealedBk);
+        }
+
+        if (Object.keys(updates).length > 0) {
           await supabaseLocal
             .from('devices')
-            .update({ backup_key_wrap: await toBase64(sealed) })
+            .update(updates)
             .eq('id', request.device_id);
         }
       } catch (err) {
-        console.warn('backup key share failed:', errorMessage(err));
+        console.warn('key share to new device failed:', errorMessage(err));
       }
 
       await deleteApprovalRequest(request.id);

@@ -112,23 +112,24 @@ async function mnemonicToEntropyBytes(phrase: string): Promise<Bytes> {
 }
 
 /**
- * Wrap the caller's UMK priv under the given phrase. Returns an opaque blob
- * safe to upload to `recovery_blobs`.
+ * Wrap keys under the given phrase. Produces the highest format the inputs
+ * support:
  *
- * v2 (per-device) note: recovery now targets the user master key, not a full
- * combined identity. Device key bundles are per-device and regenerated on
- * recovery. The restored UMK lets the new device sign its own device cert.
- */
-/**
- * Wrap the user's UMK priv (and optionally a backup key) under the given
- * phrase. v3 format packs `[umkPriv(64) || backupKey(32)]` = 96 bytes;
- * v2 format packs `[umkPriv(64)]` = 64 bytes (when no backup key).
+ *   v4 (cross-signing): mskPriv(64) || sskPriv(64) || uskPriv(64) || backupKey(32) = 224 bytes
+ *   v3 (per-device):    mskPriv(64) || backupKey(32) = 96 bytes
+ *   v2 (legacy):        mskPriv(64) = 64 bytes
  */
 export async function wrapUserMasterKeyWithPhrase(
   umk: UserMasterKey,
   phrase: string,
   userId: string,
-  opts?: { opslimit?: number; memlimit?: number; backupKey?: Bytes },
+  opts?: {
+    opslimit?: number;
+    memlimit?: number;
+    backupKey?: Bytes;
+    sskPriv?: Bytes;
+    uskPriv?: Bytes;
+  },
 ): Promise<RecoveryBlob> {
   const sodium = await getSodium();
   const opslimit = opts?.opslimit ?? DEFAULT_OPSLIMIT;
@@ -139,14 +140,22 @@ export async function wrapUserMasterKeyWithPhrase(
     const nonce = await randomBytes(RECOVERY_NONCE_BYTES);
     let packed: Bytes;
     let adTag: string;
-    if (opts?.backupKey) {
-      // v3: UMK priv + backup key
+    if (opts?.sskPriv && opts?.uskPriv && opts?.backupKey) {
+      // v4: MSK priv + SSK priv + USK priv + backup key
+      packed = new Uint8Array(64 + 64 + 64 + 32);
+      packed.set(umk.ed25519PrivateKey, 0);
+      packed.set(opts.sskPriv, 64);
+      packed.set(opts.uskPriv, 128);
+      packed.set(opts.backupKey, 192);
+      adTag = `vibecheck:recovery:v4:${userId}`;
+    } else if (opts?.backupKey) {
+      // v3: MSK priv + backup key
       packed = new Uint8Array(64 + 32);
       packed.set(umk.ed25519PrivateKey, 0);
       packed.set(opts.backupKey, 64);
       adTag = `vibecheck:recovery:v3:${userId}`;
     } else {
-      // v2: UMK priv only
+      // v2: MSK priv only
       packed = new Uint8Array(umk.ed25519PrivateKey);
       adTag = `vibecheck:recovery:v2:${userId}`;
     }
@@ -166,17 +175,23 @@ export async function wrapUserMasterKeyWithPhrase(
 }
 
 /**
- * Open a recovery blob with the given phrase. Returns the UMK priv and,
- * if the blob is v3, the backup key. Backward-compatible: v2 blobs
- * (64-byte payload, AD tag v2) unwrap to `{ ed25519PrivateKey }` with
- * no backup key; v3 blobs (96-byte payload, AD tag v3) unwrap to
- * `{ ed25519PrivateKey, backupKey }`.
+ * Open a recovery blob with the given phrase. Tries AD tags in order:
+ *   v4 (224 bytes): mskPriv + sskPriv + uskPriv + backupKey
+ *   v3 (96 bytes):  mskPriv + backupKey
+ *   v2 (64 bytes):  mskPriv only
  */
+export interface RecoveryUnwrapResult {
+  ed25519PrivateKey: Bytes;
+  sskPriv?: Bytes;
+  uskPriv?: Bytes;
+  backupKey?: Bytes;
+}
+
 export async function unwrapUserMasterKeyWithPhrase(
   blob: RecoveryBlob,
   phrase: string,
   userId: string,
-): Promise<{ ed25519PrivateKey: Bytes; backupKey?: Bytes }> {
+): Promise<RecoveryUnwrapResult> {
   const sodium = await getSodium();
   const wrappingKey = await deriveWrappingKey(
     phrase,
@@ -186,54 +201,60 @@ export async function unwrapUserMasterKeyWithPhrase(
   );
   let packed: Bytes;
   try {
-    // Try v3 AD first, fall back to v2. The ciphertext itself doesn't
-    // carry a version field; we rely on the AD mismatch to distinguish.
+    // Try v4 → v3 → v2. The ciphertext itself doesn't carry a version
+    // field; we rely on the AD mismatch to distinguish.
+    const adV4 = new TextEncoder().encode(`vibecheck:recovery:v4:${userId}`);
     const adV3 = new TextEncoder().encode(`vibecheck:recovery:v3:${userId}`);
     const adV2 = new TextEncoder().encode(`vibecheck:recovery:v2:${userId}`);
-    let decrypted = false;
-    try {
-      packed = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
-        null, blob.ciphertext, adV3, blob.nonce, wrappingKey,
-      );
-      decrypted = true;
-    } catch {
-      // v3 AD didn't match — try v2
-    }
-    if (!decrypted) {
+
+    const tryDecrypt = (ad: Uint8Array): Bytes | null => {
       try {
-        packed = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
-          null, blob.ciphertext, adV2, blob.nonce, wrappingKey,
+        return sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+          null, blob.ciphertext, ad, blob.nonce, wrappingKey,
         );
       } catch {
-        throw new CryptoError(
-          'recovery phrase did not match (or blob was tampered)',
-          'DECRYPT_FAILED',
-        );
+        return null;
       }
+    };
+
+    packed = tryDecrypt(adV4) ?? tryDecrypt(adV3) ?? tryDecrypt(adV2) ?? null!;
+    if (!packed) {
+      throw new CryptoError(
+        'recovery phrase did not match (or blob was tampered)',
+        'DECRYPT_FAILED',
+      );
     }
   } finally {
     sodium.memzero(wrappingKey);
   }
-  if (packed!.byteLength === 96) {
-    // v3: UMK priv (64) + backup key (32)
-    const result = {
-      ed25519PrivateKey: packed!.slice(0, 64),
-      backupKey: packed!.slice(64, 96),
-    };
-    sodium.memzero(packed!);
-    return result;
+  try {
+    if (packed.byteLength === 224) {
+      // v4: MSK priv (64) + SSK priv (64) + USK priv (64) + backup key (32)
+      return {
+        ed25519PrivateKey: packed.slice(0, 64),
+        sskPriv: packed.slice(64, 128),
+        uskPriv: packed.slice(128, 192),
+        backupKey: packed.slice(192, 224),
+      };
+    }
+    if (packed.byteLength === 96) {
+      // v3: MSK priv (64) + backup key (32)
+      return {
+        ed25519PrivateKey: packed.slice(0, 64),
+        backupKey: packed.slice(64, 96),
+      };
+    }
+    if (packed.byteLength === 64) {
+      // v2: MSK priv only
+      return { ed25519PrivateKey: packed.slice(0, 64) };
+    }
+    throw new CryptoError(
+      `recovery blob has unexpected length ${packed.byteLength} (expected 64, 96, or 224)`,
+      'BAD_KEY_LENGTH',
+    );
+  } finally {
+    sodium.memzero(packed);
   }
-  if (packed!.byteLength === 64) {
-    // v2: UMK priv only
-    const result = { ed25519PrivateKey: packed!.slice(0, 64) };
-    sodium.memzero(packed!);
-    return result;
-  }
-  sodium.memzero(packed!);
-  throw new CryptoError(
-    `recovery blob has unexpected length ${packed!.byteLength} (expected 64 or 96)`,
-    'BAD_KEY_LENGTH',
-  );
 }
 
 const BACKUP_NONCE_BYTES = 24;
@@ -292,6 +313,42 @@ export async function decryptRoomKeyFromBackup(params: {
     );
   }
   return { key, generation: params.generation };
+}
+
+/**
+ * Encrypt a Megolm session snapshot for server-side backup. The snapshot's
+ * chain key + metadata are sealed under the backup key so the server never
+ * sees them. AD binds the ciphertext to (roomId, sessionId, startIndex).
+ */
+export async function encryptSessionSnapshotForBackup(params: {
+  snapshot: { chainKeyAtIndex: Bytes; startIndex: number; senderUserId: string; senderDeviceId: string };
+  sessionId: string;
+  backupKey: Bytes;
+  roomId: string;
+}): Promise<{ ciphertext: Bytes; nonce: Bytes }> {
+  const sodium = await getSodium();
+  const nonce = await randomBytes(BACKUP_NONCE_BYTES);
+  const ad = new TextEncoder().encode(
+    `vibecheck:session-backup:v1:${params.roomId}:${params.sessionId}:${params.snapshot.startIndex}`,
+  );
+  // Pack: chainKey(32) || senderUserId(UTF8) || \0 || senderDeviceId(UTF8)
+  const enc = new TextEncoder();
+  const suBytes = enc.encode(params.snapshot.senderUserId);
+  const sdBytes = enc.encode(params.snapshot.senderDeviceId);
+  const packed = new Uint8Array(32 + suBytes.length + 1 + sdBytes.length);
+  packed.set(params.snapshot.chainKeyAtIndex, 0);
+  packed.set(suBytes, 32);
+  packed[32 + suBytes.length] = 0;
+  packed.set(sdBytes, 32 + suBytes.length + 1);
+  const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+    packed,
+    ad,
+    null,
+    nonce,
+    params.backupKey,
+  );
+  sodium.memzero(packed);
+  return { ciphertext, nonce };
 }
 
 /** Serialize a blob for transport (base64 strings). */

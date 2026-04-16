@@ -142,6 +142,7 @@ function CallInner({ roomId }: { roomId: string }) {
   const waitingForEnvelopeRef = useRef<boolean>(false);
   /** Call the joiner is trying to enter (used by the calls UPDATE handler). */
   const joiningCallIdRef = useRef<string | null>(null);
+  const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     deviceRef.current = device;
@@ -533,7 +534,8 @@ function CallInner({ roomId }: { roomId: string }) {
             deviceId: device.deviceId,
           }),
         );
-        setTimeout(() => {
+        watchdogRef.current = setTimeout(() => {
+          watchdogRef.current = null;
           if (
             !waitingForEnvelopeRef.current ||
             joiningCallIdRef.current !== call.id ||
@@ -544,10 +546,13 @@ function CallInner({ roomId }: { roomId: string }) {
           void (async () => {
             try {
               logDiag('info', 'watchdog: no rotation arrived in 7s — taking over');
+              // Read current generation at fire time, not at join time,
+              // to avoid stale closure if a rotation landed during the wait.
+              const genAtFire = keyedGenRef.current || currentGeneration;
               const newKey = await rotateCallKeyForCurrentMembers({
                 callId: call.id,
                 device,
-                oldGeneration: currentGeneration,
+                oldGeneration: genAtFire,
               });
               // Only proceed if we're still waiting — the gen-bump UPDATE
               // handler might have connected us first.
@@ -604,6 +609,7 @@ function CallInner({ roomId }: { roomId: string }) {
 
   const doEndForEveryone = useCallback(async () => {
     if (!adapterRef.current) return;
+    if (!confirm('End call for all participants?')) return;
     try {
       await rpcEndCall(adapterRef.current.callId);
     } catch (e) {
@@ -614,6 +620,10 @@ function CallInner({ roomId }: { roomId: string }) {
   }, []);
 
   const teardown = useCallback(async (reason: 'local' | 'error' | 'ended') => {
+    if (watchdogRef.current) {
+      clearTimeout(watchdogRef.current);
+      watchdogRef.current = null;
+    }
     const adapter = adapterRef.current;
     adapterRef.current = null;
     if (adapter) {
@@ -762,7 +772,10 @@ function CallInner({ roomId }: { roomId: string }) {
       )}
 
       {diag.length > 0 && (
-        <details className="rounded border border-neutral-200 bg-neutral-50 p-2 text-xs" open>
+        <details
+          className="rounded border border-neutral-200 bg-neutral-50 p-2 text-xs"
+          open={process.env.NODE_ENV === 'development' || (typeof localStorage !== 'undefined' && localStorage.getItem('debugCall') === '1')}
+        >
           <summary className="cursor-pointer select-none font-semibold text-neutral-700">
             diagnostics ({diag.length} step{diag.length === 1 ? '' : 's'})
           </summary>

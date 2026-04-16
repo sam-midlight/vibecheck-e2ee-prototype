@@ -26,12 +26,30 @@ import { getKnownContact, putKnownContact } from './storage';
 
 export type KeyChangeListener = (event: KeyChangeEvent) => void;
 
+/**
+ * Emitted when a SAS-verified contact's MSK changes. Louder than a
+ * normal KeyChangeEvent — UI should block sends until re-verified.
+ */
+export interface VerificationBreakEvent extends KeyChangeEvent {
+  wasVerified: true;
+  verifiedAt: number;
+}
+
+export type VerificationBreakListener = (event: VerificationBreakEvent) => void;
+
 const listeners = new Set<KeyChangeListener>();
+const verifyBreakListeners = new Set<VerificationBreakListener>();
 
 /** Subscribe to key-change events across the whole app. Returns an unsubscriber. */
 export function onKeyChange(listener: KeyChangeListener): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+/** Subscribe to verification-break events (key change on a verified contact). */
+export function onVerificationBreak(listener: VerificationBreakListener): () => void {
+  verifyBreakListeners.add(listener);
+  return () => verifyBreakListeners.delete(listener);
 }
 
 function emitKeyChange(event: KeyChangeEvent): void {
@@ -40,6 +58,16 @@ function emitKeyChange(event: KeyChangeEvent): void {
       l(event);
     } catch (e) {
       console.error('key-change listener threw:', e);
+    }
+  }
+}
+
+function emitVerificationBreak(event: VerificationBreakEvent): void {
+  for (const l of verifyBreakListeners) {
+    try {
+      l(event);
+    } catch (e) {
+      console.error('verification-break listener threw:', e);
     }
   }
 }
@@ -103,6 +131,18 @@ export async function observeContact(
     },
     detectedAt: now,
   };
+
+  // Escalate if this was a SAS-verified contact — their MSK changed,
+  // breaking the verification chain. UI should show a loud red alert.
+  if (cached.verified && cached.verifiedAt) {
+    const breakEvent: VerificationBreakEvent = {
+      ...event,
+      wasVerified: true,
+      verifiedAt: cached.verifiedAt,
+    };
+    emitVerificationBreak(breakEvent);
+  }
+
   emitKeyChange(event);
   return { status: 'changed', event };
 }
@@ -123,5 +163,23 @@ export async function acceptKeyChange(
     x25519PublicKey: pub.x25519PublicKey,
     firstSeenAt: now, // reset; this is effectively a new TOFU anchor
     lastSeenAt: now,
+    verified: false, // key changed → verification is broken; must re-verify
+    verifiedAt: undefined,
+  });
+}
+
+/**
+ * Mark a contact as SAS-verified (called after successful SAS completion).
+ * Updates the local TOFU record so future key changes are escalated.
+ */
+export async function markContactVerified(
+  userId: string,
+): Promise<void> {
+  const cached = await getKnownContact(userId);
+  if (!cached) return;
+  await putKnownContact({
+    ...cached,
+    verified: true,
+    verifiedAt: Date.now(),
   });
 }

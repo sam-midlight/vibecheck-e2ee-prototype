@@ -136,7 +136,7 @@ All RPCs `SECURITY DEFINER` with explicit `auth.uid()` checks, matching `kick_an
 2. Realtime broadcast `{type: 'member_joined', call_id, device_id: carol}` to existing participants.
 3. **Rotator election (optimistic, DB-arbitrated).** Every currently-connected member independently checks whether they are the lowest-ordered active device by `(joined_at ASC, device_id ASC)`. If yes, they proceed to rotate. If no, they wait for the rotation broadcast.
 4. The elected rotator generates `CallKey'`, wraps to current members + Carol, and calls `rotate_call_key(call_id, G+1, new_envelopes[])`.
-5. **Race resolution:** if two clients both believed they were the rotator and both submit `rotate_call_key` with `p_new_generation = G+1`, the RPC's uniqueness constraint (`p_new_generation = current_generation + 1`) causes the second to fail. The loser observes via the `key_rotated` broadcast, reads the new generation, and gives up the attempt. **No leader lease, no coordination.** This is the Matrix/CRDT pattern: let the DB be the arbiter.
+5. **Race resolution:** if two clients both believed they were the rotator and both submit `rotate_call_key` with `p_new_generation = G+1`, the RPC's uniqueness constraint (`p_new_generation = current_generation + 1`) causes the second to fail. The loser observes via the `key_rotated` broadcast, reads the new generation, and gives up the attempt. **No leader lease, no coordination.** This is optimistic concurrency control with DB-arbitrated uniqueness: let the DB be the arbiter.
 6. If the elected rotator is silent for 2 seconds after `member_joined`, the next-in-order device attempts. Same race semantics apply — worst case is one spurious failed RPC, no correctness impact.
 7. All clients receive `{type: 'key_rotated', call_id, generation: G+1}` via realtime, fetch their new envelope, call `keyProvider.setKey(CallKey', G+1)`.
 8. LiveKit SDK handles the cutover: old key stays valid for a short grace window for in-flight frames, new key active for new frames.
@@ -295,7 +295,7 @@ On rotation: `await keyProvider.setKey(newCallKey, newGeneration)`. LiveKit hand
 
 ## 11. Open questions
 
-1. ~~**Rotator election robustness.**~~ **Resolved:** optimistic election + `rotate_call_key`'s `p_new_generation = current_generation + 1` uniqueness constraint arbitrates races (§6.3). No leader lease. Matrix/CRDT pattern.
+1. ~~**Rotator election robustness.**~~ **Resolved:** optimistic election + `rotate_call_key`'s `p_new_generation = current_generation + 1` uniqueness constraint arbitrates races (§6.3). No leader lease. Optimistic concurrency control with DB-arbitrated uniqueness.
 
 2. **Incoming-call UX.** Realtime presence is fine for app-open callees. For app-closed → push notifications. Deferred to a later iteration; noted in roadmap.
 

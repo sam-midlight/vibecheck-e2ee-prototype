@@ -214,6 +214,8 @@ V2 implications:
 
 **Pair rooms are strictly 2 people.** Groups have no cap in the prototype — pick one in V2 based on the UX (8? 50?) and encode it in the trigger. Either way, the enforcement lives in `0007_pair_cap_and_admin_delete.sql`: a BEFORE INSERT trigger on both `room_members` and `room_invites` counts distinct `user_id` values across both tables and rejects insertions that would exceed the cap. Existing users (re-wraps during rotation, invite-acceptance paths) short-circuit so the trigger never blocks legitimate churn.
 
+**Client-side pair-fullness checks must count distinct users, not rows.** Since migration 0015, `room_members` keys on `(room_id, device_id, generation)`, so a single user with multiple devices produces multiple rows. UI code that disables the invite button based on `count(*)` will flag a one-user-two-device pair as full and the invite will never be attempted. Both `src/app/rooms/page.tsx` (rooms-list invite form) and `src/app/rooms/[id]/page.tsx` (in-room invite form) use a `new Set(user_id).size` pattern to match the DB trigger's `distinct user_id` semantics. V2 must replicate this shape for any new pair-cap-aware UI.
+
 **The room creator is the admin.** That single bit — `rooms.created_by = auth.uid()` — is what determines who can:
 - kick other members (the "remove + rotate" button in `MemberList`),
 - delete the whole room (via `rooms_creator_delete` policy from 0004),
@@ -279,6 +281,31 @@ Row shape: `key_backup (user_id, room_id, generation, ciphertext, nonce, created
 - If V2 adds a key-backup "prune" UX (e.g. drop old generations to limit row count), rotate the backup key first via a new recovery-blob write — otherwise a server snapshot keeps the pruned rows readable.
 
 **Check #16** in `/status` is the canary: it constructs a synthetic temp device, signs its cert with the real UMK, runs the full wrap/unwrap roundtrip, cleans up. Keep it in the V2 port.
+
+## 13. Multi-primary via "promote this device" (Matrix-style)
+
+v3's approval flow deliberately does not transmit UMK priv (see AGENTS.md §3 — "no private keys cross the network"). So a device linked via approval holds a device bundle but no UMK, which means `PendingApprovalBanner` hides itself on that device and a user with 2+ linked devices can only approve new devices from the original primary. Losing / logging out of the primary blocks all further device sign-ins short of a full recovery-phrase re-enrollment.
+
+`src/components/PromoteDeviceModal.tsx` + the "Promote this device" button in `src/app/settings/page.tsx` give any linked device a way to unwrap UMK from the recovery blob on demand, becoming a co-primary. After promotion, `PendingApprovalBanner` shows up on that device and can approve further sign-ins.
+
+**What the flow does (tight):**
+
+1. Fetches the recovery blob, unwraps it via `unwrapUserMasterKeyWithPhrase`.
+2. Derives UMK pub from the unwrapped priv and rejects if it doesn't match the published UMK pub (guards against tampered blobs / wrong-account confusion).
+3. `putUserMasterKey` locally. If the blob was v3, also `putBackupKey`.
+4. If pin-lock is enabled on this device, asks for the pin passphrase, trial-unwraps the existing wrapped identity to verify it, then re-wraps device+UMK under the same passphrase via `wrapDeviceStateWithPin` and overwrites `putWrappedIdentity`. Without this, UMK would be lost on the next lock cycle and the user would need to promote again.
+
+**Why this doesn't violate the "no UMK across the wire" invariant:** the recovery phrase is the pre-existing UMK-recovery credential. A user who has the phrase can already unwrap UMK on any device (via the fresh-device recovery path). Promote-this-device just exposes the same capability as a mid-session action. No bytes move; UMK stays client-side.
+
+**Security tradeoff vs. strict single-primary:**
+- Multiple devices can now hold UMK priv simultaneously. Split-brain is possible if two primaries issue conflicting device certs or revocations at the same time. Rare in practice (requires two users acting on the same account within the same replication window) and the failure mode is a merge conflict on the device list, not a key compromise.
+- Compromise surface for UMK priv grows linearly with the number of promoted devices. The phrase's compromise surface was already the union of "devices that ran the setup flow"; promote-device just widens it to "devices that the user explicitly promoted."
+
+**V2 port actions:**
+
+- Copy `src/components/PromoteDeviceModal.tsx` verbatim. It's purely stateful UX over e2ee-core helpers — no new Supabase contract.
+- If V2 adds a new pin-lock or recovery flow, make sure promote-device's trial-unwrap + re-wrap sequence still works. Specifically: `wrapDeviceStateWithPin(deviceBundle, umk, passphrase, userId)` must continue to accept a non-null UMK and pack it into the blob. `unwrapDeviceStateWithPin` must return `{ deviceBundle, umk }` where `umk` is non-null on a promoted device.
+- **Do NOT re-introduce UMK transport in the approval flow as an "automatic promote."** The phrase-entry gate is load-bearing — it's what makes the user explicitly opt in to widening their UMK compromise surface. Silent auto-promote on every linked device is the v1/v2 "seal the root identity" footgun AGENTS.md §3 forbids.
 
 ## 8. Things to test on each port
 

@@ -7,6 +7,9 @@ import { getSupabase } from '@/lib/supabase/client';
 import {
   clearDeviceBundle,
   clearUserMasterKey,
+  clearSelfSigningKey,
+  clearUserSigningKey,
+  verifySskCrossSignature,
   verifyDeviceIssuance,
 } from '@/lib/e2ee-core';
 import {
@@ -47,6 +50,18 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
         const devices = await fetchPublicDevices(uid);
         const mine = devices.find((d) => d.deviceId === local.deviceBundle.deviceId);
         if (!mine) return false;
+        // Verify SSK cross-sig if present, then pass SSK pub for v2 cert dispatch.
+        let sskPub: Uint8Array | undefined;
+        if (umkPub.sskPub && umkPub.sskCrossSignature) {
+          try {
+            await verifySskCrossSignature(
+              umkPub.ed25519PublicKey,
+              umkPub.sskPub,
+              umkPub.sskCrossSignature,
+            );
+            sskPub = umkPub.sskPub;
+          } catch { /* fall back to MSK-only */ }
+        }
         await verifyDeviceIssuance(
           {
             userId: uid,
@@ -57,6 +72,7 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
           },
           mine.issuanceSignature,
           umkPub.ed25519PublicKey,
+          sskPub,
         );
         return true;
       } catch {
@@ -68,6 +84,8 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
       if (uid) {
         await clearDeviceBundle(uid).catch(() => {});
         await clearUserMasterKey(uid).catch(() => {});
+        await clearSelfSigningKey(uid).catch(() => {});
+        await clearUserSigningKey(uid).catch(() => {});
       }
       await supabase.auth.signOut().catch(() => {});
       router.replace('/');

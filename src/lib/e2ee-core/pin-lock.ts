@@ -25,7 +25,9 @@ import {
   CryptoError,
   type Bytes,
   type DeviceKeyBundle,
+  type SelfSigningKey,
   type UserMasterKey,
+  type UserSigningKey,
 } from './types';
 import { concatBytes, getSodium, randomBytes, stringToBytes } from './sodium';
 
@@ -37,8 +39,12 @@ const DEFAULT_MEMLIMIT = 256 * 1024 * 1024;
 /**
  * Opaque wrapped-identity payload. Safe to persist in IndexedDB.
  *
- * Packed plaintext (v2): `[has_umk_byte (1)] [deviceId_utf8 (36)] [dev_ed_priv (64)]
- * [dev_x_priv (32)] [dev_ed_pub (32)] [dev_x_pub (32)] [umk_ed_priv (64, only if has_umk=1)]`.
+ * v2 plaintext: `[has_umk(1)] [deviceId(36)] [dev_ed_priv(64)]
+ *   [dev_x_priv(32)] [dev_ed_pub(32)] [dev_x_pub(32)] [umk_ed_priv(64)?]`
+ *
+ * v3 plaintext (cross-signing): `[has_msk(1)] [has_ssk(1)] [has_usk(1)]
+ *   [deviceId(36)] [dev_ed_priv(64)] [dev_x_priv(32)] [dev_ed_pub(32)] [dev_x_pub(32)]
+ *   [msk_ed_priv(64)?] [ssk_ed_priv(64)?] [usk_ed_priv(64)?]`
  */
 export interface PinWrappedIdentity {
   ciphertext: Bytes;
@@ -71,16 +77,20 @@ async function deriveKey(
 }
 
 /**
- * Wrap this device's DeviceKeyBundle (and optionally the UMK priv, if this
- * device holds it) under a passphrase. Stored in IndexedDB; server never
- * sees any part.
+ * Wrap this device's state under a passphrase. Produces v3 format when
+ * SSK/USK are provided; falls back to v2 for backward compat.
  */
 export async function wrapDeviceStateWithPin(
   deviceBundle: DeviceKeyBundle,
   umk: UserMasterKey | null,
   passphrase: string,
   userId: string,
-  opts?: { opslimit?: number; memlimit?: number },
+  opts?: {
+    opslimit?: number;
+    memlimit?: number;
+    ssk?: SelfSigningKey | null;
+    usk?: UserSigningKey | null;
+  },
 ): Promise<PinWrappedIdentity> {
   if (!passphrase || passphrase.length < 4) {
     throw new CryptoError('passphrase must be at least 4 characters', 'BAD_INPUT');
@@ -98,19 +108,42 @@ export async function wrapDeviceStateWithPin(
   const key = await deriveKey(passphrase, kdfSalt, opslimit, memlimit);
   try {
     const nonce = await randomBytes(PIN_NONCE_BYTES);
-    const hasUmkByte = new Uint8Array([umk ? 1 : 0]);
     const deviceIdBytes = stringToBytes(deviceBundle.deviceId);
-    const parts: Bytes[] = [
-      hasUmkByte,
-      deviceIdBytes,
-      deviceBundle.ed25519PrivateKey,
-      deviceBundle.x25519PrivateKey,
-      deviceBundle.ed25519PublicKey,
-      deviceBundle.x25519PublicKey,
-    ];
-    if (umk) parts.push(umk.ed25519PrivateKey);
-    const packed = concatBytes(...parts);
-    const ad = stringToBytes(`vibecheck:pinlock:v2:${userId}`);
+    const useCrossSigning = !!(opts?.ssk || opts?.usk);
+    let packed: Bytes;
+    let adTag: string;
+
+    if (useCrossSigning) {
+      // v3: 3 flag bytes + device bundle + optional MSK/SSK/USK privs
+      const parts: Bytes[] = [
+        new Uint8Array([umk ? 1 : 0, opts?.ssk ? 1 : 0, opts?.usk ? 1 : 0]),
+        deviceIdBytes,
+        deviceBundle.ed25519PrivateKey,
+        deviceBundle.x25519PrivateKey,
+        deviceBundle.ed25519PublicKey,
+        deviceBundle.x25519PublicKey,
+      ];
+      if (umk) parts.push(umk.ed25519PrivateKey);
+      if (opts?.ssk) parts.push(opts.ssk.ed25519PrivateKey);
+      if (opts?.usk) parts.push(opts.usk.ed25519PrivateKey);
+      packed = concatBytes(...parts);
+      adTag = `vibecheck:pinlock:v3:${userId}`;
+    } else {
+      // v2: 1 flag byte + device bundle + optional UMK priv
+      const parts: Bytes[] = [
+        new Uint8Array([umk ? 1 : 0]),
+        deviceIdBytes,
+        deviceBundle.ed25519PrivateKey,
+        deviceBundle.x25519PrivateKey,
+        deviceBundle.ed25519PublicKey,
+        deviceBundle.x25519PublicKey,
+      ];
+      if (umk) parts.push(umk.ed25519PrivateKey);
+      packed = concatBytes(...parts);
+      adTag = `vibecheck:pinlock:v2:${userId}`;
+    }
+
+    const ad = stringToBytes(adTag);
     const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
       packed,
       ad,
@@ -127,13 +160,17 @@ export async function wrapDeviceStateWithPin(
 
 export interface UnlockedDeviceState {
   deviceBundle: DeviceKeyBundle;
-  /** Present iff this device was the UMK-holder at wrap time. */
+  /** Present iff this device was the MSK/UMK-holder at wrap time. */
   umk: UserMasterKey | null;
+  /** Present iff this device held SSK at wrap time (v3 format). */
+  ssk: SelfSigningKey | null;
+  /** Present iff this device held USK at wrap time (v3 format). */
+  usk: UserSigningKey | null;
 }
 
 /**
- * Unlock a pin-wrapped device bundle (+ optional UMK). Throws
- * `DECRYPT_FAILED` on wrong passphrase or any tamper.
+ * Unlock a pin-wrapped device state. Tries v3 AD first (cross-signing),
+ * falls back to v2. Throws DECRYPT_FAILED on wrong passphrase.
  */
 export async function unwrapDeviceStateWithPin(
   blob: PinWrappedIdentity,
@@ -148,46 +185,122 @@ export async function unwrapDeviceStateWithPin(
     blob.kdfMemlimit,
   );
   let packed: Bytes;
+  let isV3 = false;
   try {
-    const ad = stringToBytes(`vibecheck:pinlock:v2:${userId}`);
+    const adV3 = stringToBytes(`vibecheck:pinlock:v3:${userId}`);
+    const adV2 = stringToBytes(`vibecheck:pinlock:v2:${userId}`);
     try {
       packed = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
-        null,
-        blob.ciphertext,
-        ad,
-        blob.nonce,
-        key,
+        null, blob.ciphertext, adV3, blob.nonce, key,
       );
+      isV3 = true;
     } catch {
-      throw new CryptoError('passphrase did not match', 'DECRYPT_FAILED');
+      try {
+        packed = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+          null, blob.ciphertext, adV2, blob.nonce, key,
+        );
+      } catch {
+        throw new CryptoError('passphrase did not match', 'DECRYPT_FAILED');
+      }
     }
   } finally {
     sodium.memzero(key);
   }
 
-  // Header = has_umk(1) + deviceId_utf8(36) + ed_priv(64) + x_priv(32) + ed_pub(32) + x_pub(32)
-  const WITHOUT_UMK_LEN = 1 + 36 + 64 + 32 + 32 + 32;
-  const WITH_UMK_LEN = WITHOUT_UMK_LEN + 64;
-  if (packed.byteLength !== WITHOUT_UMK_LEN && packed.byteLength !== WITH_UMK_LEN) {
+  try {
+    if (isV3) {
+      return unwrapV3(packed, sodium);
+    }
+    return unwrapV2(packed, sodium);
+  } finally {
     sodium.memzero(packed);
+  }
+}
+
+function unwrapV2(
+  packed: Bytes,
+  sodium: Awaited<ReturnType<typeof getSodium>>,
+): UnlockedDeviceState {
+  // v2: has_umk(1) + deviceId(36) + ed_priv(64) + x_priv(32) + ed_pub(32) + x_pub(32) [+ umk(64)]
+  const BASE = 1 + 36 + 64 + 32 + 32 + 32; // 197
+  if (packed.byteLength !== BASE && packed.byteLength !== BASE + 64) {
     throw new CryptoError('wrapped device state has unexpected length', 'BAD_KEY_LENGTH');
   }
   const hasUmk = packed[0] === 1;
-  const decoder = new TextDecoder();
-  const deviceId = decoder.decode(packed.slice(1, 37));
+  const deviceId = new TextDecoder().decode(packed.slice(1, 37));
   const deviceBundle: DeviceKeyBundle = {
     deviceId,
-    ed25519PrivateKey: packed.slice(37, 37 + 64),
-    x25519PrivateKey: packed.slice(101, 101 + 32),
-    ed25519PublicKey: packed.slice(133, 133 + 32),
-    x25519PublicKey: packed.slice(165, 165 + 32),
+    ed25519PrivateKey: packed.slice(37, 101),
+    x25519PrivateKey: packed.slice(101, 133),
+    ed25519PublicKey: packed.slice(133, 165),
+    x25519PublicKey: packed.slice(165, 197),
   };
   const umk: UserMasterKey | null = hasUmk
     ? {
-        ed25519PublicKey: sodium.crypto_sign_ed25519_sk_to_pk(packed.slice(197, 197 + 64)),
-        ed25519PrivateKey: packed.slice(197, 197 + 64),
+        ed25519PublicKey: sodium.crypto_sign_ed25519_sk_to_pk(packed.slice(197, 261)),
+        ed25519PrivateKey: packed.slice(197, 261),
       }
     : null;
-  sodium.memzero(packed);
-  return { deviceBundle, umk };
+  return { deviceBundle, umk, ssk: null, usk: null };
+}
+
+function unwrapV3(
+  packed: Bytes,
+  sodium: Awaited<ReturnType<typeof getSodium>>,
+): UnlockedDeviceState {
+  // v3: has_msk(1) + has_ssk(1) + has_usk(1) + deviceId(36) +
+  //     ed_priv(64) + x_priv(32) + ed_pub(32) + x_pub(32)
+  //     [+ msk(64)] [+ ssk(64)] [+ usk(64)]
+  const FLAGS = 3;
+  const BUNDLE = 36 + 64 + 32 + 32 + 32; // 196
+  const hasMsk = packed[0] === 1;
+  const hasSsk = packed[1] === 1;
+  const hasUsk = packed[2] === 1;
+  const expectedLen = FLAGS + BUNDLE
+    + (hasMsk ? 64 : 0)
+    + (hasSsk ? 64 : 0)
+    + (hasUsk ? 64 : 0);
+  if (packed.byteLength !== expectedLen) {
+    throw new CryptoError('wrapped device state v3 has unexpected length', 'BAD_KEY_LENGTH');
+  }
+  let offset = FLAGS;
+  const deviceId = new TextDecoder().decode(packed.slice(offset, offset + 36));
+  offset += 36;
+  const deviceBundle: DeviceKeyBundle = {
+    deviceId,
+    ed25519PrivateKey: packed.slice(offset, offset + 64),
+    x25519PrivateKey: packed.slice(offset + 64, offset + 96),
+    ed25519PublicKey: packed.slice(offset + 96, offset + 128),
+    x25519PublicKey: packed.slice(offset + 128, offset + 160),
+  };
+  offset += 160;
+
+  let umk: UserMasterKey | null = null;
+  if (hasMsk) {
+    const priv = packed.slice(offset, offset + 64);
+    umk = {
+      ed25519PublicKey: sodium.crypto_sign_ed25519_sk_to_pk(priv),
+      ed25519PrivateKey: priv,
+    };
+    offset += 64;
+  }
+  let ssk: SelfSigningKey | null = null;
+  if (hasSsk) {
+    const priv = packed.slice(offset, offset + 64);
+    ssk = {
+      ed25519PublicKey: sodium.crypto_sign_ed25519_sk_to_pk(priv),
+      ed25519PrivateKey: priv,
+    };
+    offset += 64;
+  }
+  let usk: UserSigningKey | null = null;
+  if (hasUsk) {
+    const priv = packed.slice(offset, offset + 64);
+    usk = {
+      ed25519PublicKey: sodium.crypto_sign_ed25519_sk_to_pk(priv),
+      ed25519PrivateKey: priv,
+    };
+    offset += 64;
+  }
+  return { deviceBundle, umk, ssk, usk };
 }

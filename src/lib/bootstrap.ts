@@ -15,6 +15,7 @@ import {
   filterActiveDevices,
   fromBase64,
   generateCallKey,
+  generateSigningKeys,
   getBackupKey,
   generateDeviceKeyBundle,
   generateUserMasterKey,
@@ -23,23 +24,37 @@ import {
   getUserMasterKey,
   putDeviceBundle,
   putDeviceRecord,
+  putSelfSigningKey,
   putUserMasterKey,
+  putUserSigningKey,
   rotateRoomKey,
-  signDeviceIssuance,
+  signDeviceIssuanceV2,
   signInviteEnvelope,
   signMembershipWrap,
   toBase64,
   unwrapRoomKey,
   unwrapCallKey,
+  verifySskCrossSignature,
   verifyCallEnvelope,
   verifyPublicDevice,
   wrapAndSignCallEnvelope,
   wrapRoomKeyFor,
   zeroCallKey,
+  createOutboundSession,
+  exportSessionSnapshot,
+  sealSessionSnapshot,
+  signSessionShare,
+  getOutboundSession,
+  putOutboundSession,
+  shouldRotateSession,
+  type AutoRotationConfig,
   type CallKey,
   type DeviceKeyBundle,
+  type OutboundMegolmSession,
   type PublicDevice,
+  type SelfSigningKey,
   type UserMasterKey,
+  type UserSigningKey,
 } from '@/lib/e2ee-core';
 import { getSupabase } from '@/lib/supabase/client';
 import { errorMessage } from '@/lib/errors';
@@ -50,6 +65,8 @@ import {
   fetchUserMasterKeyPub,
   fetchCallKeyEnvelope,
   getMyWrappedRoomKey,
+  insertMegolmSession,
+  insertMegolmSessionShare,
   kickAndRotate,
   listCallMembers,
   listRoomMembers,
@@ -81,15 +98,20 @@ export interface EnrolledDevice {
 }
 
 /**
- * First-ever sign-in for a user: generate UMK + device bundle locally, sign
- * the device's issuance cert with UMK, publish UMK pub, register the device.
+ * First-ever sign-in for a user: generate MSK + SSK + USK + device bundle,
+ * sign the device's issuance cert with SSK, publish all identity keys,
+ * register the device.
  */
 export async function bootstrapNewUser(userId: string): Promise<EnrolledDevice> {
   const umk = await generateUserMasterKey();
+  const { ssk, usk, sskCrossSignature, uskCrossSignature } =
+    await generateSigningKeys(umk);
+
   const deviceId = crypto.randomUUID();
   const bundle = await generateDeviceKeyBundle(deviceId);
   const createdAtMs = Date.now();
-  const issuanceSignature = await signDeviceIssuance(
+  // Sign with SSK (v2 cert) — cross-sig chain: device ← SSK ← MSK
+  const issuanceSignature = await signDeviceIssuanceV2(
     {
       userId,
       deviceId,
@@ -97,12 +119,23 @@ export async function bootstrapNewUser(userId: string): Promise<EnrolledDevice> 
       deviceX25519PublicKey: bundle.x25519PublicKey,
       createdAtMs,
     },
-    umk.ed25519PrivateKey,
+    ssk.ed25519PrivateKey,
   );
 
   await putUserMasterKey(userId, umk);
+  await putSelfSigningKey(userId, ssk);
+  await putUserSigningKey(userId, usk);
   await putDeviceBundle(userId, bundle);
-  await publishUserMasterKey(userId, { ed25519PublicKey: umk.ed25519PublicKey });
+  await publishUserMasterKey(
+    userId,
+    { ed25519PublicKey: umk.ed25519PublicKey },
+    {
+      sskPub: ssk.ed25519PublicKey,
+      sskCrossSignature,
+      uskPub: usk.ed25519PublicKey,
+      uskCrossSignature,
+    },
+  );
   const displayName = inferDeviceName();
   const displayNameCiphertext = await encryptDeviceDisplayName(
     displayName,
@@ -123,14 +156,16 @@ export async function bootstrapNewUser(userId: string): Promise<EnrolledDevice> 
 }
 
 /**
- * Enroll a new device using a locally-held UMK (e.g. after a recovery
- * unwrap). Generates a fresh device bundle, signs its cert, writes the
- * server-side device row. The UMK priv is also persisted on this device so
- * the user can continue to add devices from here.
+ * Enroll a new device using a locally-held MSK (e.g. after a recovery
+ * unwrap). Generates a fresh device bundle, signs its cert with SSK,
+ * writes the server-side device row. If SSK/USK privs are provided
+ * (v4 recovery blob), they're reused; otherwise fresh ones are generated
+ * and the identity row is updated with the new cross-sigs.
  */
 export async function enrollDeviceWithUmk(
   userId: string,
   umk: UserMasterKey,
+  opts?: { ssk?: SelfSigningKey; usk?: UserSigningKey },
 ): Promise<EnrolledDevice> {
   const publishedPub = await fetchUserMasterKeyPub(userId);
   if (!publishedPub) {
@@ -141,10 +176,32 @@ export async function enrollDeviceWithUmk(
       'UMK pub derived locally does not match the published UMK pub — refusing',
     );
   }
+
+  // Resolve or generate SSK + USK
+  let ssk = opts?.ssk ?? null;
+  let usk = opts?.usk ?? null;
+  if (!ssk || !usk) {
+    // No SSK/USK from recovery blob (v2/v3 blob) — generate fresh ones
+    // and publish them. This is a one-time upgrade path.
+    const keys = await generateSigningKeys(umk);
+    ssk = keys.ssk;
+    usk = keys.usk;
+    await publishUserMasterKey(
+      userId,
+      { ed25519PublicKey: umk.ed25519PublicKey },
+      {
+        sskPub: ssk.ed25519PublicKey,
+        sskCrossSignature: keys.sskCrossSignature,
+        uskPub: usk.ed25519PublicKey,
+        uskCrossSignature: keys.uskCrossSignature,
+      },
+    );
+  }
+
   const deviceId = crypto.randomUUID();
   const bundle = await generateDeviceKeyBundle(deviceId);
   const createdAtMs = Date.now();
-  const issuanceSignature = await signDeviceIssuance(
+  const issuanceSignature = await signDeviceIssuanceV2(
     {
       userId,
       deviceId,
@@ -152,10 +209,12 @@ export async function enrollDeviceWithUmk(
       deviceX25519PublicKey: bundle.x25519PublicKey,
       createdAtMs,
     },
-    umk.ed25519PrivateKey,
+    ssk.ed25519PrivateKey,
   );
 
   await putUserMasterKey(userId, umk);
+  await putSelfSigningKey(userId, ssk);
+  await putUserSigningKey(userId, usk);
   await putDeviceBundle(userId, bundle);
   const displayName = inferDeviceName();
   const displayNameCiphertext = await encryptDeviceDisplayName(
@@ -190,15 +249,29 @@ export async function loadEnrolledDevice(
 }
 
 /**
- * Fetch + verify the active devices for a user. Rejects devices whose
- * issuance cert doesn't verify against the user's UMK pub, or that are
- * revoked. Returns filtered list.
+ * Fetch + verify the active devices for a user. Verifies device certs via
+ * the MSK→SSK cross-sig chain when SSK is published; falls back to v1
+ * (MSK-direct) certs otherwise. Returns filtered list.
  */
 export async function fetchAndVerifyDevices(userId: string) {
   const umkPub = await fetchUserMasterKeyPub(userId);
   if (!umkPub) return { umkPub: null, devices: [] as Awaited<ReturnType<typeof fetchPublicDevices>> };
+  // Verify SSK cross-sig if published; pass SSK pub for v2 cert verification.
+  let sskPub: Uint8Array | undefined;
+  if (umkPub.sskPub && umkPub.sskCrossSignature) {
+    try {
+      await verifySskCrossSignature(
+        umkPub.ed25519PublicKey,
+        umkPub.sskPub,
+        umkPub.sskCrossSignature,
+      );
+      sskPub = umkPub.sskPub;
+    } catch {
+      // SSK cross-sig invalid — fall back to MSK-only verification
+    }
+  }
   const all = await fetchPublicDevices(userId);
-  const active = await filterActiveDevices(all, umkPub.ed25519PublicKey);
+  const active = await filterActiveDevices(all, umkPub.ed25519PublicKey, sskPub);
   return { umkPub, devices: active };
 }
 
@@ -216,17 +289,21 @@ export async function fetchAndVerifyDevices(userId: string) {
  *
  * Must be called from a device that currently holds the UMK priv.
  */
-/** Result of the generate-only half of UMK rotation. */
+/** Result of the generate-only half of MSK rotation. */
 export interface RotatedUmkResult {
   newUmk: UserMasterKey;
+  newSsk: SelfSigningKey;
+  newUsk: UserSigningKey;
+  sskCrossSignature: Uint8Array;
+  uskCrossSignature: Uint8Array;
   reissuedCerts: Array<{ deviceId: string; issuanceSignature: Uint8Array }>;
 }
 
 /**
- * Generate a fresh UMK and re-sign all active device issuance certs in
- * memory. This is the PURE-COMPUTATION half of UMK rotation — no server
- * writes, no local saves. Callers use it with `commitRotatedUmk` to
- * control the exact ordering of escrow → save → publish (SSSS pattern).
+ * Generate a fresh MSK + SSK + USK and re-sign all active device issuance
+ * certs with the new SSK. Pure computation — no server writes, no local
+ * saves. Callers use it with `commitRotatedUmk` to control the escrow →
+ * save → publish ordering (SSSS pattern).
  */
 export async function generateRotatedUmk(
   userId: string,
@@ -240,19 +317,36 @@ export async function generateRotatedUmk(
     );
   }
 
+  // Verify old devices using SSK if available for backward-compat dispatch
+  let oldSskPub: Uint8Array | undefined;
+  if (publishedOld.sskPub && publishedOld.sskCrossSignature) {
+    try {
+      await verifySskCrossSignature(
+        publishedOld.ed25519PublicKey,
+        publishedOld.sskPub,
+        publishedOld.sskCrossSignature,
+      );
+      oldSskPub = publishedOld.sskPub;
+    } catch { /* fall back to MSK-only */ }
+  }
+
   const activeDevices = await filterActiveDevices(
     await fetchPublicDevices(userId),
     oldUmk.ed25519PublicKey,
+    oldSskPub,
   );
   if (activeDevices.length === 0) {
     throw new Error('no active devices to re-sign — rotation aborted');
   }
 
   const newUmk = await generateUserMasterKey();
+  const { ssk: newSsk, usk: newUsk, sskCrossSignature, uskCrossSignature } =
+    await generateSigningKeys(newUmk);
 
+  // Re-sign all device certs with the new SSK (v2 domain)
   const reissuedCerts = await Promise.all(
     activeDevices.map(async (d) => {
-      const sig = await signDeviceIssuance(
+      const sig = await signDeviceIssuanceV2(
         {
           userId,
           deviceId: d.deviceId,
@@ -260,19 +354,19 @@ export async function generateRotatedUmk(
           deviceX25519PublicKey: d.x25519PublicKey,
           createdAtMs: d.createdAtMs,
         },
-        newUmk.ed25519PrivateKey,
+        newSsk.ed25519PrivateKey,
       );
       return { deviceId: d.deviceId, issuanceSignature: sig };
     }),
   );
 
-  return { newUmk, reissuedCerts };
+  return { newUmk, newSsk, newUsk, sskCrossSignature, uskCrossSignature, reissuedCerts };
 }
 
 /**
- * Publish a previously-generated UMK: update the identities row (which
- * triggers identity_epoch bump), write re-issued device certs, and save
- * the new UMK to local IDB.
+ * Publish a previously-generated identity key set: update the identities
+ * row (which triggers identity_epoch bump), write re-issued device certs,
+ * and save the new keys to local IDB.
  *
  * MUST be called AFTER the recovery blob has been committed (SSSS
  * pattern: escrow before publish). Otherwise a crash between publish
@@ -282,10 +376,25 @@ export async function commitRotatedUmk(
   userId: string,
   newUmk: UserMasterKey,
   reissuedCerts: Array<{ deviceId: string; issuanceSignature: Uint8Array }>,
+  crossSigning?: {
+    ssk: SelfSigningKey;
+    usk: UserSigningKey;
+    sskCrossSignature: Uint8Array;
+    uskCrossSignature: Uint8Array;
+  },
 ): Promise<void> {
-  await publishUserMasterKey(userId, {
-    ed25519PublicKey: newUmk.ed25519PublicKey,
-  });
+  await publishUserMasterKey(
+    userId,
+    { ed25519PublicKey: newUmk.ed25519PublicKey },
+    crossSigning
+      ? {
+          sskPub: crossSigning.ssk.ed25519PublicKey,
+          sskCrossSignature: crossSigning.sskCrossSignature,
+          uskPub: crossSigning.usk.ed25519PublicKey,
+          uskCrossSignature: crossSigning.uskCrossSignature,
+        }
+      : undefined,
+  );
 
   const supabase = getSupabase();
   await Promise.all(
@@ -299,6 +408,10 @@ export async function commitRotatedUmk(
   );
 
   await putUserMasterKey(userId, newUmk);
+  if (crossSigning) {
+    await putSelfSigningKey(userId, crossSigning.ssk);
+    await putUserSigningKey(userId, crossSigning.usk);
+  }
 }
 
 /**
@@ -311,10 +424,15 @@ export async function rotateUserMasterKey(
   userId: string,
   oldUmk: UserMasterKey,
 ): Promise<UserMasterKey> {
-  const { newUmk, reissuedCerts } = await generateRotatedUmk(userId, oldUmk);
-  await putUserMasterKey(userId, newUmk);
-  await commitRotatedUmk(userId, newUmk, reissuedCerts);
-  return newUmk;
+  const result = await generateRotatedUmk(userId, oldUmk);
+  await putUserMasterKey(userId, result.newUmk);
+  await commitRotatedUmk(userId, result.newUmk, result.reissuedCerts, {
+    ssk: result.newSsk,
+    usk: result.newUsk,
+    sskCrossSignature: result.sskCrossSignature,
+    uskCrossSignature: result.uskCrossSignature,
+  });
+  return result.newUmk;
 }
 
 /**
@@ -693,6 +811,87 @@ export const HEARTBEAT_GRACE_SECONDS = 30;
  * rejoin from scratch — they were never evicted, only skipped for the
  * election.
  */
+
+// ---------------------------------------------------------------------------
+// Megolm session management
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a new Megolm outbound session for this device in a room, distribute
+ * sealed snapshots to all active member devices, and register the session
+ * on the server. Stores the outbound session in local IDB.
+ */
+export async function createAndDistributeSession(params: {
+  roomId: string;
+  generation: number;
+  userId: string;
+  device: DeviceKeyBundle;
+}): Promise<OutboundMegolmSession> {
+  const { roomId, generation, userId, device } = params;
+  const session = await createOutboundSession(roomId, generation);
+  const sessionIdB64 = await toBase64(session.sessionId);
+
+  // Register the session on the server.
+  await insertMegolmSession({
+    roomId,
+    senderUserId: userId,
+    senderDeviceId: device.deviceId,
+    sessionId: sessionIdB64,
+    generation,
+  });
+
+  // Collect all active devices across all room members for this generation.
+  const memberRows = await listRoomMembers(roomId);
+  const currentGenMembers = memberRows.filter((m) => m.generation === generation);
+  const memberUserIds = [...new Set(currentGenMembers.map((m) => m.user_id))];
+
+  for (const uid of memberUserIds) {
+    const { devices: activeDevices } = await fetchAndVerifyDevices(uid);
+    for (const d of activeDevices) {
+      const snapshot = exportSessionSnapshot(session, userId, device.deviceId);
+      const sealed = await sealSessionSnapshot(snapshot, d.x25519PublicKey);
+      const sig = await signSessionShare({
+        sessionId: session.sessionId,
+        recipientDeviceId: d.deviceId,
+        sealedSnapshot: sealed,
+        signerDeviceId: device.deviceId,
+        signerEd25519Priv: device.ed25519PrivateKey,
+      });
+      await insertMegolmSessionShare({
+        sessionId: sessionIdB64,
+        recipientDeviceId: d.deviceId,
+        sealedSnapshot: await toBase64(sealed),
+        startIndex: snapshot.startIndex,
+        signerDeviceId: device.deviceId,
+        shareSignature: await toBase64(sig),
+      });
+    }
+  }
+
+  await putOutboundSession(roomId, device.deviceId, session);
+  return session;
+}
+
+/**
+ * Ensure there's a fresh (non-rotated) outbound Megolm session for the
+ * current room. Creates one if none exists or if auto-rotation triggers.
+ * Returns the session for callers to ratchet + encrypt with.
+ */
+export async function ensureFreshSession(params: {
+  roomId: string;
+  generation: number;
+  userId: string;
+  device: DeviceKeyBundle;
+  config?: AutoRotationConfig;
+}): Promise<OutboundMegolmSession> {
+  const { roomId, generation, userId, device, config } = params;
+  const existing = await getOutboundSession(roomId, device.deviceId);
+  if (existing && existing.generation === generation && !shouldRotateSession(existing, config)) {
+    return existing;
+  }
+  return createAndDistributeSession({ roomId, generation, userId, device });
+}
+
 export function filterActiveCallMembers<
   T extends { left_at: string | null; last_seen_at: string },
 >(members: T[], graceSeconds = HEARTBEAT_GRACE_SECONDS): T[] {
@@ -827,6 +1026,12 @@ export async function fetchAndUnwrapCallKey(params: {
   if (senderErr) throw senderErr;
   if (!senderRow) {
     throw new Error(`unknown sender device ${row.sender_device_id}`);
+  }
+  // Explicit revocation check before cert verification — defense-in-depth
+  // against a future regression where verifyPublicDevice's revocation path
+  // is accidentally weakened.
+  if (senderRow.revoked_at_ms != null) {
+    throw new Error(`sender device ${row.sender_device_id} is revoked`);
   }
   const senderUmk = await fetchUserMasterKeyPub(senderRow.user_id);
   if (!senderUmk) {

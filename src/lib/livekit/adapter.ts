@@ -232,16 +232,18 @@ export class LiveKitAdapter {
         if (!participant || !isLocalParticipant(participant)) return;
         if (enabled) {
           this.setEncryptionState('active');
-        } else if (this._encryptionState === 'active') {
-          // Downgrade: we were encrypting, and now we're not. Real failure.
+        } else if (
+          this._encryptionState !== 'failed' &&
+          this._encryptionState !== 'unsupported'
+        ) {
+          // Any non-terminal → disabled transition is a real downgrade.
+          // Catches both `active → false` (mid-call failure) and
+          // `pending → false` (SFrame worker never engaged at startup).
           this.setEncryptionState(
             'failed',
-            'local participant encryption went off mid-call',
+            'local participant encryption went off — possible silent plaintext fallback',
           );
         }
-        // `pending → enabled=false` is bootstrap noise — LiveKit's
-        // E2EEManager briefly emits `false` before the first encrypted
-        // track publishes. Ignore and wait for the real `true`.
       },
     );
 
