@@ -1695,15 +1695,66 @@ export function subscribeRoomCalls(
 export async function nukeIdentityServer(userId: string): Promise<void> {
   const supabase = getSupabase();
 
+  // Order matters: tables with FK references to `devices` must be cleaned
+  // before `devices` itself. The calls tables (0023) lack ON DELETE CASCADE,
+  // and megolm_session_shares.signer_device_id also lacks it.
   const steps: Array<[label: string, column: string, table: string]> = [
+    ['call_key_envelopes (target)', 'target_device_id', 'call_key_envelopes'],
+    ['call_key_envelopes (sender)', 'sender_device_id', 'call_key_envelopes'],
+    ['call_members', 'user_id', 'call_members'],
+    ['calls', 'initiator_user_id', 'calls'],
+    ['megolm_session_shares', 'signer_device_id', 'megolm_session_shares'],
+    ['megolm_sessions', 'sender_user_id', 'megolm_sessions'],
     ['room_members', 'user_id', 'room_members'],
     ['room_invites', 'invited_user_id', 'room_invites'],
+    ['key_backup', 'user_id', 'key_backup'],
     ['device_approval_requests', 'user_id', 'device_approval_requests'],
     ['devices', 'user_id', 'devices'],
     ['recovery_blobs', 'user_id', 'recovery_blobs'],
   ];
 
   for (const [label, column, table] of steps) {
+    // call_key_envelopes doesn't have a direct user_id column — we need
+    // to delete via a device-id subquery. For simplicity, delete by
+    // matching device_ids that belong to this user.
+    if (table === 'call_key_envelopes') {
+      const { data: deviceIds } = await supabase
+        .from('devices')
+        .select('id')
+        .eq('user_id', userId);
+      if (deviceIds && deviceIds.length > 0) {
+        const ids = deviceIds.map((d) => d.id);
+        const { error } = await supabase
+          .from('call_key_envelopes')
+          .delete()
+          .in(column, ids);
+        if (error) {
+          throw new Error(
+            `nuclear reset failed at ${label}: ${errorMessage(error)}`,
+          );
+        }
+      }
+      continue;
+    }
+    if (table === 'megolm_session_shares' && column === 'signer_device_id') {
+      const { data: deviceIds } = await supabase
+        .from('devices')
+        .select('id')
+        .eq('user_id', userId);
+      if (deviceIds && deviceIds.length > 0) {
+        const ids = deviceIds.map((d) => d.id);
+        const { error } = await supabase
+          .from('megolm_session_shares')
+          .delete()
+          .in(column, ids);
+        if (error) {
+          throw new Error(
+            `nuclear reset failed at ${label}: ${errorMessage(error)}`,
+          );
+        }
+      }
+      continue;
+    }
     const { error } = await supabase.from(table).delete().eq(column, userId);
     if (error) {
       throw new Error(

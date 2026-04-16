@@ -126,6 +126,17 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
           uskCrossSignature: rotated.uskCrossSignature,
         });
 
+        // Step 5b: invalidate the stale pin-locked blob. The old wrapped
+        // identity contains the pre-rotation MSK; unlocking it would fail
+        // the ghost check (old MSK ≠ published new MSK → orphan). Clearing
+        // it forces a re-setup via the mandatory require-pin-setup gate on
+        // next navigation. The user re-enters their passphrase once.
+        const { hasWrappedIdentity, clearWrappedIdentity: clearWrap } =
+          await import('@/lib/e2ee-core');
+        if (await hasWrappedIdentity(userId)) {
+          await clearWrap(userId);
+        }
+
         // Step 6: cascade room rotations.
         if (device) {
           try {
