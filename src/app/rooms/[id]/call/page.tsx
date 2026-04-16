@@ -74,13 +74,49 @@ interface ParticipantTile {
   isLocal: boolean;
 }
 
+interface DiagEntry {
+  ts: number;
+  kind: 'info' | 'ok' | 'err';
+  step: string;
+  detail?: string;
+}
+
 function CallInner({ roomId }: { roomId: string }) {
   const [userId, setUserId] = useState<string | null>(null);
   const [device, setDevice] = useState<DeviceKeyBundle | null>(null);
   const [activeCall, setActiveCall] = useState<CallRow | null>(null);
   const [uiState, setUiState] = useState<CallUiState>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [errorStack, setErrorStack] = useState<string | null>(null);
+  const [diag, setDiag] = useState<DiagEntry[]>([]);
   const [tiles, setTiles] = useState<ParticipantTile[]>([]);
+
+  const logDiag = useCallback(
+    (kind: DiagEntry['kind'], step: string, detail?: string) => {
+      console.log(`[call-diag] ${kind}: ${step}`, detail ?? '');
+      setDiag((prev) => [...prev, { ts: Date.now(), kind, step, detail }]);
+    },
+    [],
+  );
+
+  /** Run `op`, log ok/err, and re-throw with step prefix for outer catch. */
+  const step = useCallback(
+    async <T,>(label: string, op: () => Promise<T>): Promise<T> => {
+      logDiag('info', label);
+      try {
+        const out = await op();
+        logDiag('ok', label);
+        return out;
+      } catch (err) {
+        const msg = errorMessage(err);
+        const stack = err instanceof Error ? err.stack : undefined;
+        logDiag('err', label, msg);
+        if (stack) setErrorStack(stack);
+        throw err;
+      }
+    },
+    [logDiag],
+  );
 
   const adapterRef = useRef<LiveKitAdapter | null>(null);
   const callKeyRef = useRef<CallKey | null>(null);
@@ -195,21 +231,25 @@ function CallInner({ roomId }: { roomId: string }) {
     async (callId: string, initialCallKey: CallKey) => {
       const dev = deviceRef.current;
       if (!dev) throw new Error('no device');
-      const adapter = new LiveKitAdapter({
-        callId,
-        deviceId: dev.deviceId,
-        initialCallKey,
-        tokenFetcher: makeDefaultTokenFetcher(),
+      const adapter = await step('new LiveKitAdapter', async () => {
+        return new LiveKitAdapter({
+          callId,
+          deviceId: dev.deviceId,
+          initialCallKey,
+          tokenFetcher: makeDefaultTokenFetcher(),
+        });
       });
       adapter.on(onAdapterEvent);
       adapterRef.current = adapter;
-      await adapter.connect();
+      await step('adapter.connect (fetch JWT + ws + setE2EE)', () =>
+        adapter.connect(),
+      );
       attachRoomEvents(adapter);
-      await adapter.publishLocalMedia();
+      await step('publishLocalMedia', () => adapter.publishLocalMedia());
       setUiState('in_call');
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
+    [step],
   );
 
   // ---- heartbeat: every 10s while in_call, update last_seen_at ---------
@@ -372,12 +412,12 @@ function CallInner({ roomId }: { roomId: string }) {
     if (!userId || !device) return;
     setUiState('starting');
     setError(null);
+    setErrorStack(null);
+    setDiag([]);
     try {
-      const { callId, callKey } = await startCallInRoom({
-        roomId,
-        userId,
-        device,
-      });
+      const { callId, callKey } = await step('startCallInRoom', () =>
+        startCallInRoom({ roomId, userId, device }),
+      );
       callKeyRef.current = callKey;
       keyedGenRef.current = callKey.generation;
       await connectAdapterWith(callId, callKey);
@@ -387,7 +427,7 @@ function CallInner({ roomId }: { roomId: string }) {
       await teardown('error');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectAdapterWith, device, roomId, userId]);
+  }, [connectAdapterWith, device, roomId, userId, step]);
 
   // ---- join ----------------------------------------------------------------
   const doJoin = useCallback(
@@ -395,41 +435,42 @@ function CallInner({ roomId }: { roomId: string }) {
       if (!device) return;
       setUiState('joining');
       setError(null);
+      setErrorStack(null);
+      setDiag([]);
       try {
-        const { currentGeneration } = await rpcJoinCall({
-          callId: call.id,
-          deviceId: device.deviceId,
-        });
+        const { currentGeneration } = await step('join_call RPC', () =>
+          rpcJoinCall({ callId: call.id, deviceId: device.deviceId }),
+        );
 
-        // Best case: a prior envelope at current_generation exists for us.
-        // (Happens when we're the initiator's target or the rotator has
-        // already processed a prior member_joined.)
-        const existing = await fetchAndUnwrapCallKey({
-          callId: call.id,
-          generation: currentGeneration,
-          device,
-        });
+        const existing = await step('fetchAndUnwrapCallKey', () =>
+          fetchAndUnwrapCallKey({
+            callId: call.id,
+            generation: currentGeneration,
+            device,
+          }),
+        );
         if (existing) {
           callKeyRef.current = existing;
           keyedGenRef.current = currentGeneration;
           await connectAdapterWith(call.id, existing);
-          await broadcastCallSignaling(call.id, {
-            type: 'member_joined',
-            deviceId: device.deviceId,
-          });
+          await step('broadcast member_joined (post-connect)', () =>
+            broadcastCallSignaling(call.id, {
+              type: 'member_joined',
+              deviceId: device.deviceId,
+            }),
+          );
           return;
         }
 
-        // Otherwise: enter "waiting for rotator" mode. The rotator will be
-        // woken by our broadcast; when it bumps the gen, our `calls`
-        // subscription's onGenerationMaybeBumped will finish the connect.
+        // Waiting for rotator — the `calls` UPDATE subscription will pick us up.
         waitingForEnvelopeRef.current = true;
         joiningCallIdRef.current = call.id;
-        await broadcastCallSignaling(call.id, {
-          type: 'member_joined',
-          deviceId: device.deviceId,
-        });
-        // State stays at `joining` until connectAdapterWith flips it.
+        await step('broadcast member_joined (awaiting rotation)', () =>
+          broadcastCallSignaling(call.id, {
+            type: 'member_joined',
+            deviceId: device.deviceId,
+          }),
+        );
       } catch (e) {
         waitingForEnvelopeRef.current = false;
         joiningCallIdRef.current = null;
@@ -439,7 +480,7 @@ function CallInner({ roomId }: { roomId: string }) {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [connectAdapterWith, device],
+    [connectAdapterWith, device, step],
   );
 
   // ---- leave / end ---------------------------------------------------------
@@ -524,9 +565,53 @@ function CallInner({ roomId }: { roomId: string }) {
       </div>
 
       {error && (
-        <div className="rounded bg-red-50 border border-red-200 p-3 text-sm text-red-800">
-          {error}
+        <div className="rounded bg-red-50 border border-red-200 p-3 text-sm text-red-800 space-y-2">
+          <div>
+            <span className="font-semibold">Error:</span> {error}
+          </div>
+          {errorStack && (
+            <details className="text-xs">
+              <summary className="cursor-pointer select-none text-red-700 hover:underline">
+                stack trace
+              </summary>
+              <pre className="mt-1 whitespace-pre-wrap break-all font-mono text-[10px] leading-snug">
+                {errorStack}
+              </pre>
+            </details>
+          )}
         </div>
+      )}
+
+      {diag.length > 0 && (
+        <details className="rounded border border-neutral-200 bg-neutral-50 p-2 text-xs" open>
+          <summary className="cursor-pointer select-none font-semibold text-neutral-700">
+            diagnostics ({diag.length} step{diag.length === 1 ? '' : 's'})
+          </summary>
+          <ol className="mt-2 space-y-0.5 font-mono text-[11px]">
+            {diag.map((d, i) => (
+              <li
+                key={i}
+                className={
+                  d.kind === 'err'
+                    ? 'text-red-700'
+                    : d.kind === 'ok'
+                      ? 'text-green-700'
+                      : 'text-neutral-600'
+                }
+              >
+                <span className="opacity-50">
+                  {new Date(d.ts).toISOString().slice(11, 23)}
+                </span>{' '}
+                {d.kind === 'err' ? '✗' : d.kind === 'ok' ? '✓' : '·'} {d.step}
+                {d.detail && (
+                  <div className="ml-6 whitespace-pre-wrap break-all text-[10px]">
+                    {d.detail}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ol>
+        </details>
       )}
 
       {uiState === 'idle' && !activeCall && (
