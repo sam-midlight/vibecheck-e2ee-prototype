@@ -19,7 +19,9 @@ import {
   ExternalE2EEKeyProvider,
   Room,
   RoomEvent,
+  isLocalParticipant,
   type LocalParticipant,
+  type Participant,
   type RemoteParticipant,
 } from 'livekit-client';
 import type { CallKey } from '@/lib/e2ee-core';
@@ -180,6 +182,26 @@ export class LiveKitAdapter {
       this.setEncryptionState('failed', err instanceof Error ? err.message : String(err));
     });
 
+    // `room.isE2EEEnabled` is updated AFTER the E2EEManager reports a
+    // successful cryptor setup for the local participant via this event —
+    // which only fires once an encrypted track is published. Synchronous
+    // assertion after `setE2EEEnabled(true)` is racy; this event is the
+    // canonical "encryption is actually live" signal.
+    this.room.on(
+      RoomEvent.ParticipantEncryptionStatusChanged,
+      (enabled: boolean, participant?: Participant) => {
+        if (!participant || !isLocalParticipant(participant)) return;
+        if (enabled) {
+          this.setEncryptionState('active');
+        } else {
+          this.setEncryptionState(
+            'failed',
+            'local participant encryption went off mid-call',
+          );
+        }
+      },
+    );
+
     // Bail early if the browser can't do insertable streams at all. LiveKit
     // would silently fall back to plain SRTP in that case.
     if (!browserSupportsE2EE()) {
@@ -232,23 +254,11 @@ export class LiveKitAdapter {
     const tok = await this.fetchToken();
     this.currentToken = tok;
     await this.room.connect(tok.url, tok.jwt);
+    // Enable E2EE mode. With no tracks yet this only flips the flag — the
+    // `ParticipantEncryptionStatusChanged` event (that flips us to
+    // 'active') only fires once the first encrypted track is published.
+    // `publishLocalMedia` handles the wait-for-active + timeout.
     await this.room.setE2EEEnabled(true);
-
-    // Assert: setE2EEEnabled resolves even when the underlying pipeline
-    // fails silently (worker never loaded, no insertable-streams, etc.).
-    // `isE2EEEnabled` is the post-conditional truth.
-    if (!this.room.isE2EEEnabled) {
-      this.setEncryptionState(
-        'failed',
-        'setE2EEEnabled resolved but isE2EEEnabled is false',
-      );
-      await this.room.disconnect(true);
-      throw new Error(
-        'refusing to stay connected: E2EE did not engage on this Room — ' +
-          'the SFU would see plaintext frames',
-      );
-    }
-    this.setEncryptionState('active');
 
     this.scheduleRenewal();
     this.installVisibilityHandler();
@@ -256,10 +266,55 @@ export class LiveKitAdapter {
 
   /**
    * Publish local camera + microphone tracks with QVGA constraints applied.
-   * Callers can call this after `connect()` to start broadcasting.
+   * Must be called after `connect()`. Blocks until LiveKit confirms the
+   * local participant's cryptor is live (encryptionState → 'active') or
+   * `encryptionWaitMs` elapses (default 15s). On timeout, disconnects and
+   * throws — we never stay connected with tracks in flight while
+   * encryption is not confirmed.
    */
-  async publishLocalMedia(): Promise<void> {
+  async publishLocalMedia(encryptionWaitMs = 15_000): Promise<void> {
     await this.room.localParticipant.enableCameraAndMicrophone();
+    await this.awaitEncryptionActive(encryptionWaitMs);
+  }
+
+  private async awaitEncryptionActive(timeoutMs: number): Promise<void> {
+    if (this._encryptionState === 'active') return;
+    if (this._encryptionState === 'failed' || this._encryptionState === 'unsupported') {
+      throw new Error(`E2EE is in ${this._encryptionState} state — refusing to continue`);
+    }
+    await new Promise<void>((resolve, reject) => {
+      const unlisten = this.on((ev) => {
+        if (ev.type !== 'encryption_state') return;
+        if (ev.state === 'active') {
+          clearTimeout(timer);
+          unlisten();
+          resolve();
+        } else if (ev.state === 'failed' || ev.state === 'unsupported') {
+          clearTimeout(timer);
+          unlisten();
+          reject(
+            new Error(
+              `E2EE state flipped to ${ev.state} while awaiting activation: ${ev.detail ?? '(no detail)'}`,
+            ),
+          );
+        }
+      });
+      const timer = setTimeout(() => {
+        unlisten();
+        this.setEncryptionState(
+          'failed',
+          `timed out after ${timeoutMs}ms waiting for ParticipantEncryptionStatusChanged(enabled=true). ` +
+            `The SFU may be receiving plaintext frames — disconnecting.`,
+        );
+        void this.room.disconnect(true);
+        reject(
+          new Error(
+            `refusing to stay connected: E2EE did not engage within ${timeoutMs}ms — ` +
+              `the SFU would see plaintext frames`,
+          ),
+        );
+      }, timeoutMs);
+    });
   }
 
   /**
