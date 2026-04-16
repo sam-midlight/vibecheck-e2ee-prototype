@@ -37,13 +37,16 @@ import {
   fetchUserMasterKeyPub,
   insertBlob,
   kickAndRotate,
+  fetchActiveCallForRoom,
   listBlobs,
   listMyRoomKeyRows,
   listRoomMembers,
   renameRoom,
   subscribeBlobs,
+  subscribeRoomCalls,
   uploadAttachment,
   type BlobRow,
+  type CallRow,
   type RoomMemberRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
@@ -135,6 +138,7 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [staleMembership, setStaleMembership] = useState(false);
   const [leaveBusy, setLeaveBusy] = useState(false);
+  const [activeCall, setActiveCall] = useState<CallRow | null>(null);
   const roomKeyRef = useRef<RoomKey | null>(null);
   const roomKeysByGenRef = useRef<Map<number, RoomKey>>(new Map());
 
@@ -286,13 +290,50 @@ function RoomInner({ roomId }: { roomId: string }) {
     return unsub;
   }, [roomId, device, userId, ingestBlobRow]);
 
-  // Poll every 30s for room metadata changes (name, generation, members)
+  // Poll every 10s for room metadata changes (name, generation, members)
   // from other devices. Rooms table is not in realtime publication.
+  //
+  // Load-bearing: if loadAll throws STALE_MEMBERSHIP here (e.g. the room
+  // admin kicked us while we had the page open), we flip to the stale UI
+  // instead of silently swallowing. Without this, the kicked user keeps
+  // staring at a stale feed forever.
   useEffect(() => {
     if (!device || !userId) return;
-    const interval = setInterval(() => void loadAll(userId, device), 30_000);
+    const tick = async () => {
+      try {
+        await loadAll(userId, device);
+      } catch (e) {
+        if ((e as { staleMembership?: boolean } | null)?.staleMembership) {
+          setStaleMembership(true);
+        }
+        // Non-stale errors: leave the current view alone; next tick retries.
+      }
+    };
+    const interval = setInterval(() => void tick(), 10_000);
     return () => clearInterval(interval);
   }, [device, userId, loadAll]);
+
+  // Live-call indicator: subscribe to `calls` for this room + seed the
+  // current state on mount. Drives the call button's "live" badge.
+  useEffect(() => {
+    let cancelled = false;
+    void fetchActiveCallForRoom(roomId).then((row) => {
+      if (!cancelled) setActiveCall(row);
+    });
+    const unsub = subscribeRoomCalls(roomId, (row, event) => {
+      if (event === 'INSERT') {
+        setActiveCall((prev) => prev ?? row);
+      } else if (row.ended_at != null) {
+        setActiveCall((prev) => (prev?.id === row.id ? null : prev));
+      } else {
+        setActiveCall(row);
+      }
+    });
+    return () => {
+      cancelled = true;
+      unsub();
+    };
+  }, [roomId]);
 
   if (loading) return <p className="text-sm text-neutral-500">loading…</p>;
   if (staleMembership) {
@@ -364,10 +405,24 @@ function RoomInner({ roomId }: { roomId: string }) {
         <div className="flex shrink-0 gap-2">
           <button
             onClick={() => router.push(`/rooms/${roomId}/call`)}
-            className="rounded bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700"
-            title="Start or join the E2EE video call for this room"
+            className={
+              activeCall
+                ? 'rounded bg-green-600 px-2 py-1 text-xs text-white hover:bg-green-700 flex items-center gap-1.5'
+                : 'rounded bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700'
+            }
+            title={
+              activeCall
+                ? 'A call is live in this room — click to join'
+                : 'Start an E2EE video call for this room'
+            }
           >
-            call
+            {activeCall && (
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-white opacity-75"></span>
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-white"></span>
+              </span>
+            )}
+            {activeCall ? 'join call' : 'call'}
           </button>
           <button
             onClick={() => setRenameOpen(true)}
