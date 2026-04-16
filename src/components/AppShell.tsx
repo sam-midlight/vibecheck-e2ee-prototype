@@ -4,6 +4,16 @@ import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { getSupabase } from '@/lib/supabase/client';
+import {
+  clearDeviceBundle,
+  clearUserMasterKey,
+  verifyDeviceIssuance,
+} from '@/lib/e2ee-core';
+import {
+  fetchPublicDevices,
+  fetchUserMasterKeyPub,
+} from '@/lib/supabase/queries';
+import { loadEnrolledDevice } from '@/lib/bootstrap';
 import { KeyChangeBanner } from './KeyChangeBanner';
 import { PendingApprovalBanner } from './PendingApprovalBanner';
 
@@ -22,10 +32,64 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
     const supabase = getSupabase();
     let mounted = true;
 
-    void supabase.auth.getUser().then(({ data }) => {
+    /**
+     * Verify that this tab's cached device identity still chains to the
+     * published UMK. If it doesn't (account nuked elsewhere, device revoked,
+     * UMK rotated), wipe local state + sign out so the user lands on the
+     * sign-in screen instead of poking around with stale keys.
+     */
+    async function ensureIdentityStillValid(uid: string): Promise<boolean> {
+      try {
+        const umkPub = await fetchUserMasterKeyPub(uid);
+        if (!umkPub) return false;
+        const local = await loadEnrolledDevice(uid);
+        if (!local) return false;
+        const devices = await fetchPublicDevices(uid);
+        const mine = devices.find((d) => d.deviceId === local.deviceBundle.deviceId);
+        if (!mine) return false;
+        await verifyDeviceIssuance(
+          {
+            userId: uid,
+            deviceId: mine.deviceId,
+            deviceEd25519PublicKey: mine.ed25519PublicKey,
+            deviceX25519PublicKey: mine.x25519PublicKey,
+            createdAtMs: mine.createdAtMs,
+          },
+          mine.issuanceSignature,
+          umkPub.ed25519PublicKey,
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    async function bootOut(uid: string | null) {
+      if (uid) {
+        await clearDeviceBundle(uid).catch(() => {});
+        await clearUserMasterKey(uid).catch(() => {});
+      }
+      await supabase.auth.signOut().catch(() => {});
+      router.replace('/');
+    }
+
+    void supabase.auth.getUser().then(async ({ data }) => {
       if (!mounted) return;
       setEmail(data.user?.email ?? null);
-      if (requireAuth && !data.user) router.replace('/');
+      if (!requireAuth) {
+        setChecking(false);
+        return;
+      }
+      if (!data.user) {
+        router.replace('/');
+        return;
+      }
+      const ok = await ensureIdentityStillValid(data.user.id);
+      if (!mounted) return;
+      if (!ok) {
+        await bootOut(data.user.id);
+        return;
+      }
       setChecking(false);
     });
 

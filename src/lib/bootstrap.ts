@@ -23,12 +23,14 @@ import {
   type DeviceKeyBundle,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
+import { getSupabase } from '@/lib/supabase/client';
 import {
   fetchPublicDevices,
   fetchUserMasterKeyPub,
   publishUserMasterKey,
   registerDevice,
 } from '@/lib/supabase/queries';
+import { toBase64 } from '@/lib/e2ee-core';
 
 export function inferDeviceName(): string {
   if (typeof navigator === 'undefined') return 'device';
@@ -168,6 +170,91 @@ export async function fetchAndVerifyDevices(userId: string) {
   const all = await fetchPublicDevices(userId);
   const active = await filterActiveDevices(all, umkPub.ed25519PublicKey);
   return { umkPub, devices: active };
+}
+
+/**
+ * Rotate the User Master Key. Generates a fresh UMK, UMK-signs new issuance
+ * certs for every current device on the user's account (preserving each
+ * device's existing ed/x pubs and created_at — only the cert signature
+ * changes), publishes the new UMK pub (which trips the identity_epoch
+ * bump trigger), and writes the new certs back to the devices rows.
+ *
+ * Side-effect: every OTHER device on this account becomes an orphan. Their
+ * locally-cached UMK pub is stale, so on next app load the AppShell sanity
+ * check will sign them out. They must re-enrol via approval (from this
+ * device, now holding the new UMK) or via the new recovery phrase.
+ *
+ * Must be called from a device that currently holds the UMK priv.
+ */
+export async function rotateUserMasterKey(
+  userId: string,
+  oldUmk: UserMasterKey,
+): Promise<UserMasterKey> {
+  // Sanity: make sure the caller really has the current UMK priv. We derive
+  // the pub from the priv and compare to published — if they differ, we're
+  // already on a fork.
+  const publishedOld = await fetchUserMasterKeyPub(userId);
+  if (!publishedOld) throw new Error('no published UMK — nothing to rotate');
+  if (!bytesEq(publishedOld.ed25519PublicKey, oldUmk.ed25519PublicKey)) {
+    throw new Error(
+      'local UMK does not match published UMK — refusing to rotate from a stale copy',
+    );
+  }
+
+  // Fetch + verify all current devices under the OLD UMK. Revoked/broken
+  // ones are skipped so we don't re-issue certs for ghost rows.
+  const activeDevices = await filterActiveDevices(
+    await fetchPublicDevices(userId),
+    oldUmk.ed25519PublicKey,
+  );
+  if (activeDevices.length === 0) {
+    throw new Error('no active devices to re-sign — rotation aborted');
+  }
+
+  const newUmk = await generateUserMasterKey();
+
+  // Re-sign each device's issuance cert with the new UMK priv, keeping
+  // everything else about the device stable.
+  const reissued = await Promise.all(
+    activeDevices.map(async (d) => {
+      const sig = await signDeviceIssuance(
+        {
+          userId,
+          deviceId: d.deviceId,
+          deviceEd25519PublicKey: d.ed25519PublicKey,
+          deviceX25519PublicKey: d.x25519PublicKey,
+          createdAtMs: d.createdAtMs,
+        },
+        newUmk.ed25519PrivateKey,
+      );
+      return { deviceId: d.deviceId, issuanceSignature: sig };
+    }),
+  );
+
+  // Publish the new UMK pub. The bump_identity_epoch trigger fires on this
+  // UPDATE (ed25519_pub changed), so every stale client that caches a
+  // previous epoch will be detectable.
+  await publishUserMasterKey(userId, { ed25519PublicKey: newUmk.ed25519PublicKey });
+
+  // Write the new issuance signatures back to the device rows. Each row is
+  // this user's own, so RLS (devices_update_self) permits the updates. We
+  // issue them in parallel — any individual failure leaves the account in
+  // a partially-rotated state, which the next rotation will converge.
+  const supabase = getSupabase();
+  await Promise.all(
+    reissued.map(async ({ deviceId, issuanceSignature }) => {
+      const { error } = await supabase
+        .from('devices')
+        .update({ issuance_signature: await toBase64(issuanceSignature) })
+        .eq('id', deviceId);
+      if (error) throw error;
+    }),
+  );
+
+  // Replace the locally-held UMK with the new one.
+  await putUserMasterKey(userId, newUmk);
+
+  return newUmk;
 }
 
 export { getDeviceRecord, verifyPublicDevice };

@@ -14,8 +14,9 @@ import {
   type DeviceKeyBundle,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
+import { useRouter } from 'next/navigation';
 import { getSupabase } from '@/lib/supabase/client';
-import { deleteRecoveryBlob, hasRecoveryBlob } from '@/lib/supabase/queries';
+import { hasRecoveryBlob } from '@/lib/supabase/queries';
 
 export default function SettingsPage() {
   return (
@@ -26,6 +27,7 @@ export default function SettingsPage() {
 }
 
 function SettingsInner() {
+  const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
   const [device, setDevice] = useState<DeviceKeyBundle | null>(null);
   const [umk, setUmk] = useState<UserMasterKey | null>(null);
@@ -74,7 +76,7 @@ function SettingsInner() {
     if (!userId) return;
     if (
       !confirm(
-        'Lock now? The plaintext identity copy is cleared from this device; you\u2019ll be prompted for your passphrase on the next visit. In-flight room sessions on this tab continue working until reload.',
+        'Lock now? The plaintext identity copy is cleared from this device and you\u2019ll be sent to the unlock screen. In-flight room tabs will also fail their next load.',
       )
     ) {
       return;
@@ -83,26 +85,13 @@ function SettingsInner() {
     setError(null);
     try {
       await clearDeviceBundle(userId);
+      // Also drop UMK priv from memory (if this device held it); unlock
+      // will re-materialize it from the wrapped blob using the passphrase.
+      const { clearUserMasterKey } = await import('@/lib/e2ee-core');
+      await clearUserMasterKey(userId);
+      router.replace('/auth/callback');
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleRemove() {
-    if (!userId) return;
-    if (!confirm('Remove recovery phrase? If you lose all your devices, you won\u2019t be able to recover this account.')) {
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      await deleteRecoveryBlob(userId);
-      setHasPhrase(false);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
       setBusy(false);
     }
   }
@@ -125,46 +114,34 @@ function SettingsInner() {
         </h2>
         {hasPhrase === null ? (
           <p className="text-sm text-neutral-500">checking…</p>
-        ) : hasPhrase ? (
+        ) : !umk ? (
+          <p className="text-xs text-neutral-600 dark:text-neutral-400">
+            This device doesn&apos;t hold the User Master Key, so it can&apos;t
+            rotate it. Open the app on your primary device (the one that
+            created this account, or the one you last used to enter a recovery
+            phrase) and rotate from there.
+          </p>
+        ) : (
           <div className="space-y-2">
-            <p className="text-sm text-emerald-700 dark:text-emerald-300">
-              A recovery phrase is set up for this account.
+            <p className="text-sm">
+              {hasPhrase
+                ? 'A recovery phrase is set up.'
+                : skipped
+                  ? 'You skipped setting up a recovery phrase.'
+                  : 'No recovery phrase is set up yet.'}
             </p>
             <p className="text-xs text-neutral-600 dark:text-neutral-400">
-              If you lose the phrase (or it leaks), generate a new one — the
-              old phrase stops working immediately.
-            </p>
-            <div className="flex gap-2">
-              <button
-                onClick={() => setShowModal(true)}
-                disabled={busy}
-                className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
-              >
-                rotate phrase
-              </button>
-              <button
-                onClick={() => void handleRemove()}
-                disabled={busy}
-                className="rounded border border-red-300 px-3 py-1.5 text-xs text-red-700 dark:border-red-800 dark:text-red-400"
-              >
-                remove phrase
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950">
-            <p className="text-sm">
-              {skipped
-                ? 'You skipped setting up a recovery phrase.'
-                : 'You don\u2019t have a recovery phrase.'}{' '}
-              If you lose every signed-in device, your account and its data
-              become unrecoverable.
+              Clicking below generates a fresh master key, re-signs every
+              device&apos;s cert under the new key, and wraps the new key
+              with a new 24-word phrase. Any other device you&apos;re signed
+              into becomes orphaned and will need to re-link.
             </p>
             <button
               onClick={() => setShowModal(true)}
-              className="mt-2 rounded bg-neutral-900 px-3 py-1.5 text-xs text-white dark:bg-white dark:text-neutral-900"
+              disabled={busy}
+              className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
             >
-              Set up recovery phrase
+              Rotate &amp; generate new phrase
             </button>
           </div>
         )}
@@ -238,10 +215,14 @@ function SettingsInner() {
           userId={userId}
           umk={umk}
           hideSkip
-          onDone={(result) => {
+          rotate
+          onDone={async (result) => {
             setShowModal(false);
             if (result === 'saved') {
               setHasPhrase(true);
+              // The rotation swapped the locally-held UMK; pick up the new one.
+              const { getUserMasterKey } = await import('@/lib/e2ee-core');
+              setUmk(await getUserMasterKey(userId));
               if (typeof window !== 'undefined') {
                 localStorage.removeItem(`recovery_skipped_${userId}`);
               }

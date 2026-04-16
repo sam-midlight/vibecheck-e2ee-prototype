@@ -19,6 +19,7 @@ import {
   wrapUserMasterKeyWithPhrase,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
+import { rotateUserMasterKey } from '@/lib/bootstrap';
 import { putRecoveryBlob } from '@/lib/supabase/queries';
 
 interface Props {
@@ -27,11 +28,17 @@ interface Props {
   onDone: (result: 'saved' | 'skipped') => void;
   /** If true, no "skip" button — used when rotating (must commit or cancel the rotate). */
   hideSkip?: boolean;
+  /**
+   * If true: rotate the UMK first (re-issue all device certs, bump
+   * identity_epoch), then wrap the NEW UMK with the generated phrase.
+   * The old blob becomes inert even if someone held a copy.
+   */
+  rotate?: boolean;
 }
 
 type Stage = 'intro' | 'display' | 'verify' | 'uploading' | 'error';
 
-export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip }: Props) {
+export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate }: Props) {
   const [stage, setStage] = useState<Stage>('intro');
   const [phrase, setPhrase] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,7 +53,10 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip }: Props) {
     setStage('uploading');
     setError(null);
     try {
-      const blob = await wrapUserMasterKeyWithPhrase(umk, phrase, userId);
+      const umkToWrap = rotate
+        ? await rotateUserMasterKey(userId, umk)
+        : umk;
+      const blob = await wrapUserMasterKeyWithPhrase(umkToWrap, phrase, userId);
       const encoded = await encodeRecoveryBlob(blob);
       await putRecoveryBlob({ userId, ...encoded });
       onDone('saved');

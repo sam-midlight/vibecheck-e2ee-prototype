@@ -268,9 +268,12 @@ export default function StatusPage() {
           unsubscribe();
           fn();
         };
+        // Free-tier Supabase realtime tenants cold-start: the first SUBSCRIBE
+        // after an idle period regularly takes 8–14 seconds to handshake.
+        // Give it 30 so a cold probe doesn't flash red on first page load.
         const timer = setTimeout(() => {
-          finish(() => reject(new Error('realtime subscription timeout (15s)')));
-        }, 15000);
+          finish(() => reject(new Error('realtime subscription timeout (30s)')));
+        }, 30000);
         const start = performance.now();
         let inserted = false;
         const insertOnce = async () => {

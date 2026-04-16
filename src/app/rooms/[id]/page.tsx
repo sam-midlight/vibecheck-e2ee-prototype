@@ -17,6 +17,7 @@ import {
   observeContact,
   prepareImageForUpload,
   rotateRoomKey,
+  signInviteEnvelope,
   signMembershipWrap,
   unwrapRoomKey,
   verifyMembershipWrap,
@@ -28,6 +29,7 @@ import {
   type RoomKey,
 } from '@/lib/e2ee-core';
 import {
+  createInvite,
   decodeBlobRow,
   deleteAttachment,
   deleteRoom,
@@ -297,6 +299,20 @@ function RoomInner({ roomId }: { roomId: string }) {
         onChange={() => void loadAll(userId, device)}
         onLeft={() => router.replace('/rooms')}
       />
+
+      {room.created_by === userId && (
+        <InRoomInviteForm
+          room={room}
+          roomName={roomName}
+          userId={userId}
+          device={device}
+          roomKey={roomKey}
+          currentMemberCount={
+            members.filter((m) => m.generation === room.current_generation).length
+          }
+          onInvited={() => void loadAll(userId, device)}
+        />
+      )}
 
       <BlobFeed
         blobs={blobs}
@@ -892,6 +908,155 @@ function ImageAttachment({
 }
 
 // Supabase Realtime tenants on free tier sleep when idle and cold-start on the
+/**
+ * In-room invite form (admin only). Mirrors the rooms-page InviteForm but
+ * pre-scoped to the current room — no room-picker, lifts pair-cap awareness
+ * from the member count already loaded in state.
+ */
+function InRoomInviteForm({
+  room,
+  roomName,
+  userId,
+  device,
+  roomKey,
+  currentMemberCount,
+  onInvited,
+}: {
+  room: RoomRow;
+  roomName: string | null;
+  userId: string;
+  device: DeviceKeyBundle;
+  roomKey: RoomKey;
+  currentMemberCount: number;
+  onInvited: () => void;
+}) {
+  const [inviteeId, setInviteeId] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const pairFull = room.kind === 'pair' && currentMemberCount >= 2;
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      if (!inviteeId.trim()) throw new Error('enter a user id');
+      if (pairFull) {
+        throw new Error('pair rooms are capped at 2; remove someone first');
+      }
+      if (inviteeId === userId) {
+        throw new Error("that's your own user id");
+      }
+
+      const inviteeUmk = await fetchUserMasterKeyPub(inviteeId);
+      if (!inviteeUmk) throw new Error('that user has no published UMK');
+      const inviteeDevices = await fetchPublicDevices(inviteeId);
+      const active: PublicDevice[] = [];
+      for (const d of inviteeDevices) {
+        try {
+          await verifyPublicDevice(d, inviteeUmk.ed25519PublicKey);
+          active.push(d);
+        } catch {
+          // skip revoked/invalid
+        }
+      }
+      if (active.length === 0) throw new Error('invitee has no active signed devices');
+      const targetDev = active[active.length - 1];
+
+      const tofu = await observeContact(inviteeId, {
+        ed25519PublicKey: inviteeUmk.ed25519PublicKey,
+        x25519PublicKey: targetDev.x25519PublicKey,
+        selfSignature: new Uint8Array(0),
+      });
+      if (tofu.status === 'changed') {
+        throw new Error(
+          "invitee's UMK has changed since you last saw it — acknowledge the key change before inviting",
+        );
+      }
+
+      const inviteeWrap = await wrapRoomKeyFor(roomKey, targetDev.x25519PublicKey);
+      const expiresAtMs = Date.now() + 60 * 60 * 24 * 7 * 1000;
+      const envelopeSig = await signInviteEnvelope(
+        {
+          roomId: room.id,
+          generation: room.current_generation,
+          invitedUserId: inviteeId,
+          invitedDeviceId: targetDev.deviceId,
+          invitedDeviceEd25519PublicKey: targetDev.ed25519PublicKey,
+          invitedDeviceX25519PublicKey: targetDev.x25519PublicKey,
+          wrappedRoomKey: inviteeWrap.wrapped,
+          inviterUserId: userId,
+          inviterDeviceId: device.deviceId,
+          expiresAtMs,
+        },
+        device.ed25519PrivateKey,
+      );
+      await createInvite({
+        roomId: room.id,
+        invitedUserId: inviteeId,
+        invitedDeviceId: targetDev.deviceId,
+        invitedEd25519Pub: targetDev.ed25519PublicKey,
+        invitedX25519Pub: targetDev.x25519PublicKey,
+        generation: room.current_generation,
+        wrappedRoomKey: inviteeWrap.wrapped,
+        createdBy: userId,
+        inviterDeviceId: device.deviceId,
+        inviterSignature: envelopeSig,
+        expiresAtMs,
+      });
+      setStatus('Invite sent.');
+      setInviteeId('');
+      onInvited();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form
+      onSubmit={submit}
+      className="space-y-2 rounded border border-neutral-200 p-3 text-sm dark:border-neutral-800"
+    >
+      <h3 className="text-sm font-semibold">
+        Invite someone to{' '}
+        {roomName ? (
+          <span>&ldquo;{roomName}&rdquo;</span>
+        ) : (
+          <code className="font-mono text-xs">{room.id.slice(0, 8)}</code>
+        )}
+      </h3>
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={inviteeId}
+          onChange={(e) => setInviteeId(e.target.value)}
+          placeholder="user id (uuid)"
+          className="flex-1 rounded border border-neutral-300 px-2 py-1 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-900"
+        />
+        <button
+          type="submit"
+          disabled={busy || pairFull}
+          className="rounded bg-neutral-900 px-3 py-1 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+        >
+          {busy ? 'sending…' : 'invite'}
+        </button>
+      </div>
+      {pairFull && (
+        <p className="text-xs text-amber-700 dark:text-amber-400">
+          Pair rooms are 2 people; remove someone first.
+        </p>
+      )}
+      {status && <p className="text-xs text-emerald-700 dark:text-emerald-400">{status}</p>}
+      {error && <p className="text-xs text-red-600 dark:text-red-400">{error}</p>}
+    </form>
+  );
+}
+
 // next subscribe. That handshake can flash CHANNEL_ERROR / TIMED_OUT for a few
 // seconds before flipping to SUBSCRIBED. Showing the raw amber "channel_error"
 // immediately makes the app look broken when it's actually just waking up, so
