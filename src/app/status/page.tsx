@@ -198,15 +198,21 @@ export default function StatusPage() {
     });
 
     await runStep(CHECK_NAMES[3], async () => {
-      // In v3 the published "self_signature" is gone; we instead verify that
-      // this device's cert chains to the published UMK pub.
+      // Verify this device's cert chains through the MSK→SSK cross-sig chain.
       const umkPub = await fetchUserMasterKeyPub(userId);
       if (!umkPub) throw new Error('No UMK on server.');
       const devices = await fetchPublicDevices(userId);
       const me = devices.find((d) => d.deviceId === ctx.device!.deviceId);
       if (!me) throw new Error('This device not in published device list.');
-      await verifyPublicDevice(me, umkPub.ed25519PublicKey);
-      return { detail: 'device cert verifies against published UMK' };
+      // Verify SSK cross-sig if present, pass SSK pub for v2 cert dispatch.
+      let sskPub: Uint8Array | undefined;
+      if (umkPub.sskPub && umkPub.sskCrossSignature) {
+        const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
+        await verifySskCrossSignature(umkPub.ed25519PublicKey, umkPub.sskPub, umkPub.sskCrossSignature);
+        sskPub = umkPub.sskPub;
+      }
+      await verifyPublicDevice(me, umkPub.ed25519PublicKey, sskPub);
+      return { detail: sskPub ? 'device cert (v2) verifies via MSK→SSK chain' : 'device cert (v1) verifies against MSK' };
     });
 
     await runStep(CHECK_NAMES[4], async () => {
@@ -869,6 +875,12 @@ async function findOrCreateTestRoom(
       );
       return { roomId: keep.id, roomKey };
     }
+    // Stale probe room (e.g. after identity nuke) — delete it so we
+    // create a fresh one with valid membership below.
+    await supabase.from('rooms').delete().eq('id', keep.id).then(
+      () => undefined,
+      (err) => console.warn('stale status-room cleanup failed', err),
+    );
   }
 
   const room = await createRoom({ kind: 'group', createdBy: userId });
