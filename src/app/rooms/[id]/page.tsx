@@ -48,6 +48,7 @@ import {
   renameRoom,
   subscribeBlobs,
   subscribeRoomCalls,
+  subscribeRoomMetadata,
   listMegolmSharesForDevice,
   uploadAttachment,
   type BlobRow,
@@ -331,13 +332,16 @@ function RoomInner({ roomId }: { roomId: string }) {
     return unsub;
   }, [roomId, device, userId, ingestBlobRow]);
 
-  // Poll every 10s for room metadata changes (name, generation, members)
-  // from other devices. Rooms table is not in realtime publication.
+  // React to room metadata changes (generation bumps from kick_and_rotate,
+  // renames, member joins/leaves). Migration 0032 put `rooms` and
+  // `room_members` in the realtime publication — a push event fires in ms
+  // so `ensureFreshSession` on the next send sees the latest generation and
+  // distributes the new outbound session to the full post-join member set.
+  // Keep a 30s poll as a backstop against transient realtime disconnects.
   //
   // Load-bearing: if loadAll throws STALE_MEMBERSHIP here (e.g. the room
   // admin kicked us while we had the page open), we flip to the stale UI
-  // instead of silently swallowing. Without this, the kicked user keeps
-  // staring at a stale feed forever.
+  // instead of silently swallowing.
   useEffect(() => {
     if (!device || !userId) return;
     const tick = async () => {
@@ -347,12 +351,15 @@ function RoomInner({ roomId }: { roomId: string }) {
         if ((e as { staleMembership?: boolean } | null)?.staleMembership) {
           setStaleMembership(true);
         }
-        // Non-stale errors: leave the current view alone; next tick retries.
       }
     };
-    const interval = setInterval(() => void tick(), 10_000);
-    return () => clearInterval(interval);
-  }, [device, userId, loadAll]);
+    const unsub = subscribeRoomMetadata(roomId, () => void tick());
+    const interval = setInterval(() => void tick(), 30_000);
+    return () => {
+      unsub();
+      clearInterval(interval);
+    };
+  }, [roomId, device, userId, loadAll]);
 
   // Live-call indicator: subscribe to `calls` for this room + seed the
   // current state on mount. Drives the call button's "live" badge.

@@ -1717,6 +1717,40 @@ export function subscribeRoomCalls(
   };
 }
 
+/**
+ * Realtime: room metadata changes (generation bumps, renames). Migration
+ * 0032 publishes `rooms`; prior to that, clients polled every 10s and
+ * missed the window between "User 2 accepts invite" and "User A sends",
+ * causing User A to reuse a stale outbound Megolm session that had no
+ * share for User 2. `room_members` is deliberately NOT in the realtime
+ * publication (0009 dropped it to close a metadata-leak surface), but
+ * every membership change goes through `kick_and_rotate` which UPDATEs
+ * `rooms.current_generation` in the same transaction — so this single
+ * subscription catches them all.
+ */
+export function subscribeRoomMetadata(
+  roomId: string,
+  onChange: () => void,
+): () => void {
+  const supabase = getSupabase();
+  const channel = supabase
+    .channel(`room-meta:${roomId}:${crypto.randomUUID()}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'rooms',
+        filter: `id=eq.${roomId}`,
+      },
+      () => onChange(),
+    )
+    .subscribe();
+  return () => {
+    void supabase.removeChannel(channel);
+  };
+}
+
 export async function nukeIdentityServer(userId: string): Promise<void> {
   const supabase = getSupabase();
   // Single SECURITY DEFINER RPC that handles all FK-ordered deletes
