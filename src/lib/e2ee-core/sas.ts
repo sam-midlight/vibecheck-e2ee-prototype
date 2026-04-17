@@ -116,8 +116,12 @@ export async function deriveSasEmoji(params: {
     params.aliceEphemeralPub,
     params.bobEphemeralPub,
   );
-  // HKDF-extract then expand to get 6 bytes
-  const prk = sodium.crypto_auth_hmacsha256(params.sharedSecret, info);
+  // HKDF-extract then expand to get 6 bytes.
+  // libsodium-wrappers signature is (message, key) — sharedSecret is the
+  // 32-byte key; info is the variable-length message. Swapping them trips
+  // libsodium's 32-byte key-length check (info is 148 bytes) → "invalid
+  // key length". Keep message first, key second.
+  const prk = sodium.crypto_auth_hmacsha256(info, params.sharedSecret);
   // Take first 6 bytes → 48 bits → 7 × 6-bit emoji indices.
   const raw = prk.slice(0, 6);
   sodium.memzero(prk);

@@ -40,6 +40,16 @@ export type VerificationBreakListener = (event: VerificationBreakEvent) => void;
 const listeners = new Set<KeyChangeListener>();
 const verifyBreakListeners = new Set<VerificationBreakListener>();
 
+/**
+ * Per-userId de-dup of emitted "changed" events. Many call sites run
+ * observeContact (every blob decode, every invite path, every room load);
+ * without this, a single nuke+re-enroll by a peer surfaces as N simultaneous
+ * banners. Key is userId, value is the new ed25519 pub we've already
+ * reported for that user. Cleared in acceptKeyChange so subsequent
+ * rotations still alert.
+ */
+const emittedFor = new Map<string, Uint8Array>();
+
 /** Subscribe to key-change events across the whole app. Returns an unsubscriber. */
 export function onKeyChange(listener: KeyChangeListener): () => void {
   listeners.add(listener);
@@ -132,6 +142,16 @@ export async function observeContact(
     detectedAt: now,
   };
 
+  // De-dup: if we already reported THIS new ed pub for THIS user, return
+  // the changed event (so callers like observeContact's own consumers can
+  // still react) but skip emitting to listeners. Another call site seeing
+  // the same rotation shouldn't produce another banner.
+  const alreadyEmitted = emittedFor.get(userId);
+  if (alreadyEmitted && (await bytesEqual(alreadyEmitted, pub.ed25519PublicKey))) {
+    return { status: 'changed', event };
+  }
+  emittedFor.set(userId, pub.ed25519PublicKey);
+
   // Escalate if this was a SAS-verified contact — their MSK changed,
   // breaking the verification chain. UI should show a loud red alert.
   if (cached.verified && cached.verifiedAt) {
@@ -166,6 +186,10 @@ export async function acceptKeyChange(
     verified: false, // key changed → verification is broken; must re-verify
     verifiedAt: undefined,
   });
+  // Clear the emit-dedupe so a FUTURE rotation (another nuke later) still
+  // surfaces a banner — we only want to suppress the concurrent duplicates
+  // from the same rotation event.
+  emittedFor.delete(userId);
 }
 
 /**
