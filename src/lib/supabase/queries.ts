@@ -870,21 +870,23 @@ export async function insertMegolmSessionShare(params: {
   shareSignature: string;
 }): Promise<void> {
   const supabase = getSupabase();
-  // `ignoreDuplicates` skips the row when (session_id, recipient_device_id)
-  // already exists — avoids 42501 (no UPDATE policy on the table) and keeps
-  // the earliest snapshot, which covers more history than a later one.
-  const { error } = await supabase.from('megolm_session_shares').upsert(
-    {
-      session_id: params.sessionId,
-      recipient_device_id: params.recipientDeviceId,
-      sealed_snapshot: params.sealedSnapshot,
-      start_index: params.startIndex,
-      signer_device_id: params.signerDeviceId,
-      share_signature: params.shareSignature,
-    },
-    { onConflict: 'session_id,recipient_device_id', ignoreDuplicates: true },
-  );
-  if (error) throw error;
+  // Plain INSERT + client-side 23505 swallow. We cannot use any form of
+  // `ON CONFLICT` here: Postgres evaluates the table's SELECT policy USING
+  // clause against the NEW row whenever ON CONFLICT is present, regardless
+  // of whether a conflict actually exists. The SELECT policy restricts
+  // visibility to `recipient_device_id` owned by `auth.uid()` — so every
+  // cross-user share (i.e. most shares) would fail 42501. On real duplicate
+  // key, Postgres returns 23505 which we treat as idempotent success; the
+  // earliest snapshot wins, which covers more history than a later one.
+  const { error } = await supabase.from('megolm_session_shares').insert({
+    session_id: params.sessionId,
+    recipient_device_id: params.recipientDeviceId,
+    sealed_snapshot: params.sealedSnapshot,
+    start_index: params.startIndex,
+    signer_device_id: params.signerDeviceId,
+    share_signature: params.shareSignature,
+  });
+  if (error && error.code !== '23505') throw error;
 }
 
 export interface MegolmSessionShareRow {
