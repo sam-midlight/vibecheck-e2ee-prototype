@@ -91,6 +91,15 @@ async function verifyLocalChainOrMarkOrphan(
       publishedUmk.ed25519PublicKey,
     ));
   if (!umkPubsMatch) return 'orphan';
+  // Verify SSK cross-sig if present for v2 cert dispatch.
+  let sskPub: Uint8Array | undefined;
+  if (publishedUmk.sskPub && publishedUmk.sskCrossSignature) {
+    try {
+      const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
+      await verifySskCrossSignature(publishedUmk.ed25519PublicKey, publishedUmk.sskPub, publishedUmk.sskCrossSignature);
+      sskPub = publishedUmk.sskPub;
+    } catch { /* fall back to MSK-only */ }
+  }
   const devices = await fetchPublicDevices(uid);
   const myDevice = devices.find(
     (d) => d.deviceId === local.deviceBundle.deviceId,
@@ -107,6 +116,7 @@ async function verifyLocalChainOrMarkOrphan(
       },
       myDevice.issuanceSignature,
       publishedUmk.ed25519PublicKey,
+      sskPub,
     );
   } catch {
     return 'orphan';
@@ -762,6 +772,15 @@ function AwaitingApproval({
         const tryInstall = async () => {
           const umkPub = await fetchUserMasterKeyPub(userId);
           if (!umkPub) return;
+          // Verify SSK cross-sig for v2 cert dispatch.
+          let pollSskPub: Uint8Array | undefined;
+          if (umkPub.sskPub && umkPub.sskCrossSignature) {
+            try {
+              const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
+              await verifySskCrossSignature(umkPub.ed25519PublicKey, umkPub.sskPub, umkPub.sskCrossSignature);
+              pollSskPub = umkPub.sskPub;
+            } catch { /* fall back */ }
+          }
           const devices = await fetchPublicDevices(userId);
           const mine = devices.find((d) => d.deviceId === deviceId);
           if (!mine) return;
@@ -777,6 +796,7 @@ function AwaitingApproval({
             },
             mine.issuanceSignature,
             umkPub.ed25519PublicKey,
+            pollSskPub,
           );
           // Also assert A signed our own pubkeys, not some swapped set.
           const edMatch = await bytesEqual(

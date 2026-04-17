@@ -313,6 +313,14 @@ function InviteCard({
       // and verify its cert.
       const inviterUmk = await fetchUserMasterKeyPub(invite.created_by);
       if (!inviterUmk) throw new Error('inviter has no published UMK');
+      let inviterSskPub: Uint8Array | undefined;
+      if (inviterUmk.sskPub && inviterUmk.sskCrossSignature) {
+        try {
+          const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
+          await verifySskCrossSignature(inviterUmk.ed25519PublicKey, inviterUmk.sskPub, inviterUmk.sskCrossSignature);
+          inviterSskPub = inviterUmk.sskPub;
+        } catch { /* fall back */ }
+      }
       const inviterDevices = await fetchPublicDevices(invite.created_by);
       const inviterDev = inviterDevices.find(
         (d) => d.deviceId === invite.inviter_device_id,
@@ -321,10 +329,10 @@ function InviteCard({
         throw new Error('inviter device not found in published device list');
       }
       try {
-        await verifyPublicDeviceChain(inviterDev, inviterUmk.ed25519PublicKey);
+        await verifyPublicDeviceChain(inviterDev, inviterUmk.ed25519PublicKey, inviterSskPub);
       } catch {
         throw new Error(
-          'inviter device cert did not verify against their UMK — refusing',
+          'inviter device cert did not verify — refusing',
         );
       }
 
@@ -657,11 +665,19 @@ function InviteForm({
       // device will rewrap for the invitee's other devices on accept.
       const inviteeUmk = await fetchUserMasterKeyPub(inviteeId);
       if (!inviteeUmk) throw new Error('that user has no published UMK');
+      let inviteeSskPub2: Uint8Array | undefined;
+      if (inviteeUmk.sskPub && inviteeUmk.sskCrossSignature) {
+        try {
+          const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
+          await verifySskCrossSignature(inviteeUmk.ed25519PublicKey, inviteeUmk.sskPub, inviteeUmk.sskCrossSignature);
+          inviteeSskPub2 = inviteeUmk.sskPub;
+        } catch { /* fall back */ }
+      }
       const inviteeDevices = await fetchPublicDevices(inviteeId);
       const activeDevices: PublicDevice[] = [];
       for (const d of inviteeDevices) {
         try {
-          await verifyPublicDeviceChain(d, inviteeUmk.ed25519PublicKey);
+          await verifyPublicDeviceChain(d, inviteeUmk.ed25519PublicKey, inviteeSskPub2);
           activeDevices.push(d);
         } catch {
           // skip revoked/invalid devices

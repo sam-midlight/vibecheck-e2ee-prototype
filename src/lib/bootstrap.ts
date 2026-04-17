@@ -1041,9 +1041,21 @@ export async function fetchAndUnwrapCallKey(params: {
           }
         : null,
   };
+  // Verify SSK cross-sig for v2 cert dispatch.
+  let senderSskPub: Uint8Array | undefined;
+  if (senderUmk.sskPub && senderUmk.sskCrossSignature) {
+    try {
+      await verifySskCrossSignature(
+        senderUmk.ed25519PublicKey,
+        senderUmk.sskPub,
+        senderUmk.sskCrossSignature,
+      );
+      senderSskPub = senderUmk.sskPub;
+    } catch { /* fall back to MSK-only */ }
+  }
   // verifyPublicDevice throws on CERT_INVALID or DEVICE_REVOKED — both are
   // "don't trust this envelope." Propagate and let the caller handle.
-  await verifyPublicDevice(senderPublicDevice, senderUmk.ed25519PublicKey);
+  await verifyPublicDevice(senderPublicDevice, senderUmk.ed25519PublicKey, senderSskPub);
 
   await verifyCallEnvelope(
     {
