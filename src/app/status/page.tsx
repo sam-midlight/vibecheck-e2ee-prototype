@@ -517,16 +517,31 @@ export default function StatusPage() {
       }
       const tempId = crypto.randomUUID();
       const tempBundle = await generateDeviceKeyBundle(tempId);
-      const tempCertSig = await signDeviceIssuance(
-        {
-          userId,
-          deviceId: tempId,
-          deviceEd25519PublicKey: tempBundle.ed25519PublicKey,
-          deviceX25519PublicKey: tempBundle.x25519PublicKey,
-          createdAtMs: Date.now(),
-        },
-        ctx.umk.ed25519PrivateKey,
-      );
+      const tempCreatedAtMs = Date.now();
+      // Use SSK (v2 cert) if available, else fall back to MSK (v1).
+      const { getSelfSigningKey: getLocalSsk } = await import('@/lib/e2ee-core');
+      const localSsk = await getLocalSsk(userId);
+      const tempCertSig = localSsk
+        ? await signDeviceIssuanceV2(
+            {
+              userId,
+              deviceId: tempId,
+              deviceEd25519PublicKey: tempBundle.ed25519PublicKey,
+              deviceX25519PublicKey: tempBundle.x25519PublicKey,
+              createdAtMs: tempCreatedAtMs,
+            },
+            localSsk.ed25519PrivateKey,
+          )
+        : await signDeviceIssuance(
+            {
+              userId,
+              deviceId: tempId,
+              deviceEd25519PublicKey: tempBundle.ed25519PublicKey,
+              deviceX25519PublicKey: tempBundle.x25519PublicKey,
+              createdAtMs: tempCreatedAtMs,
+            },
+            ctx.umk.ed25519PrivateKey,
+          );
       // Register the temp device on the server so fetchPublicDevices
       // returns it, then wrap the test room's key for all devices.
       await registerDevice({
@@ -534,7 +549,7 @@ export default function StatusPage() {
         deviceId: tempId,
         deviceEd25519Pub: tempBundle.ed25519PublicKey,
         deviceX25519Pub: tempBundle.x25519PublicKey,
-        issuanceCreatedAtMs: Date.now(),
+        issuanceCreatedAtMs: tempCreatedAtMs,
         issuanceSignature: tempCertSig,
       });
       try {
@@ -666,39 +681,25 @@ export default function StatusPage() {
     // Check 18: V2 device cert chain (MSK → SSK cross-sig → device cert)
     // -----------------------------------------------------------------------
     await runStep(CHECK_NAMES[18], async () => {
-      const device = ctx.device!;
-      const umk = ctx.umk;
-      if (!umk) throw new Error('no UMK on this device — cannot test v2 cert chain');
-      // Generate SSK + USK + cross-sigs from the local UMK
-      const { ssk, sskCrossSignature } = await generateSigningKeys(umk);
-      // Sign a synthetic device cert with SSK (v2 domain)
-      const createdAtMs = Date.now();
-      const sig = await signDeviceIssuanceV2(
-        {
-          userId: ctx.userId!,
-          deviceId: device.deviceId,
-          deviceEd25519PublicKey: device.ed25519PublicKey,
-          deviceX25519PublicKey: device.x25519PublicKey,
-          createdAtMs,
-        },
-        ssk.ed25519PrivateKey,
-      );
-      // Verify: SSK cross-sig verifies against MSK, then device cert verifies against SSK
+      // Verify the PUBLISHED cross-sig chain + this device's actual cert.
+      // Works on any device — doesn't require local MSK.
+      const pubKeys = await fetchUserMasterKeyPub(userId);
+      if (!pubKeys) throw new Error('no published identity');
+      if (!pubKeys.sskPub || !pubKeys.sskCrossSignature) {
+        throw new Error('no SSK published — pre-cross-signing identity');
+      }
       const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
-      await verifySskCrossSignature(umk.ed25519PublicKey, ssk.ed25519PublicKey, sskCrossSignature);
-      await verifyDeviceIssuance(
-        {
-          userId: ctx.userId!,
-          deviceId: device.deviceId,
-          deviceEd25519PublicKey: device.ed25519PublicKey,
-          deviceX25519PublicKey: device.x25519PublicKey,
-          createdAtMs,
-        },
-        sig,
-        umk.ed25519PublicKey,
-        ssk.ed25519PublicKey,
+      await verifySskCrossSignature(
+        pubKeys.ed25519PublicKey,
+        pubKeys.sskPub,
+        pubKeys.sskCrossSignature,
       );
-      return { detail: 'MSK → SSK cross-sig ✓, SSK → device cert (v2) ✓' };
+      // Verify this device's actual cert against the published SSK
+      const devices = await fetchPublicDevices(userId);
+      const me = devices.find((d) => d.deviceId === ctx.device!.deviceId);
+      if (!me) throw new Error('this device not in published list');
+      await verifyPublicDevice(me, pubKeys.ed25519PublicKey, pubKeys.sskPub);
+      return { detail: 'published MSK → SSK cross-sig ✓, SSK → this device cert ✓' };
     });
 
     // -----------------------------------------------------------------------
@@ -766,17 +767,21 @@ export default function StatusPage() {
     // Check 20: Cross-signing SSK + USK chain verification
     // -----------------------------------------------------------------------
     await runStep(CHECK_NAMES[20], async () => {
-      const umk = ctx.umk;
-      if (!umk) throw new Error('no UMK — cannot test cross-signing chain');
-      const keys = await generateSigningKeys(umk);
+      // Verify the PUBLISHED cross-signing chain. Works on any device.
+      const pubKeys = await fetchUserMasterKeyPub(userId);
+      if (!pubKeys) throw new Error('no published identity');
+      if (!pubKeys.sskPub || !pubKeys.sskCrossSignature ||
+          !pubKeys.uskPub || !pubKeys.uskCrossSignature) {
+        throw new Error('incomplete cross-signing keys published');
+      }
       await verifyCrossSigningChain({
-        mskPub: umk.ed25519PublicKey,
-        sskPub: keys.ssk.ed25519PublicKey,
-        sskCrossSignature: keys.sskCrossSignature,
-        uskPub: keys.usk.ed25519PublicKey,
-        uskCrossSignature: keys.uskCrossSignature,
+        mskPub: pubKeys.ed25519PublicKey,
+        sskPub: pubKeys.sskPub,
+        sskCrossSignature: pubKeys.sskCrossSignature,
+        uskPub: pubKeys.uskPub,
+        uskCrossSignature: pubKeys.uskCrossSignature,
       });
-      return { detail: 'MSK → SSK ✓, MSK → USK ✓' };
+      return { detail: 'published MSK → SSK ✓, MSK → USK ✓' };
     });
 
     finish(allOk);

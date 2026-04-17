@@ -760,22 +760,38 @@ async function decodeAndVerify(
 
     // v4 (Megolm) path
     if (blob.sessionId && blob.messageIndex != null && device) {
-      const decoded = await decryptBlob<unknown>({
-        blob,
-        roomId: row.room_id,
-        roomKey: { key: new Uint8Array(0), generation: blob.generation }, // unused for v4
-        resolveSenderDeviceEd25519Pub: resolveSenderDeviceEd,
-        resolveMegolmKey: (sid, mi) =>
-          resolveMegolmMessageKey(sid, mi, row.room_id, device),
-      });
-      return {
-        id: row.id,
-        senderId: decoded.senderUserId ?? row.sender_id,
-        createdAt: row.created_at,
-        generation: blob.generation,
-        payload: decoded.payload,
-        verified: true,
-      };
+      try {
+        const decoded = await decryptBlob<unknown>({
+          blob,
+          roomId: row.room_id,
+          roomKey: { key: new Uint8Array(0), generation: blob.generation }, // unused for v4
+          resolveSenderDeviceEd25519Pub: resolveSenderDeviceEd,
+          resolveMegolmKey: (sid, mi) =>
+            resolveMegolmMessageKey(sid, mi, row.room_id, device),
+        });
+        return {
+          id: row.id,
+          senderId: decoded.senderUserId ?? row.sender_id,
+          createdAt: row.created_at,
+          generation: blob.generation,
+          payload: decoded.payload,
+          verified: true,
+        };
+      } catch {
+        // Missing Megolm session — this device joined after the session
+        // was created and the sender hasn't sent a new message yet.
+        // Forward secrecy working as designed.
+        return {
+          id: row.id,
+          senderId: row.sender_id,
+          createdAt: row.created_at,
+          generation: blob.generation,
+          payload: null,
+          verified: false,
+          missingKey: true,
+          error: 'encrypted with a session from before this device joined',
+        };
+      }
     }
 
     // v3/v2/v1 flat-key path
