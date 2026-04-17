@@ -401,6 +401,25 @@ function InviteCard({
         roomKey,
         signerDevice: device,
       });
+      // Re-share any Megolm sessions this device holds to all our other
+      // devices so they can decrypt recent messages in this room.
+      try {
+        const { reshareSessionsToDevice } = await import('@/lib/bootstrap');
+        const { fetchAndVerifyDevices } = await import('@/lib/bootstrap');
+        const { devices: myDevices } = await fetchAndVerifyDevices(userId);
+        for (const d of myDevices) {
+          if (d.deviceId === device.deviceId) continue;
+          await reshareSessionsToDevice({
+            roomId: invite.room_id,
+            userId,
+            signerDevice: device,
+            targetDeviceId: d.deviceId,
+            targetX25519Pub: d.x25519PublicKey,
+          });
+        }
+      } catch (err) {
+        console.warn('Megolm session re-share on accept failed:', err);
+      }
       // Delete ALL sibling invite rows for this user+room (one existed
       // per device). The accepted one is consumed; the rest are stale.
       await deleteInvitesForUserInRoom(invite.room_id, userId);

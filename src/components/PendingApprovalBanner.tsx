@@ -382,6 +382,24 @@ async function rewrapRoomsForNewDevice(params: {
         signerDeviceId: myBundle.deviceId,
         wrapSignature: sig,
       });
+
+      // Re-share any Megolm outbound session this device holds for this
+      // room to the new device, so it can decrypt recent v4 messages.
+      try {
+        const { reshareSessionsToDevice } = await import('@/lib/bootstrap');
+        await reshareSessionsToDevice({
+          roomId: room.id,
+          userId,
+          signerDevice: myBundle,
+          targetDeviceId: newDeviceId,
+          targetX25519Pub: newDeviceX25519Pub,
+        });
+      } catch (err) {
+        console.warn(
+          `megolm re-share failed for room ${room.id.slice(0, 8)}:`,
+          errorMessage(err),
+        );
+      }
     } catch (err) {
       console.warn(
         `rewrap failed for room ${room.id.slice(0, 8)}:`,

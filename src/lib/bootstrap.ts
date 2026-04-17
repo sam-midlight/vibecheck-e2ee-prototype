@@ -862,6 +862,46 @@ export async function createAndDistributeSession(params: {
 }
 
 /**
+ * Re-share all existing Megolm outbound sessions in a room to a newly-joined
+ * device. Called after invite acceptance or device approval rewrap so the new
+ * device can decrypt messages sent since the last session creation.
+ *
+ * Only re-shares sessions that THIS device holds (outbound sessions). For
+ * sessions owned by other senders, the new device will get them when those
+ * senders create their next session (on their next send).
+ */
+export async function reshareSessionsToDevice(params: {
+  roomId: string;
+  userId: string;
+  signerDevice: DeviceKeyBundle;
+  targetDeviceId: string;
+  targetX25519Pub: Uint8Array;
+}): Promise<void> {
+  const { roomId, userId, signerDevice, targetDeviceId, targetX25519Pub } = params;
+  const session = await getOutboundSession(roomId, signerDevice.deviceId);
+  if (!session) return; // no outbound session for this room on this device
+
+  const snapshot = exportSessionSnapshot(session, userId, signerDevice.deviceId);
+  const sealed = await sealSessionSnapshot(snapshot, targetX25519Pub);
+  const sessionIdB64 = await toBase64(session.sessionId);
+  const sig = await signSessionShare({
+    sessionId: session.sessionId,
+    recipientDeviceId: targetDeviceId,
+    sealedSnapshot: sealed,
+    signerDeviceId: signerDevice.deviceId,
+    signerEd25519Priv: signerDevice.ed25519PrivateKey,
+  });
+  await insertMegolmSessionShare({
+    sessionId: sessionIdB64,
+    recipientDeviceId: targetDeviceId,
+    sealedSnapshot: await toBase64(sealed),
+    startIndex: snapshot.startIndex,
+    signerDeviceId: signerDevice.deviceId,
+    shareSignature: await toBase64(sig),
+  });
+}
+
+/**
  * Ensure there's a fresh (non-rotated) outbound Megolm session for the
  * current room. Creates one if none exists or if auto-rotation triggers.
  * Returns the session for callers to ratchet + encrypt with.
