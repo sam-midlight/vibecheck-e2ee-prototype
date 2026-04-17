@@ -843,13 +843,21 @@ export async function insertMegolmSession(params: {
   generation: number;
 }): Promise<void> {
   const supabase = getSupabase();
-  const { error } = await supabase.from('megolm_sessions').insert({
-    room_id: params.roomId,
-    sender_user_id: params.senderUserId,
-    sender_device_id: params.senderDeviceId,
-    session_id: params.sessionId,
-    generation: params.generation,
-  });
+  // Upsert on (room_id, sender_device_id, generation) so a partial prior run
+  // (server row inserted, share distribution threw, local IDB never saved)
+  // can be retried without 23505. Resets message_count so the server's 200-cap
+  // tracks the fresh session that's actually being distributed.
+  const { error } = await supabase.from('megolm_sessions').upsert(
+    {
+      room_id: params.roomId,
+      sender_user_id: params.senderUserId,
+      sender_device_id: params.senderDeviceId,
+      session_id: params.sessionId,
+      generation: params.generation,
+      message_count: 0,
+    },
+    { onConflict: 'room_id,sender_device_id,generation' },
+  );
   if (error) throw error;
 }
 
@@ -862,14 +870,20 @@ export async function insertMegolmSessionShare(params: {
   shareSignature: string;
 }): Promise<void> {
   const supabase = getSupabase();
-  const { error } = await supabase.from('megolm_session_shares').upsert({
-    session_id: params.sessionId,
-    recipient_device_id: params.recipientDeviceId,
-    sealed_snapshot: params.sealedSnapshot,
-    start_index: params.startIndex,
-    signer_device_id: params.signerDeviceId,
-    share_signature: params.shareSignature,
-  });
+  // `ignoreDuplicates` skips the row when (session_id, recipient_device_id)
+  // already exists — avoids 42501 (no UPDATE policy on the table) and keeps
+  // the earliest snapshot, which covers more history than a later one.
+  const { error } = await supabase.from('megolm_session_shares').upsert(
+    {
+      session_id: params.sessionId,
+      recipient_device_id: params.recipientDeviceId,
+      sealed_snapshot: params.sealedSnapshot,
+      start_index: params.startIndex,
+      signer_device_id: params.signerDeviceId,
+      share_signature: params.shareSignature,
+    },
+    { onConflict: 'session_id,recipient_device_id', ignoreDuplicates: true },
+  );
   if (error) throw error;
 }
 
@@ -997,8 +1011,13 @@ export function subscribeSasSessions(
   onRow: (row: SasVerificationSessionRow) => void,
 ): () => void {
   const supabase = getSupabase();
+  // Channel name is unique per call. Supabase reuses channels by name, and if
+  // two subscribers share a name, the second one's .on() runs after the first
+  // has already .subscribe()'d → "cannot add postgres_changes callbacks after
+  // subscribe". The rooms page + initiator modal + responder modal all
+  // subscribe concurrently, so per-call uniqueness is required.
   const channel = supabase
-    .channel(`sas:${userId}`)
+    .channel(`sas:${userId}:${crypto.randomUUID()}`)
     .on(
       'postgres_changes',
       {

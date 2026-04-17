@@ -84,13 +84,13 @@ export function MagicLinkForm() {
             <button
               type="button"
               onClick={() => void copy()}
-              className="rounded border border-neutral-300 px-2 py-1 text-[11px] dark:border-neutral-700"
+              className="rounded border border-neutral-300 px-2 py-1 text-[11px] transition-transform duration-150 hover:bg-neutral-100 active:scale-95 dark:border-neutral-700 dark:hover:bg-neutral-800"
             >
               {copied ? 'copied ✓' : 'copy'}
             </button>
             <a
               href={link}
-              className="rounded bg-neutral-900 px-2 py-1 text-[11px] text-white dark:bg-white dark:text-neutral-900"
+              className="rounded bg-neutral-900 px-2 py-1 text-[11px] text-white transition-transform duration-150 hover:bg-neutral-700 active:scale-95 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
             >
               open →
             </a>

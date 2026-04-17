@@ -17,6 +17,7 @@ import { use, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { AppShell } from '@/components/AppShell';
+import { CallChatPanel } from '@/components/CallChatPanel';
 import { getSupabase } from '@/lib/supabase/client';
 import { errorMessage } from '@/lib/errors';
 import type { DeviceKeyBundle, CallKey } from '@/lib/e2ee-core';
@@ -840,10 +841,17 @@ function CallInner({ roomId }: { roomId: string }) {
 
       {uiState === 'in_call' && (
         <>
-          <div className="grid grid-cols-2 gap-4">
-            {tiles.map((t) => (
-              <VideoTile key={t.identity} tile={t} />
-            ))}
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              {tiles.map((t) => (
+                <VideoTile key={t.identity} tile={t} />
+              ))}
+            </div>
+            {userId && device && (
+              <div className="h-[480px] lg:h-auto lg:min-h-[320px]">
+                <CallChatPanel roomId={roomId} userId={userId} device={device} />
+              </div>
+            )}
           </div>
           <div className="flex flex-wrap gap-2">
             {!receiveOnly && (

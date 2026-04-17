@@ -309,7 +309,7 @@ function DisplayStage({
         <button
           type="button"
           onClick={() => void handleCopy()}
-          className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
+          className="rounded border border-neutral-300 px-3 py-1.5 text-xs transition-transform duration-150 hover:bg-neutral-100 active:scale-95 dark:border-neutral-700 dark:hover:bg-neutral-800"
         >
           {copied ? 'copied ✓' : 'copy phrase'}
         </button>

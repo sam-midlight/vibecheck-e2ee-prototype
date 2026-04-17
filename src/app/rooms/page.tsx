@@ -165,7 +165,7 @@ function RoomsInner() {
           </code>
           <button
             onClick={() => void navigator.clipboard.writeText(userId)}
-            className="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
+            className="rounded border border-neutral-300 px-2 py-1 text-xs transition-transform duration-150 hover:bg-neutral-100 active:scale-95 dark:border-neutral-700 dark:hover:bg-neutral-800"
           >
             copy
           </button>
@@ -232,7 +232,7 @@ function RoomsInner() {
                 </div>
                 <Link
                   href={`/rooms/${room.id}`}
-                  className="ml-2 rounded bg-neutral-900 px-2 py-1 text-xs text-white dark:bg-white dark:text-neutral-900"
+                  className="ml-2 rounded bg-neutral-900 px-2 py-1 text-xs text-white transition-transform duration-150 hover:bg-neutral-700 active:scale-95 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
                 >
                   open →
                 </Link>
@@ -255,6 +255,7 @@ function RoomsInner() {
               userId={userId}
               device={device}
               rooms={rooms}
+              names={names}
               onInvited={() => void reload(userId)}
             />
           )}
@@ -602,11 +603,13 @@ function InviteForm({
   userId,
   device,
   rooms,
+  names,
   onInvited,
 }: {
   userId: string;
   device: DeviceKeyBundle;
   rooms: RoomRow[];
+  names: Map<string, string>;
   onInvited: () => void;
 }) {
   const [roomId, setRoomId] = useState(rooms[0]?.id ?? '');
@@ -766,7 +769,11 @@ function InviteForm({
         >
           {rooms.map((r) => {
             const full = fullness.get(r.id) ?? false;
-            const base = `${r.id.slice(0, 8)} · ${r.kind} · gen ${r.current_generation}`;
+            const customName = names.get(r.id);
+            const head = customName
+              ? `${customName} · ${r.id.slice(0, 8)}`
+              : r.id.slice(0, 8);
+            const base = `${head} · ${r.kind} · gen ${r.current_generation}`;
             const label = full ? `${base} · full` : base;
             return (
               <option key={r.id} value={r.id} disabled={full}>
