@@ -3,7 +3,6 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useState } from 'react';
 import { AppShell } from '@/components/AppShell';
-import { KeyChangeBanner } from '@/components/KeyChangeBanner';
 import { errorMessage } from '@/lib/errors';
 import { getSupabase } from '@/lib/supabase/client';
 import {
@@ -33,7 +32,7 @@ import {
   type RoomRow,
 } from '@/lib/supabase/queries';
 import { loadEnrolledDevice, sendInviteToAllDevices, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
-import { publicIdentityFingerprint, verifyPublicDevice as verifyPublicDeviceChain } from '@/lib/e2ee-core';
+import { verifyPublicDevice as verifyPublicDeviceChain } from '@/lib/e2ee-core';
 
 function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
   if (a.byteLength !== b.byteLength) return false;
@@ -151,8 +150,6 @@ function RoomsInner() {
 
   return (
     <div className="mx-auto max-w-2xl space-y-6">
-      <KeyChangeBanner />
-
       <section className="rounded border border-neutral-200 p-4 dark:border-neutral-800">
         <h2 className="text-sm font-semibold">Your user ID</h2>
         <p className="mt-1 text-xs text-neutral-500">
@@ -280,31 +277,6 @@ function InviteCard({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [inviterFingerprint, setInviterFingerprint] = useState<string | null>(null);
-
-  // Show the inviter's UMK fingerprint (the stable root identity anchor).
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const umkPub = await fetchUserMasterKeyPub(invite.created_by);
-        if (cancelled || !umkPub) return;
-        // Reuse the fingerprint helper with UMK pub as both halves — stable hash.
-        setInviterFingerprint(
-          await publicIdentityFingerprint({
-            ed25519PublicKey: umkPub.ed25519PublicKey,
-            x25519PublicKey: umkPub.ed25519PublicKey,
-            selfSignature: new Uint8Array(0),
-          }),
-        );
-      } catch {
-        // non-fatal
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [invite.created_by]);
 
   async function accept() {
     setBusy(true);
@@ -451,15 +423,6 @@ function InviteCard({
         <code className="font-mono text-xs">{invite.room_id.slice(0, 8)}</code>{' '}
         from <code className="font-mono text-xs">{invite.created_by.slice(0, 8)}</code>
       </div>
-      {inviterFingerprint && (
-        <div className="mt-1 text-xs text-neutral-600 dark:text-neutral-400">
-          inviter safety number: <code className="font-mono">{inviterFingerprint}</code>
-          <br />
-          <span className="text-neutral-500">
-            confirm this matches the inviter out-of-band (phone, in person) before accepting
-          </span>
-        </div>
-      )}
       <div className="mt-2 flex gap-2">
         <button
           onClick={() => void accept()}

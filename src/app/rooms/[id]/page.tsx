@@ -3,7 +3,6 @@
 import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { AppShell } from '@/components/AppShell';
-import { KeyChangeBanner } from '@/components/KeyChangeBanner';
 import { errorMessage } from '@/lib/errors';
 import { getSupabase } from '@/lib/supabase/client';
 import {
@@ -17,7 +16,6 @@ import {
   fromBase64,
   observeContact,
   prepareImageForUpload,
-  publicIdentityFingerprint,
   ratchetAndDerive,
   rotateRoomKey,
   signMembershipWrap,
@@ -422,8 +420,6 @@ function RoomInner({ roomId }: { roomId: string }) {
 
   return (
     <div className="mx-auto max-w-2xl space-y-4">
-      <KeyChangeBanner />
-
       <div className="flex items-baseline justify-between gap-3">
         <div className="min-w-0">
           <h1 className="truncate text-xl font-semibold">
@@ -922,35 +918,6 @@ function MemberList({
     return () => { cancelled = true; unsub(); };
   }, [selfUserId]);
 
-  const [fingerprints, setFingerprints] = useState<Map<string, string>>(() => new Map());
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const entries = await Promise.all(
-        members.map(async (m): Promise<[string, string] | null> => {
-          try {
-            const umk = await fetchUserMasterKeyPub(m.user_id);
-            if (!umk) return null;
-            const fp = await publicIdentityFingerprint({
-              ed25519PublicKey: umk.ed25519PublicKey,
-              x25519PublicKey: umk.ed25519PublicKey,
-              selfSignature: new Uint8Array(0),
-            });
-            return [m.user_id, fp];
-          } catch {
-            return null;
-          }
-        }),
-      );
-      if (cancelled) return;
-      setFingerprints(
-        new Map(entries.filter((e): e is [string, string] => e !== null)),
-      );
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [members]);
   // Keep the edit box in sync if realtime delivers a new value for self.
   useEffect(() => {
     setNickDraft(selfNick);
@@ -1270,14 +1237,6 @@ function MemberList({
                       </span>
                     )}
                   </span>
-                  {fingerprints.get(u.userId) && (
-                    <code
-                      className="font-mono text-[10px] text-neutral-400"
-                      title="safety number — compare out-of-band (phone, in person) to confirm identity"
-                    >
-                      🔑 {fingerprints.get(u.userId)}
-                    </code>
-                  )}
                   {verifiedUsers.has(u.userId) && (
                     <span
                       className="text-[10px] text-emerald-600 dark:text-emerald-400"
