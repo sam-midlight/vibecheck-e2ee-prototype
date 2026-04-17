@@ -209,8 +209,20 @@ function RoomInner({ roomId }: { roomId: string }) {
         setRoomName(null);
       }
 
-      // Hydrate inbound Megolm sessions for this device in one batch.
-      // Cached in IDB so per-blob decrypt doesn't hit the server.
+      // Hydrate inbound Megolm sessions from two sources:
+      // 1. Direct session shares (sealed to this device by other senders)
+      // 2. Server-side key backup (encrypted under the backup key)
+      // Source 2 covers historical sessions that were backed up by other
+      // devices, enabling cross-device history access.
+      try {
+        const { restoreSessionsFromBackup } = await import('@/lib/bootstrap');
+        const backupResult = await restoreSessionsFromBackup(uid);
+        if (backupResult.restored > 0) {
+          console.log(`restored ${backupResult.restored} session(s) from key backup`);
+        }
+      } catch (err) {
+        console.warn('session backup restore failed:', errorMessage(err));
+      }
       try {
         const shares = await listMegolmSharesForDevice({
           roomId,

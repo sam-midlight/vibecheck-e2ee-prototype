@@ -66,6 +66,7 @@ import {
   fetchCallKeyEnvelope,
   getMyWrappedRoomKey,
   insertMegolmSession,
+  listKeyBackups,
   insertMegolmSessionShare,
   kickAndRotate,
   listCallMembers,
@@ -941,6 +942,62 @@ export async function reshareSessionsToDevice(params: {
  * current room. Creates one if none exists or if auto-rotation triggers.
  * Returns the session for callers to ratchet + encrypt with.
  */
+/**
+ * Restore Megolm session snapshots from server-side key_backup into local
+ * IDB. Called once on device enrollment (or first room load) so this device
+ * can decrypt historical v4 messages that were backed up by other devices.
+ *
+ * Only restores sessions that have a backup_key-encrypted snapshot in
+ * key_backup AND the local device holds the backup key.
+ */
+export async function restoreSessionsFromBackup(
+  userId: string,
+): Promise<{ restored: number; failed: number }> {
+  const { getBackupKey: bk, fromBase64: b64d, putInboundSession, toBase64: b64e } =
+    await import('@/lib/e2ee-core');
+  const backupKey = await bk(userId);
+  if (!backupKey) return { restored: 0, failed: 0 };
+
+  const rows = await listKeyBackups(userId);
+  const megolmRows = rows.filter((r) => r.session_id && r.start_index != null);
+  if (megolmRows.length === 0) return { restored: 0, failed: 0 };
+
+  const { decryptSessionSnapshotFromBackup } = await import('@/lib/e2ee-core');
+  let restored = 0;
+  let failed = 0;
+
+  for (const row of megolmRows) {
+    try {
+      const ct = await b64d(row.ciphertext);
+      const nonce = await b64d(row.nonce);
+      const snapshot = await decryptSessionSnapshotFromBackup({
+        ciphertext: ct,
+        nonce,
+        sessionId: row.session_id!,
+        startIndex: row.start_index!,
+        backupKey,
+        roomId: row.room_id,
+      });
+      const sessionIdBytes = await b64d(row.session_id!);
+      await putInboundSession(row.session_id!, snapshot.senderDeviceId, {
+        sessionId: sessionIdBytes,
+        chainKeyAtIndex: snapshot.chainKeyAtIndex,
+        startIndex: snapshot.startIndex,
+        senderUserId: snapshot.senderUserId,
+        senderDeviceId: snapshot.senderDeviceId,
+      });
+      restored++;
+    } catch (err) {
+      failed++;
+      console.warn(
+        `session backup restore failed for ${row.room_id.slice(0, 8)} session ${row.session_id?.slice(0, 8)}:`,
+        err,
+      );
+    }
+  }
+  return { restored, failed };
+}
+
 export async function ensureFreshSession(params: {
   roomId: string;
   generation: number;

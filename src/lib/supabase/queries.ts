@@ -73,6 +73,10 @@ export interface KeyBackupRow {
   ciphertext: string;
   nonce: string;
   created_at: string;
+  /** Megolm session_id (base64). Null for flat-key backup rows. */
+  session_id: string | null;
+  /** Megolm start_index. Null for flat-key backup rows. */
+  start_index: number | null;
 }
 
 export interface DeviceLinkHandoffRow {

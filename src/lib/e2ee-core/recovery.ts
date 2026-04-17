@@ -351,6 +351,49 @@ export async function encryptSessionSnapshotForBackup(params: {
   return { ciphertext, nonce };
 }
 
+/** Decrypt a Megolm session snapshot from a server-side backup row. */
+export async function decryptSessionSnapshotFromBackup(params: {
+  ciphertext: Bytes;
+  nonce: Bytes;
+  sessionId: string;
+  startIndex: number;
+  backupKey: Bytes;
+  roomId: string;
+}): Promise<{
+  chainKeyAtIndex: Bytes;
+  startIndex: number;
+  senderUserId: string;
+  senderDeviceId: string;
+}> {
+  const sodium = await getSodium();
+  const ad = new TextEncoder().encode(
+    `vibecheck:session-backup:v1:${params.roomId}:${params.sessionId}:${params.startIndex}`,
+  );
+  let packed: Bytes;
+  try {
+    packed = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+      null, params.ciphertext, ad, params.nonce, params.backupKey,
+    );
+  } catch {
+    throw new CryptoError(
+      'session backup decryption failed (wrong backup key or tampered)',
+      'DECRYPT_FAILED',
+    );
+  }
+  try {
+    const chainKeyAtIndex = packed.slice(0, 32);
+    const rest = packed.slice(32);
+    const sepIdx = rest.indexOf(0);
+    if (sepIdx === -1) throw new CryptoError('malformed session backup', 'BAD_INPUT');
+    const dec = new TextDecoder();
+    const senderUserId = dec.decode(rest.slice(0, sepIdx));
+    const senderDeviceId = dec.decode(rest.slice(sepIdx + 1));
+    return { chainKeyAtIndex, startIndex: params.startIndex, senderUserId, senderDeviceId };
+  } finally {
+    sodium.memzero(packed);
+  }
+}
+
 /** Serialize a blob for transport (base64 strings). */
 export async function encodeRecoveryBlob(blob: RecoveryBlob): Promise<{
   ciphertext: string;
