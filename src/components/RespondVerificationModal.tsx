@@ -64,6 +64,11 @@ export function RespondVerificationModal({ userId, session, onDone }: Props) {
   const sharedSecretRef = useRef<Bytes | null>(null);
   const commitmentRef = useRef<Bytes | null>(null);
   const ranRef = useRef(false);
+  // Idempotency guards so repeat events (own UPDATE triggers another tick,
+  // poller + realtime both fire for same row) don't re-run side-effectful
+  // stages. Closure-captured `stage` and `emoji.length` are stale.
+  const didDeriveRef = useRef(false);
+  const didFinalizeRef = useRef(false);
 
   useEffect(() => {
     if (ranRef.current) return;
@@ -94,31 +99,52 @@ export function RespondVerificationModal({ userId, session, onDone }: Props) {
         if (cancelled) return;
         setStage('waiting-for-reveal');
 
+        // Wrap handler so errors surface to UI instead of being swallowed by
+        // realtime callback / setInterval (they silently drop rejections).
+        const safeHandle = async (row: SasVerificationSessionRow) => {
+          try {
+            await handleUpdate(row);
+          } catch (err) {
+            console.error('[sas-responder] handler failed', err);
+            if (!cancelled) {
+              setError(errorMessage(err));
+              setStage('error');
+            }
+          }
+        };
+
         // Subscribe for initiator's reveal
-        unsub = subscribeSasSessions(userId, async (row) => {
+        unsub = subscribeSasSessions(userId, (row) => {
           if (row.id !== session.id || cancelled) return;
-          await handleUpdate(row);
+          void safeHandle(row);
         });
 
         // Poll fallback
-        const poller = setInterval(async () => {
+        const poller = setInterval(() => {
           if (cancelled) { clearInterval(poller); return; }
-          const row = await getSasSession(session.id);
-          if (row) await handleUpdate(row);
+          void (async () => {
+            try {
+              const row = await getSasSession(session.id);
+              if (row) await safeHandle(row);
+            } catch (err) {
+              console.error('[sas-responder] poll failed', err);
+            }
+          })();
         }, 2000);
 
         async function handleUpdate(row: SasVerificationSessionRow) {
           if (cancelled) return;
 
-          // Initiator revealed their ephemeral pub → derive emoji
-          if (
-            stage === 'waiting-for-reveal' ||
-            (row.initiator_ephemeral_pub && emoji.length === 0)
-          ) {
-            if (!row.initiator_ephemeral_pub) return;
+          // Initiator revealed their ephemeral pub → derive emoji.
+          // Use a ref guard (closure-captured `stage` / `emoji.length` are
+          // stale, and we'd otherwise re-run on every duplicate event).
+          if (row.initiator_ephemeral_pub && !didDeriveRef.current) {
+            didDeriveRef.current = true;
             const eph = ephemeralRef.current;
             const commitment = commitmentRef.current;
-            if (!eph || !commitment) return;
+            if (!eph || !commitment) {
+              throw new Error('missing ephemeral keypair or commitment');
+            }
 
             const initiatorEph = await fromBase64(row.initiator_ephemeral_pub);
 
@@ -163,7 +189,13 @@ export function RespondVerificationModal({ userId, session, onDone }: Props) {
           }
 
           // Initiator sent their MAC → we can finalize
-          if (row.state === 'sas_compared' && row.initiator_mac && sharedSecretRef.current) {
+          if (
+            row.state === 'sas_compared' &&
+            row.initiator_mac &&
+            sharedSecretRef.current &&
+            !didFinalizeRef.current
+          ) {
+            didFinalizeRef.current = true;
             if (!cancelled) await finalizeSas(row);
           }
         }

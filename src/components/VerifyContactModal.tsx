@@ -57,6 +57,10 @@ export function VerifyContactModal({ userId, peerUserId, onDone }: Props) {
   const ephemeralRef = useRef<{ pub: Bytes; priv: Bytes } | null>(null);
   const sharedSecretRef = useRef<Bytes | null>(null);
   const ranRef = useRef(false);
+  // Idempotency guards so repeat events (our own UPDATE triggers another
+  // realtime tick, etc.) don't re-run the key-exchange or finalize blocks.
+  const didKeyExchangeRef = useRef(false);
+  const didFinalizeRef = useRef(false);
 
   // Initiate the SAS protocol
   useEffect(() => {
@@ -86,20 +90,40 @@ export function VerifyContactModal({ userId, peerUserId, onDone }: Props) {
         setSessionId(session.id);
         setStage('waiting-for-peer');
 
+        // Wrap handler so errors surface to UI instead of being swallowed by
+        // the realtime callback / setInterval (which silently drop rejections).
+        const safeHandle = async (row: SasVerificationSessionRow) => {
+          try {
+            await handleSessionUpdate(row, device);
+          } catch (err) {
+            console.error('[sas-initiator] handler failed', err);
+            if (!cancelled) {
+              setError(errorMessage(err));
+              setStage('error');
+            }
+          }
+        };
+
         // Subscribe for peer updates
-        unsub = subscribeSasSessions(userId, async (row) => {
+        unsub = subscribeSasSessions(userId, (row) => {
           if (row.id !== session.id || cancelled) return;
-          await handleSessionUpdate(row, device);
+          void safeHandle(row);
         });
 
         // Also poll in case realtime missed the initial state
-        const poller = setInterval(async () => {
+        const poller = setInterval(() => {
           if (cancelled) { clearInterval(poller); return; }
-          const row = await getSasSession(session.id);
-          if (row && row.state !== 'initiated') {
-            await handleSessionUpdate(row, device);
-            clearInterval(poller);
-          }
+          void (async () => {
+            try {
+              const row = await getSasSession(session.id);
+              if (row && row.state !== 'initiated') {
+                await safeHandle(row);
+                clearInterval(poller);
+              }
+            } catch (err) {
+              console.error('[sas-initiator] poll failed', err);
+            }
+          })();
         }, 2000);
 
         async function handleSessionUpdate(
@@ -108,10 +132,15 @@ export function VerifyContactModal({ userId, peerUserId, onDone }: Props) {
         ) {
           void _dev;
           if (cancelled) return;
-          if (row.state === 'key_exchanged' && row.responder_ephemeral_pub) {
+          if (
+            row.state === 'key_exchanged' &&
+            row.responder_ephemeral_pub &&
+            !didKeyExchangeRef.current
+          ) {
+            didKeyExchangeRef.current = true;
             // Peer sent their ephemeral pub. Reveal ours + derive emoji.
             const eph = ephemeralRef.current;
-            if (!eph) return;
+            if (!eph) throw new Error('missing ephemeral keypair');
             await updateSasSession(row.id, {
               initiator_ephemeral_pub: await toBase64(eph.pub),
             });
@@ -135,7 +164,12 @@ export function VerifyContactModal({ userId, peerUserId, onDone }: Props) {
               setStage('comparing-emoji');
             }
           }
-          if (row.state === 'sas_compared' && row.responder_mac) {
+          if (
+            row.state === 'sas_compared' &&
+            row.responder_mac &&
+            !didFinalizeRef.current
+          ) {
+            didFinalizeRef.current = true;
             // Peer confirmed emoji match and sent MAC. Verify + cross-sign.
             if (!cancelled) await finalizeSas(row);
           }
