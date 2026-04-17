@@ -1679,6 +1679,36 @@ export async function broadcastCallSignaling(
 }
 
 /**
+ * Realtime: INSERT/UPDATE on ANY `calls` row the user can SELECT. Supabase
+ * realtime honours the table's RLS SELECT policy, so this channel only
+ * delivers rows for rooms `auth.uid()` is a member of — we don't have to
+ * maintain per-room subscriptions. Used by the IncomingCallToast to pop a
+ * notification when a call starts in any room you're in.
+ */
+export function subscribeAllCalls(
+  onChange: (row: CallRow, event: 'INSERT' | 'UPDATE') => void,
+  onStatus?: (status: string) => void,
+): () => void {
+  const supabase = getSupabase();
+  const channel = supabase
+    .channel('calls:all')
+    .on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'calls' },
+      (payload) => onChange(payload.new as CallRow, 'INSERT'),
+    )
+    .on(
+      'postgres_changes',
+      { event: 'UPDATE', schema: 'public', table: 'calls' },
+      (payload) => onChange(payload.new as CallRow, 'UPDATE'),
+    )
+    .subscribe((status) => onStatus?.(status));
+  return () => {
+    void supabase.removeChannel(channel);
+  };
+}
+
+/**
  * Realtime: INSERT/UPDATE on `calls` rows in this room. Subscribers learn
  * about call_started (INSERT), key_rotated (UPDATE current_generation),
  * and call_ended (UPDATE ended_at) through this single channel.

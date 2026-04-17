@@ -14,14 +14,19 @@
 import { useState } from 'react';
 import { errorMessage } from '@/lib/errors';
 import {
+  decryptDeviceDisplayName,
   encodeRecoveryBlob,
+  filterActiveDevices,
+  fromBase64,
   generateBackupKey,
   generateRecoveryPhrase,
   getBackupKey,
   putBackupKey,
   splitPhrase,
+  verifySskCrossSignature,
   wrapUserMasterKeyWithPhrase,
   type DeviceKeyBundle,
+  type PublicDevice,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
 import {
@@ -29,7 +34,20 @@ import {
   generateRotatedUmk,
   rotateAllRoomsIAdmin,
 } from '@/lib/bootstrap';
-import { putRecoveryBlob } from '@/lib/supabase/queries';
+import {
+  fetchPublicDevices,
+  fetchUserMasterKeyPub,
+  listDeviceRows,
+  putRecoveryBlob,
+} from '@/lib/supabase/queries';
+
+interface PickerEntry {
+  pub: PublicDevice;
+  /** Encrypted display name string (base64) — only decryptable on the device that wrote it. */
+  displayNameCiphertext: string | null;
+  /** Decrypted name, present only for the current (own) device row. */
+  decryptedName: string | null;
+}
 
 interface Props {
   userId: string;
@@ -52,19 +70,103 @@ interface Props {
   device?: DeviceKeyBundle;
 }
 
-type Stage = 'intro' | 'display' | 'verify' | 'uploading' | 'error';
+type Stage =
+  | 'intro'
+  | 'display'
+  | 'verify'
+  | 'loading-picker'
+  | 'device-picker'
+  | 'uploading'
+  | 'error';
 
 export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, device }: Props) {
   const [stage, setStage] = useState<Stage>('intro');
   const [phrase, setPhrase] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Ghost-device picker state — populated between 'verify' and 'uploading'
+  // when we're rotating AND the user has 2+ active devices. The user must
+  // confirm which devices to keep before the new SSK re-issues their certs.
+  const [pickerEntries, setPickerEntries] = useState<PickerEntry[] | null>(null);
 
   function handleStart() {
     setPhrase(generateRecoveryPhrase());
     setStage('display');
   }
 
-  async function handleCommit() {
+  /**
+   * After the user verifies their phrase, decide whether to show the
+   * ghost-device picker. Only applies to rotation flows (rotate=true) with
+   * a known current device (device prop passed). Skip the picker if there's
+   * only one active device on the account — nothing to pick.
+   */
+  async function handleVerified() {
+    if (!phrase) return;
+    setError(null);
+    if (rotate && device) {
+      setStage('loading-picker');
+      try {
+        const publishedOld = await fetchUserMasterKeyPub(userId);
+        if (!publishedOld) throw new Error('no published UMK — nothing to rotate');
+        let oldSskPub: Uint8Array | undefined;
+        if (publishedOld.sskPub && publishedOld.sskCrossSignature) {
+          try {
+            await verifySskCrossSignature(
+              publishedOld.ed25519PublicKey,
+              publishedOld.sskPub,
+              publishedOld.sskCrossSignature,
+            );
+            oldSskPub = publishedOld.sskPub;
+          } catch {
+            // fall through to MSK-only verification
+          }
+        }
+        const active = await filterActiveDevices(
+          await fetchPublicDevices(userId),
+          umk.ed25519PublicKey,
+          oldSskPub,
+        );
+        // Fast-path: only the current device is active → nothing to pick.
+        if (active.length <= 1) {
+          await performCommit([]);
+          return;
+        }
+        // Fetch the DeviceRow list to pick up display-name ciphertext.
+        // Only the device that wrote its own ciphertext can decrypt it, so
+        // only OUR row yields a plaintext name; peer rows render as
+        // fingerprint + createdAt instead.
+        const rows = await listDeviceRows(userId);
+        const rowsById = new Map(rows.map((r) => [r.id, r]));
+        const entries: PickerEntry[] = [];
+        for (const pub of active) {
+          const row = rowsById.get(pub.deviceId);
+          const displayNameCiphertext = row?.display_name_ciphertext ?? null;
+          let decryptedName: string | null = null;
+          if (pub.deviceId === device.deviceId && displayNameCiphertext) {
+            try {
+              decryptedName = await decryptDeviceDisplayName(
+                await fromBase64(displayNameCiphertext),
+                device.x25519PublicKey,
+                device.x25519PrivateKey,
+              );
+            } catch {
+              // fall through
+            }
+          }
+          entries.push({ pub, displayNameCiphertext, decryptedName });
+        }
+        setPickerEntries(entries);
+        setStage('device-picker');
+      } catch (e) {
+        setError(errorMessage(e));
+        setStage('error');
+      }
+      return;
+    }
+    // No rotation or no device context → proceed directly.
+    await performCommit([]);
+  }
+
+  async function performCommit(devicesToRevoke: string[]) {
     if (!phrase) return;
     setStage('uploading');
     setError(null);
@@ -77,7 +179,11 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
 
       if (rotate) {
         // Step 1: generate new MSK + SSK + USK + re-sign certs IN MEMORY ONLY.
-        rotated = await generateRotatedUmk(userId, umk);
+        // devicesToRevoke comes from the picker; empty array = default
+        // "re-sign everyone" behaviour.
+        rotated = await generateRotatedUmk(userId, umk, {
+          devicesToRevoke,
+        });
         umkToWrap = rotated.newUmk;
       } else {
         umkToWrap = umk;
@@ -118,13 +224,20 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
         await saveSsk(userId, rotated.newSsk);
         await saveUsk(userId, rotated.newUsk);
 
-        // Step 5: publish new pubs + write re-signed device certs.
-        await commitRotatedUmk(userId, umkToWrap, rotated.reissuedCerts, {
-          ssk: rotated.newSsk,
-          usk: rotated.newUsk,
-          sskCrossSignature: rotated.sskCrossSignature,
-          uskCrossSignature: rotated.uskCrossSignature,
-        });
+        // Step 5: publish new pubs + write re-signed device certs +
+        // any revocations produced by the picker.
+        await commitRotatedUmk(
+          userId,
+          umkToWrap,
+          rotated.reissuedCerts,
+          {
+            ssk: rotated.newSsk,
+            usk: rotated.newUsk,
+            sskCrossSignature: rotated.sskCrossSignature,
+            uskCrossSignature: rotated.uskCrossSignature,
+          },
+          rotated.revocations,
+        );
 
         // Step 5b: invalidate the stale pin-locked blob. The old wrapped
         // identity contains the pre-rotation MSK; unlocking it would fail
@@ -176,7 +289,18 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
           <VerifyStage
             phrase={phrase}
             onBack={() => setStage('display')}
-            onOk={() => void handleCommit()}
+            onOk={() => void handleVerified()}
+          />
+        )}
+        {stage === 'loading-picker' && (
+          <p className="text-sm">Loading devices…</p>
+        )}
+        {stage === 'device-picker' && pickerEntries && device && (
+          <DevicePicker
+            entries={pickerEntries}
+            currentDeviceId={device.deviceId}
+            onBack={() => setStage('verify')}
+            onConfirm={(toRevoke) => void performCommit(toRevoke)}
           />
         )}
         {stage === 'uploading' && (
@@ -522,4 +646,140 @@ function VerifyStage({
       </div>
     </form>
   );
+}
+
+/**
+ * Ghost-device picker. Before the new SSK re-issues device certs, the user
+ * confirms which devices to keep. Unchecked devices get a fresh SSK-signed
+ * revocation cert instead of a re-issued issuance cert, expelling them from
+ * future generations. The current device is pinned-checked so the user can't
+ * lock themselves out.
+ */
+function DevicePicker({
+  entries,
+  currentDeviceId,
+  onBack,
+  onConfirm,
+}: {
+  entries: PickerEntry[];
+  currentDeviceId: string;
+  onBack: () => void;
+  onConfirm: (devicesToRevoke: string[]) => void;
+}) {
+  // State: set of deviceIds the user has opted to KEEP (checked). Initialized
+  // with every device checked (default is "trust all"); current device is
+  // always present and non-togglable.
+  const [kept, setKept] = useState<Set<string>>(
+    () => new Set(entries.map((e) => e.pub.deviceId)),
+  );
+
+  const revokeCount = entries.filter(
+    (e) => e.pub.deviceId !== currentDeviceId && !kept.has(e.pub.deviceId),
+  ).length;
+
+  function toggle(deviceId: string) {
+    if (deviceId === currentDeviceId) return; // can't toggle current
+    setKept((prev) => {
+      const next = new Set(prev);
+      if (next.has(deviceId)) next.delete(deviceId);
+      else next.add(deviceId);
+      return next;
+    });
+  }
+
+  function submit() {
+    const toRevoke = entries
+      .map((e) => e.pub.deviceId)
+      .filter((id) => id !== currentDeviceId && !kept.has(id));
+    onConfirm(toRevoke);
+  }
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-lg font-semibold">Confirm your trusted devices</h2>
+      <p className="text-sm text-neutral-700 dark:text-neutral-300">
+        Rotation replaces your root key. Any device still trusted after this
+        will be re-signed and keep access. Uncheck any device you don&apos;t
+        recognize — it will be revoked and lose access to messages sent after
+        rotation.
+      </p>
+      <ul className="space-y-2">
+        {entries.map((entry) => {
+          const isCurrent = entry.pub.deviceId === currentDeviceId;
+          const checked = kept.has(entry.pub.deviceId);
+          return (
+            <li
+              key={entry.pub.deviceId}
+              className="rounded border border-neutral-300 p-3 dark:border-neutral-700"
+            >
+              <label className="flex items-start gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={isCurrent}
+                  onChange={() => toggle(entry.pub.deviceId)}
+                  className="mt-1"
+                />
+                <div className="flex-1 space-y-0.5">
+                  <div className="font-medium">
+                    {isCurrent && entry.decryptedName
+                      ? `${entry.decryptedName} (this device)`
+                      : isCurrent
+                        ? 'This device'
+                        : `Device ${entry.pub.deviceId.slice(0, 8)}…`}
+                  </div>
+                  <div className="text-xs font-mono text-neutral-500">
+                    fingerprint {fingerprintHex(entry.pub.ed25519PublicKey)}
+                  </div>
+                  <div className="text-xs text-neutral-500">
+                    added{' '}
+                    {new Date(entry.pub.createdAtMs).toLocaleDateString(undefined, {
+                      year: 'numeric',
+                      month: 'short',
+                      day: 'numeric',
+                    })}
+                  </div>
+                </div>
+              </label>
+            </li>
+          );
+        })}
+      </ul>
+      {revokeCount > 0 && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs dark:border-amber-800 dark:bg-amber-950">
+          {revokeCount === 1 ? '1 device' : `${revokeCount} devices`} will be
+          revoked. They&apos;ll keep any messages already on their device but
+          won&apos;t see new ones.
+        </div>
+      )}
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={onBack}
+          className="rounded border border-neutral-300 px-4 py-2 text-sm dark:border-neutral-700"
+        >
+          back
+        </button>
+        <button
+          type="button"
+          onClick={submit}
+          className="rounded bg-neutral-900 px-4 py-2 text-sm text-white dark:bg-white dark:text-neutral-900"
+        >
+          Rotate with {kept.size} trusted {kept.size === 1 ? 'device' : 'devices'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** First 8 hex bytes of the ed25519 pub, space-separated for readability. */
+function fingerprintHex(edPub: Uint8Array): string {
+  const hex = bytesToHexDebug(edPub.slice(0, 8));
+  return hex.match(/.{1,4}/g)?.join(' ') ?? hex;
+}
+
+function bytesToHexDebug(bytes: Uint8Array): string {
+  let s = '';
+  for (const b of bytes) s += b.toString(16).padStart(2, '0');
+  return s;
 }

@@ -18,6 +18,7 @@ import {
 } from '@/lib/supabase/queries';
 import { loadEnrolledDevice } from '@/lib/bootstrap';
 import { subscribeIdentityChanges } from '@/lib/tab-sync';
+import { IncomingCallToast } from './IncomingCallToast';
 import { KeyChangeBanner } from './KeyChangeBanner';
 import { PendingApprovalBanner } from './PendingApprovalBanner';
 
@@ -30,6 +31,7 @@ interface AppShellProps {
 export function AppShell({ children, requireAuth = false }: AppShellProps) {
   const router = useRouter();
   const [email, setEmail] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
   const [checking, setChecking] = useState(requireAuth);
 
   useEffect(() => {
@@ -97,6 +99,7 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
     void supabase.auth.getUser().then(async ({ data }) => {
       if (!mounted) return;
       setEmail(data.user?.email ?? null);
+      setUserId(data.user?.id ?? null);
       if (!requireAuth) {
         setChecking(false);
         return;
@@ -126,6 +129,7 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!mounted) return;
       setEmail(session?.user?.email ?? null);
+      setUserId(session?.user?.id ?? null);
       if (requireAuth && !session) router.replace('/');
     });
 
@@ -183,6 +187,7 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
         )}
         {children}
       </main>
+      {userId && <IncomingCallToast userId={userId} />}
     </div>
   );
 }

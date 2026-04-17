@@ -29,6 +29,7 @@ import {
   putUserSigningKey,
   rotateRoomKey,
   signDeviceIssuanceV2,
+  signDeviceRevocationV2,
   signInviteEnvelope,
   signMembershipWrap,
   toBase64,
@@ -334,17 +335,36 @@ export interface RotatedUmkResult {
   sskCrossSignature: Uint8Array;
   uskCrossSignature: Uint8Array;
   reissuedCerts: Array<{ deviceId: string; issuanceSignature: Uint8Array }>;
+  /**
+   * New-SSK-signed revocation certs for devices the caller opted to expel
+   * during rotation. Empty on the default (re-sign everyone) path. Populated
+   * only when `options.devicesToRevoke` is passed — the ghost-device picker
+   * UX uses this to expel devices the user doesn't recognize.
+   */
+  revocations: Array<{
+    deviceId: string;
+    revokedAtMs: number;
+    signature: Uint8Array;
+  }>;
 }
 
 /**
- * Generate a fresh MSK + SSK + USK and re-sign all active device issuance
- * certs with the new SSK. Pure computation — no server writes, no local
- * saves. Callers use it with `commitRotatedUmk` to control the escrow →
- * save → publish ordering (SSSS pattern).
+ * Generate a fresh MSK + SSK + USK and re-sign active device issuance certs
+ * with the new SSK. Pure computation — no server writes, no local saves.
+ * Callers use it with `commitRotatedUmk` to control the escrow → save →
+ * publish ordering (SSSS pattern).
+ *
+ * `options.devicesToRevoke` opts into the ghost-device picker model: listed
+ * device IDs get a fresh SSK-signed revocation cert INSTEAD of a reissued
+ * issuance cert. Kept devices get a new issuance cert as before. The caller
+ * is responsible for keeping the current (acting) device OUT of the revoke
+ * list — this helper does not assert that by itself, since it doesn't know
+ * which device is "current".
  */
 export async function generateRotatedUmk(
   userId: string,
   oldUmk: UserMasterKey,
+  options?: { devicesToRevoke?: string[] },
 ): Promise<RotatedUmkResult> {
   const publishedOld = await fetchUserMasterKeyPub(userId);
   if (!publishedOld) throw new Error('no published UMK — nothing to rotate');
@@ -380,9 +400,17 @@ export async function generateRotatedUmk(
   const { ssk: newSsk, usk: newUsk, sskCrossSignature, uskCrossSignature } =
     await generateSigningKeys(newUmk);
 
-  // Re-sign all device certs with the new SSK (v2 domain)
+  const toRevoke = new Set(options?.devicesToRevoke ?? []);
+  const kept = activeDevices.filter((d) => !toRevoke.has(d.deviceId));
+  if (kept.length === 0) {
+    throw new Error(
+      'rotation would leave zero active devices — refusing. Keep at least the current device.',
+    );
+  }
+
+  // Re-sign kept device certs with the new SSK (v2 domain)
   const reissuedCerts = await Promise.all(
-    activeDevices.map(async (d) => {
+    kept.map(async (d) => {
       const sig = await signDeviceIssuanceV2(
         {
           userId,
@@ -397,7 +425,31 @@ export async function generateRotatedUmk(
     }),
   );
 
-  return { newUmk, newSsk, newUsk, sskCrossSignature, uskCrossSignature, reissuedCerts };
+  // Sign revocations for expelled devices with the new SSK so the cert
+  // chain resolves post-commit. Using old SSK here would leave the
+  // revocation signature stranded (old SSK cross-sig gets replaced).
+  const revokedAtMs = Date.now();
+  const revocations = await Promise.all(
+    activeDevices
+      .filter((d) => toRevoke.has(d.deviceId))
+      .map(async (d) => {
+        const sig = await signDeviceRevocationV2(
+          { userId, deviceId: d.deviceId, revokedAtMs },
+          newSsk.ed25519PrivateKey,
+        );
+        return { deviceId: d.deviceId, revokedAtMs, signature: sig };
+      }),
+  );
+
+  return {
+    newUmk,
+    newSsk,
+    newUsk,
+    sskCrossSignature,
+    uskCrossSignature,
+    reissuedCerts,
+    revocations,
+  };
 }
 
 /**
@@ -419,6 +471,16 @@ export async function commitRotatedUmk(
     sskCrossSignature: Uint8Array;
     uskCrossSignature: Uint8Array;
   },
+  /**
+   * Optional: device revocations produced by `generateRotatedUmk` when the
+   * caller opted into the ghost-device picker. Written in the same batch as
+   * the cert updates.
+   */
+  revocations?: Array<{
+    deviceId: string;
+    revokedAtMs: number;
+    signature: Uint8Array;
+  }>,
 ): Promise<void> {
   await publishUserMasterKey(
     userId,
@@ -434,15 +496,25 @@ export async function commitRotatedUmk(
   );
 
   const supabase = getSupabase();
-  await Promise.all(
-    reissuedCerts.map(async ({ deviceId, issuanceSignature }) => {
+  await Promise.all([
+    ...reissuedCerts.map(async ({ deviceId, issuanceSignature }) => {
       const { error } = await supabase
         .from('devices')
         .update({ issuance_signature: await toBase64(issuanceSignature) })
         .eq('id', deviceId);
       if (error) throw error;
     }),
-  );
+    ...(revocations ?? []).map(async ({ deviceId, revokedAtMs, signature }) => {
+      const { error } = await supabase
+        .from('devices')
+        .update({
+          revoked_at_ms: revokedAtMs,
+          revocation_signature: await toBase64(signature),
+        })
+        .eq('id', deviceId);
+      if (error) throw error;
+    }),
+  ]);
 
   await putUserMasterKey(userId, newUmk);
   if (crossSigning) {
