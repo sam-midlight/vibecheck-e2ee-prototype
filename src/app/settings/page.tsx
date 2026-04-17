@@ -20,7 +20,6 @@ import {
   getUserMasterKey,
   getUserSigningKey,
   hasWrappedIdentity,
-  publicIdentityFingerprint,
   putWrappedIdentity,
   signDeviceRevocation,
   signDeviceRevocationV2,
@@ -33,7 +32,6 @@ import {
 import { useRouter } from 'next/navigation';
 import { getSupabase } from '@/lib/supabase/client';
 import {
-  fetchUserMasterKeyPub,
   hasRecoveryBlob,
   listDevices,
   revokeDevice,
@@ -57,7 +55,6 @@ function SettingsInner() {
   const [usk, setUsk] = useState<UserSigningKey | null>(null);
   const [hasPhrase, setHasPhrase] = useState<boolean | null>(null);
   const [pinEnabled, setPinEnabled] = useState<boolean | null>(null);
-  const [myFingerprint, setMyFingerprint] = useState<string | null>(null);
   const [devices, setDevices] = useState<DeviceRow[]>([]);
   const [deviceLabels, setDeviceLabels] = useState<Map<string, string>>(() => new Map());
   const [showModal, setShowModal] = useState(false);
@@ -78,21 +75,6 @@ function SettingsInner() {
       setUsk(await getUserSigningKey(data.user.id));
       setHasPhrase(await hasRecoveryBlob(data.user.id));
       setPinEnabled(await hasWrappedIdentity(data.user.id));
-      // Compute own UMK-derived safety number for the "your number" strip.
-      try {
-        const umkPub = await fetchUserMasterKeyPub(data.user.id);
-        if (umkPub) {
-          setMyFingerprint(
-            await publicIdentityFingerprint({
-              ed25519PublicKey: umkPub.ed25519PublicKey,
-              x25519PublicKey: umkPub.ed25519PublicKey,
-              selfSignature: new Uint8Array(0),
-            }),
-          );
-        }
-      } catch {
-        // non-fatal
-      }
       await reloadDevices(data.user.id);
     })().catch((e) => setError(errorMessage(e)));
   }, []);
@@ -250,20 +232,6 @@ function SettingsInner() {
   return (
     <div className="max-w-xl space-y-6">
       <h1 className="text-xl font-semibold">Settings</h1>
-
-      <section className="space-y-2">
-        <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">
-          Your safety number
-        </h2>
-        <p className="text-xs text-neutral-600 dark:text-neutral-400">
-          Read this out to other members over a call or in person to confirm
-          they see the same number. If the numbers don&apos;t match, someone
-          is impersonating one of you.
-        </p>
-        <code className="block rounded bg-neutral-100 px-3 py-2 font-mono text-sm tracking-wide dark:bg-neutral-900">
-          🔑 {myFingerprint ?? '(loading…)'}
-        </code>
-      </section>
 
       <section className="space-y-3">
         <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">

@@ -164,8 +164,14 @@ export function VerifyContactModal({ userId, peerUserId, onDone }: Props) {
               setStage('comparing-emoji');
             }
           }
+          // Finalize only when BOTH MACs are present — symmetric with the
+          // responder's guard. initiator_mac proves WE clicked "they match"
+          // (set by our own confirmEmoji); responder_mac proves the peer
+          // did. Without both, a peer who confirms first would make us
+          // auto-finalize before we even see the emoji button.
           if (
             row.state === 'sas_compared' &&
+            row.initiator_mac &&
             row.responder_mac &&
             !didFinalizeRef.current
           ) {

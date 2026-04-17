@@ -188,10 +188,17 @@ export function RespondVerificationModal({ userId, session, onDone }: Props) {
             }
           }
 
-          // Initiator sent their MAC → we can finalize
+          // Finalize only when BOTH MACs are present. row.initiator_mac means
+          // the initiator confirmed emoji; row.responder_mac means WE (the
+          // responder) have confirmed too (set in our own confirmEmoji). If
+          // we finalize on initiator_mac alone we silently skip the
+          // responder's "they match" click — user-visible bug was: responder
+          // modal auto-closes as soon as initiator confirms, responder never
+          // sends responder_mac, initiator stalls forever on exchanging-mac.
           if (
             row.state === 'sas_compared' &&
             row.initiator_mac &&
+            row.responder_mac &&
             sharedSecretRef.current &&
             !didFinalizeRef.current
           ) {
