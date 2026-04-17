@@ -69,6 +69,7 @@ import {
   insertMegolmSessionShare,
   kickAndRotate,
   listCallMembers,
+  listDevices,
   listRoomMembers,
   publishUserMasterKey,
   registerDevice,
@@ -245,6 +246,40 @@ export async function loadEnrolledDevice(
   const bundle = await getDeviceBundle(userId);
   if (!bundle) return null;
   const umk = await getUserMasterKey(userId);
+
+  // Opportunistic SSK pickup: if this device doesn't hold SSK locally
+  // but its server-side row has a signing_key_wrap, unseal it now.
+  // Covers devices approved before the cross-signing code was deployed,
+  // or where the initial pickup in the auth callback failed/was skipped.
+  const { getSelfSigningKey: localSsk } = await import('@/lib/e2ee-core');
+  if (!(await localSsk(userId))) {
+    try {
+      const rows = await listDevices(userId);
+      const myRow = rows.find((r) => r.id === bundle.deviceId);
+      if (myRow?.signing_key_wrap) {
+        const { fromBase64: b64d, getSodium, putSelfSigningKey, putUserSigningKey } =
+          await import('@/lib/e2ee-core');
+        const sodium = await getSodium();
+        const sealed = await b64d(myRow.signing_key_wrap);
+        const packed = sodium.crypto_box_seal_open(
+          sealed, bundle.x25519PublicKey, bundle.x25519PrivateKey,
+        );
+        const sskPriv = packed.slice(0, 64);
+        const uskPriv = packed.slice(64, 128);
+        const sskPub = sodium.crypto_sign_ed25519_sk_to_pk(sskPriv);
+        const uskPub = sodium.crypto_sign_ed25519_sk_to_pk(uskPriv);
+        sodium.memzero(packed);
+        await putSelfSigningKey(userId, { ed25519PublicKey: sskPub, ed25519PrivateKey: sskPriv });
+        await putUserSigningKey(userId, { ed25519PublicKey: uskPub, ed25519PrivateKey: uskPriv });
+        // Clean up the wrap from the server row.
+        const supabase = (await import('@/lib/supabase/client')).getSupabase();
+        await supabase.from('devices').update({ signing_key_wrap: null }).eq('id', bundle.deviceId);
+      }
+    } catch (err) {
+      console.warn('opportunistic SSK pickup failed:', err);
+    }
+  }
+
   return { userId, deviceBundle: bundle, umk };
 }
 
