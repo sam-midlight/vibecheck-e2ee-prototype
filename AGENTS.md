@@ -44,6 +44,7 @@ Each user has **five distinct key types**. Mixing them up is the most common way
 
 - **PIN-lock is mandatory, not opt-in.** `auth/callback/page.tsx` has a `require-pin-setup` gate between "ready to navigate" and actual navigation. Any new auth flow must also pass through it.
 - **Rotation is atomic via `kick_and_rotate` RPC.** Client orchestration of delete → insert → bump was the old model and was replaced because it left zombie states on partial failure. New membership-change logic goes into the RPC, not into a series of client calls.
+- **Rotation / kick is creator-only.** UI: `isAdmin = room.created_by === selfUserId` gates the Rotate button and `rotateNow()`. Server: `kick_and_rotate` authorizes caller as (a) room creator, or (b) leaving themselves. Do not propose broadening to "any member can rotate" without an explicit design discussion.
 - **MSK rotation cascades to room rotation.** After `rotateUserMasterKey` we call `rotateAllRoomsIAdmin` so a ghost device can't retain room access. MSK rotation also generates fresh SSK+USK+cross-sigs. If you add a new "change my keys" flow, it must include the cascade.
 - **Retention window is 10 generations.** `kick_and_rotate`'s FS purge clause is `generation < new_gen - 9`. Widening or narrowing is a security trade-off; document and discuss before changing.
 - **`devices_read_all` must stay public.** Peers need to read each other's device_pubs to wrap room keys. The write policies stay owner-only.

@@ -103,6 +103,8 @@ Either reuse the prototype's `src/lib/supabase/` wholesale, or write the V2 app'
 
 If V2 wants to pre-generate TypeScript types from the DB, run `supabase gen types typescript` after the migration is applied; the row shapes in `src/lib/supabase/queries.ts` are a manual mirror of that.
 
+**Postgres RLS + `ON CONFLICT` gotcha (learned the hard way 2026-04-17):** on any table with RLS, a statement that includes `ON CONFLICT (...)` — including supabase-js `.upsert()` with or without `ignoreDuplicates: true` — causes Postgres to evaluate the table's **SELECT policy USING expression against the NEW row being inserted**, even when no conflict exists and even with `DO NOTHING`. If the SELECT policy restricts visibility to a subset of rows the writer legitimately inserts to (e.g., `megolm_session_shares.recipient_device_id` must belong to `auth.uid()`, but senders insert shares for *peer* devices), every cross-user insert fails with 42501. Workaround that `insertMegolmSessionShare` uses: plain `.insert()` + client-side swallow of 23505 (duplicate-key). When designing future "sealed blob addressed to a specific recipient" tables in V2, either follow this pattern, widen the SELECT policy to cover writes, or route through a SECURITY DEFINER RPC.
+
 ## 3. Port the auth bootstrap
 
 The critical path is in `src/app/auth/callback/page.tsx`:
