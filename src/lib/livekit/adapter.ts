@@ -232,13 +232,14 @@ export class LiveKitAdapter {
         if (!participant || !isLocalParticipant(participant)) return;
         if (enabled) {
           this.setEncryptionState('active');
-        } else if (
-          this._encryptionState !== 'failed' &&
-          this._encryptionState !== 'unsupported'
-        ) {
-          // Any non-terminal → disabled transition is a real downgrade.
-          // Catches both `active → false` (mid-call failure) and
-          // `pending → false` (SFrame worker never engaged at startup).
+        } else if (this._encryptionState === 'active') {
+          // Real downgrade: we were active and now we're not. Only treat
+          // THIS transition as a failure — LiveKit also fires enabled=false
+          // during normal init (before any track is published, there's
+          // nothing to encrypt yet), and flipping to 'failed' there was a
+          // false-positive that scared the diagnostics UI. The "never
+          // engaged" case is covered separately by the publishLocalMedia
+          // timeout in awaitEncryptionActive.
           this.setEncryptionState(
             'failed',
             'local participant encryption went off — possible silent plaintext fallback',
