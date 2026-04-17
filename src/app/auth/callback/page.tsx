@@ -35,6 +35,7 @@ import {
 } from '@/lib/bootstrap';
 import { PinSetupModal } from '@/components/PinSetupModal';
 import { errorMessage } from '@/lib/errors';
+import { broadcastIdentityChange } from '@/lib/tab-sync';
 import {
   createApprovalRequest,
   deleteApprovalRequest,
@@ -347,6 +348,9 @@ export default function AuthCallbackPage() {
       // brand-new identity.
       await clearWrappedIdentity(userId);
       await nukeIdentityServer(userId);
+      // Sibling tabs still holding the old identity must reload — their MSK
+      // pub no longer exists on the server and any operation will fail.
+      broadcastIdentityChange('identity-nuked', userId);
       const fresh = await bootstrapNewUser(userId);
       localStorage.removeItem(`recovery_skipped_${userId}`);
       setEnrolled(fresh);
@@ -708,6 +712,21 @@ function NuclearConfirm({
  * No root-identity transfer. No sealed payload. The transport is a signed
  * certificate plus a user-visible code binding.
  */
+// Server-side TTL is 2 min (migration 0010). We fail the UI at TTL + grace so
+// a borderline-slow network doesn't give "expired" immediately before the
+// approving device's row write arrives. Matches both the 5-miss lockout path
+// (server deletes the row → poll never finds our device → client times out)
+// and the natural TTL-expiry path.
+const APPROVAL_TTL_MS = 120_000;
+const APPROVAL_GRACE_MS = 15_000;
+
+function formatRemaining(ms: number): string {
+  const s = Math.ceil(ms / 1000);
+  const mm = Math.floor(s / 60);
+  const ss = s % 60;
+  return `${mm}:${ss.toString().padStart(2, '0')}`;
+}
+
 function AwaitingApproval({
   userId,
   onInstalled,
@@ -720,7 +739,10 @@ function AwaitingApproval({
   onError: (msg: string) => void;
 }) {
   const [code, setCode] = useState<string | null>(null);
-  const [status, setStatus] = useState<'preparing' | 'waiting' | 'installing'>('preparing');
+  const [status, setStatus] = useState<
+    'preparing' | 'waiting' | 'installing' | 'expired'
+  >('preparing');
+  const [remainingMs, setRemainingMs] = useState<number>(APPROVAL_TTL_MS);
 
   const bundleRef = useRef<DeviceKeyBundle | null>(null);
   const ranRef = useRef(false);
@@ -731,6 +753,7 @@ function AwaitingApproval({
     ranRef.current = true;
     let cancelled = false;
     let pollHandle: ReturnType<typeof setInterval> | null = null;
+    let tickHandle: ReturnType<typeof setInterval> | null = null;
 
     (async () => {
       try {
@@ -766,6 +789,25 @@ function AwaitingApproval({
         requestIdRef.current = request.id;
         setCode(plainCode);
         setStatus('waiting');
+
+        // Countdown + expiry tick. Runs once per second; on elapse beyond
+        // TTL+grace, flips the UI into 'expired' and stops polling. The
+        // expiry handles both TTL elapse and the 5-miss lockout (server
+        // deleted the row, poll would otherwise loop forever).
+        const startedAt = Date.now();
+        tickHandle = setInterval(() => {
+          if (cancelled) return;
+          const elapsed = Date.now() - startedAt;
+          const remaining = Math.max(0, APPROVAL_TTL_MS - elapsed);
+          setRemainingMs(remaining);
+          if (elapsed > APPROVAL_TTL_MS + APPROVAL_GRACE_MS) {
+            if (pollHandle) clearInterval(pollHandle);
+            if (tickHandle) clearInterval(tickHandle);
+            pollHandle = null;
+            tickHandle = null;
+            setStatus((prev) => (prev === 'installing' ? prev : 'expired'));
+          }
+        }, 1000);
 
         // Poll the device list for our cert to appear. Realtime on `devices`
         // is not published (see 0009), so polling is the mechanism.
@@ -907,6 +949,7 @@ function AwaitingApproval({
     return () => {
       cancelled = true;
       if (pollHandle) clearInterval(pollHandle);
+      if (tickHandle) clearInterval(tickHandle);
       const id = requestIdRef.current;
       if (id) void deleteApprovalRequest(id).catch(() => {});
     };
@@ -931,12 +974,23 @@ function AwaitingApproval({
             {code.slice(0, 3)} {code.slice(3)}
           </p>
           <p className="text-xs text-neutral-500">
-            Waiting for approval… (expires in ~2 minutes)
+            Waiting for approval… expires in {formatRemaining(remainingMs)}
           </p>
         </>
       )}
       {status === 'installing' && (
         <p className="text-neutral-600">Verifying cert and installing…</p>
+      )}
+      {status === 'expired' && (
+        <div className="space-y-2">
+          <p className="text-red-700 dark:text-red-400">
+            Request expired. This can happen if the code wasn&apos;t entered in
+            time, or if the 5-try limit was reached on the other device.
+          </p>
+          <p className="text-xs text-neutral-600 dark:text-neutral-400">
+            Go back and start a fresh request to get a new code.
+          </p>
+        </div>
       )}
       <button
         onClick={onBack}

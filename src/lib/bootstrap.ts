@@ -58,6 +58,7 @@ import {
 } from '@/lib/e2ee-core';
 import { getSupabase } from '@/lib/supabase/client';
 import { errorMessage } from '@/lib/errors';
+import { broadcastIdentityChange } from '@/lib/tab-sync';
 import {
   addRoomMember,
   createInvite,
@@ -448,6 +449,12 @@ export async function commitRotatedUmk(
     await putSelfSigningKey(userId, crossSigning.ssk);
     await putUserSigningKey(userId, crossSigning.usk);
   }
+  // Tell sibling tabs to reload — their in-memory MSK / SSK / USK are now
+  // stale and operations using them will fail once the new cert chain
+  // replaces the old one on the server. Covers BOTH the rotateUserMasterKey
+  // wrapper AND the RecoveryPhraseModal path that calls commitRotatedUmk
+  // directly.
+  broadcastIdentityChange('msk-rotated', userId);
 }
 
 /**
@@ -468,6 +475,7 @@ export async function rotateUserMasterKey(
     sskCrossSignature: result.sskCrossSignature,
     uskCrossSignature: result.uskCrossSignature,
   });
+  // commitRotatedUmk broadcasts identity-change to sibling tabs.
   return result.newUmk;
 }
 

@@ -17,6 +17,7 @@ import {
   fetchUserMasterKeyPub,
 } from '@/lib/supabase/queries';
 import { loadEnrolledDevice } from '@/lib/bootstrap';
+import { subscribeIdentityChanges } from '@/lib/tab-sync';
 import { KeyChangeBanner } from './KeyChangeBanner';
 import { PendingApprovalBanner } from './PendingApprovalBanner';
 
@@ -91,6 +92,8 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
       router.replace('/');
     }
 
+    let unsubTabSync: (() => void) | null = null;
+
     void supabase.auth.getUser().then(async ({ data }) => {
       if (!mounted) return;
       setEmail(data.user?.email ?? null);
@@ -108,6 +111,15 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
         await bootOut(data.user.id);
         return;
       }
+      // Subscribe to sibling-tab identity changes. A rotation / revocation /
+      // nuke in another tab leaves this tab's in-memory state stale; reload
+      // is the cleanest recovery because it re-reads from IDB (which the
+      // other tab already updated) and re-runs the post-mount chain check.
+      const uid = data.user.id;
+      unsubTabSync = subscribeIdentityChanges(uid, () => {
+        if (!mounted) return;
+        window.location.reload();
+      });
       setChecking(false);
     });
 
@@ -120,6 +132,7 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
     return () => {
       mounted = false;
       sub.subscription.unsubscribe();
+      unsubTabSync?.();
     };
   }, [requireAuth, router]);
 

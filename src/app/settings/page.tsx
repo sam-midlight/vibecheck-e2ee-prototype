@@ -6,6 +6,7 @@ import { PinSetupModal } from '@/components/PinSetupModal';
 import { PromoteDeviceModal } from '@/components/PromoteDeviceModal';
 import { RecoveryPhraseModal } from '@/components/RecoveryPhraseModal';
 import { errorMessage } from '@/lib/errors';
+import { broadcastIdentityChange } from '@/lib/tab-sync';
 import {
   cascadeRevocationIntoActiveCalls,
   rotateAllRoomsIAdmin,
@@ -144,6 +145,9 @@ function SettingsInner() {
         revokedAtMs,
         revocationSignature: signature,
       });
+      // If the revoked device has sibling tabs open, they need to know their
+      // cert just became invalid — reload drops them to the sign-in flow.
+      broadcastIdentityChange('device-revoked', userId);
       // Cascade 1: rotate every room this user admins so the revoked
       // device is immediately excluded from new-gen wraps.
       // filterActiveDevices in the rotation helper skips revoked certs.

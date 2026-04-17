@@ -145,8 +145,14 @@ export default function StatusPage() {
     ): Promise<T | undefined> => {
       setCheck(name, { status: 'running' });
       const t0 = performance.now();
+      // Per-check 15s cap so one hanging probe doesn't freeze the whole page.
+      // The dashboard's value is that you can see which step is broken; a
+      // hang on step N with all later steps stuck as 'idle' defeats that.
+      const timeout = new Promise<{ detail?: string; result?: T }>((_, reject) =>
+        setTimeout(() => reject(new Error('check timed out after 15s')), 15_000),
+      );
       try {
-        const { detail, result } = await fn();
+        const { detail, result } = await Promise.race([fn(), timeout]);
         const elapsed = Math.round(performance.now() - t0);
         setCheck(name, { status: 'ok', elapsedMs: elapsed, detail });
         return result;

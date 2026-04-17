@@ -27,8 +27,13 @@ import {
   signUserMsk,
   toBase64,
   verifySasCommitment,
+  verifySasMac,
   type Bytes,
 } from '@/lib/e2ee-core';
+
+// Same timeout the initiator uses — keep the two sides symmetric so a wedged
+// modal on either end fails the protocol at roughly the same time.
+const SAS_WAIT_TIMEOUT_MS = 120_000;
 import {
   fetchPublicDevices,
   fetchUserMasterKeyPub,
@@ -63,6 +68,9 @@ export function RespondVerificationModal({ userId, session, onDone }: Props) {
   const ephemeralRef = useRef<{ pub: Bytes; priv: Bytes } | null>(null);
   const sharedSecretRef = useRef<Bytes | null>(null);
   const commitmentRef = useRef<Bytes | null>(null);
+  // Cached initiator device ed pub — captured during commitment verification
+  // so finalizeSas can verify initiator's MAC without re-fetching.
+  const initiatorEdPubRef = useRef<Bytes | null>(null);
   const ranRef = useRef(false);
   // Idempotency guards so repeat events (own UPDATE triggers another tick,
   // poller + realtime both fire for same row) don't re-run side-effectful
@@ -165,6 +173,7 @@ export function RespondVerificationModal({ userId, session, onDone }: Props) {
                 'commitment verification failed — possible MITM attack. Aborting.',
               );
             }
+            initiatorEdPubRef.current = initiatorDevice.ed25519PublicKey;
 
             const shared = await computeSasSharedSecret(eph.priv, initiatorEph);
             sharedSecretRef.current = shared;
@@ -221,6 +230,19 @@ export function RespondVerificationModal({ userId, session, onDone }: Props) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Peer-disconnect timeout. Mirror of the initiator's effect — see comment
+  // in VerifyContactModal for rationale.
+  useEffect(() => {
+    const waitStages: Stage[] = ['waiting-for-reveal', 'waiting-for-initiator-mac'];
+    if (!waitStages.includes(stage)) return;
+    const t = setTimeout(() => {
+      void updateSasSession(session.id, { state: 'cancelled' });
+      setError('peer did not respond — verification timed out');
+      setStage('error');
+    }, SAS_WAIT_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [stage, session.id]);
+
   async function confirmEmoji() {
     if (!sharedSecretRef.current) return;
     setStage('exchanging-mac');
@@ -249,8 +271,20 @@ export function RespondVerificationModal({ userId, session, onDone }: Props) {
   async function finalizeSas(row: SasVerificationSessionRow) {
     setStage('signing');
     try {
+      if (!sharedSecretRef.current || !row.initiator_mac || !initiatorEdPubRef.current) {
+        throw new Error('missing data');
+      }
       const peerMskPub = await fetchUserMasterKeyPub(session.initiator_user_id);
       if (!peerMskPub) throw new Error('no peer MSK pub');
+
+      // Full MAC verification — see sibling comment in VerifyContactModal.
+      const macOk = await verifySasMac({
+        sharedSecret: sharedSecretRef.current,
+        otherMskPub: peerMskPub.ed25519PublicKey,
+        otherDeviceEdPub: initiatorEdPubRef.current,
+        mac: await fromBase64(row.initiator_mac),
+      });
+      if (!macOk) throw new Error('initiator MAC did not verify — possible MITM, aborting');
 
       const usk = await getUserSigningKey(userId);
       if (!usk) throw new Error('no USK — promote to co-primary first');

@@ -57,6 +57,11 @@ export function PinSetupModal({
           {blurb ??
             'Used to unlock your identity on this device. Argon2id-based — brute-force is slow but not impossible for short PINs; pick 8+ characters if you can. If you forget it and don\u2019t have a recovery phrase, this device is unrecoverable.'}
         </p>
+        {mandatory && (
+          <p className="text-xs text-neutral-500 dark:text-neutral-500">
+            One-time setup — required so your keys can&apos;t be read at rest. You can change this passphrase later in Settings.
+          </p>
+        )}
         <div>
           <label className="text-xs text-neutral-500">passphrase</label>
           <input

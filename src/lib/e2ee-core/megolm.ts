@@ -66,6 +66,14 @@ export const DEFAULT_AUTO_ROTATION: AutoRotationConfig = {
   maxAgeMs: 7 * 24 * 60 * 60 * 1000,
 };
 
+/**
+ * Hard cap matching the server-side trigger in migration 0029. Client rotates
+ * at 100; the 100→200 gap accommodates rotation races. Hitting 200 client-side
+ * means rotation orchestration is broken — refuse rather than hand the server
+ * a row it will reject anyway.
+ */
+export const MEGOLM_HARD_CAP = 200;
+
 // ---------------------------------------------------------------------------
 // Ratchet primitives
 // ---------------------------------------------------------------------------
@@ -113,6 +121,12 @@ export async function createOutboundSession(
 export async function ratchetAndDerive(
   session: OutboundMegolmSession,
 ): Promise<MegolmMessageKey> {
+  if (session.messageIndex >= MEGOLM_HARD_CAP) {
+    throw new CryptoError(
+      `Megolm session exhausted at index ${session.messageIndex} (cap ${MEGOLM_HARD_CAP}). Rotate before sending.`,
+      'BAD_INPUT',
+    );
+  }
   const key = await deriveMessageKey(session.chainKey);
   const index = session.messageIndex;
   const sodium = await getSodium();

@@ -20,10 +20,12 @@ import {
   getUserSigningKey,
   signUserMsk,
   toBase64,
+  verifySasMac,
   type Bytes,
 } from '@/lib/e2ee-core';
 import {
   createSasSession,
+  fetchPublicDevices,
   fetchUserMasterKeyPub,
   getSasSession,
   insertCrossUserSignature,
@@ -31,6 +33,12 @@ import {
   updateSasSession,
   type SasVerificationSessionRow,
 } from '@/lib/supabase/queries';
+
+// Client-side no-progress timeout for peer-wait stages. Server-side row TTL is
+// 10 min; we fail the UX sooner so users aren't staring at "Waiting..." for
+// ten minutes after the peer closes their tab. Matches the UX the SAS spec
+// recommends (interactive protocol with visible liveness).
+const SAS_WAIT_TIMEOUT_MS = 120_000;
 
 interface Props {
   userId: string;
@@ -194,6 +202,20 @@ export function VerifyContactModal({ userId, peerUserId, onDone }: Props) {
     };
   }, [userId, peerUserId]);
 
+  // No-progress timeout: if we sit in a wait stage longer than
+  // SAS_WAIT_TIMEOUT_MS (peer closed their tab, dropped offline, etc.), fail
+  // the flow with a clear message instead of hanging on "Waiting..." forever.
+  useEffect(() => {
+    const waitStages: Stage[] = ['waiting-for-peer', 'exchanging-mac'];
+    if (!waitStages.includes(stage)) return;
+    const t = setTimeout(() => {
+      if (sessionId) void updateSasSession(sessionId, { state: 'cancelled' });
+      setError('peer did not respond — verification timed out');
+      setStage('error');
+    }, SAS_WAIT_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [stage, sessionId]);
+
   async function confirmEmoji() {
     if (!sessionId || !sharedSecretRef.current) return;
     setStage('exchanging-mac');
@@ -221,13 +243,27 @@ export function VerifyContactModal({ userId, peerUserId, onDone }: Props) {
   async function finalizeSas(row: SasVerificationSessionRow) {
     setStage('signing');
     try {
-      if (!sharedSecretRef.current || !row.responder_mac) throw new Error('missing data');
+      if (!sharedSecretRef.current || !row.responder_mac || !row.responder_device_id) {
+        throw new Error('missing data');
+      }
       const peerMskPub = await fetchUserMasterKeyPub(peerUserId);
       if (!peerMskPub) throw new Error('no peer MSK pub');
 
-      // NOTE: full MAC verification requires looking up responder_device_id's
-      // ed pub and calling verifySasMac. For the prototype, the commitment +
-      // emoji comparison is the primary binding; MAC is defense-in-depth.
+      // Full MAC verification (Matrix MSC1267 parity). Look up the responder's
+      // device ed pub, then HMAC-check that it attests to the shared secret.
+      // Without this, an attacker who can cross-wire both ephemerals could
+      // present matching emoji on each side independently; MAC binds each
+      // side's identity to the shared secret.
+      const peerDevices = await fetchPublicDevices(peerUserId);
+      const peerDevice = peerDevices.find((d) => d.deviceId === row.responder_device_id);
+      if (!peerDevice) throw new Error('responder device not found');
+      const macOk = await verifySasMac({
+        sharedSecret: sharedSecretRef.current,
+        otherMskPub: peerMskPub.ed25519PublicKey,
+        otherDeviceEdPub: peerDevice.ed25519PublicKey,
+        mac: await fromBase64(row.responder_mac),
+      });
+      if (!macOk) throw new Error('peer MAC did not verify — possible MITM, aborting');
 
       // Cross-sign: our USK signs peer's MSK pub
       const usk = await getUserSigningKey(userId);
