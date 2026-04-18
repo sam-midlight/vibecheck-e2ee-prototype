@@ -147,6 +147,7 @@ interface DebugInfo {
   currentGen: number;
   keysLoadedGens: number[];
   backupRestored: number;
+  backupRoomKeys: number;
   backupFailed: number;
   megolmSharesFound: number;
   cachedRowCount: number;
@@ -283,6 +284,16 @@ function RoomInner({ roomId }: { roomId: string }) {
       if (backupResult.restored > 0) {
         console.log(`restored ${backupResult.restored} session(s) from key backup`);
       }
+      // Merge backed-up room keys into byGen for generations this device has no room_members row.
+      for (const rk of backupResult.roomKeys) {
+        if (rk.roomId === roomId && !byGen.has(rk.generation)) {
+          byGen.set(rk.generation, { key: rk.key, generation: rk.generation });
+        }
+      }
+      if (backupResult.roomKeys.length > 0) {
+        setRoomKeysByGen(new Map(byGen));
+        roomKeysByGenRef.current = new Map(byGen);
+      }
 
       // Hydrate inbound Megolm sessions from direct shares (fast IDB writes).
       let dbgSharesFound = sharesResult.length;
@@ -385,6 +396,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         currentGen: roomRow.current_generation,
         keysLoadedGens: [...byGen.keys()].sort((a, b) => a - b),
         backupRestored: dbgBackupRestored,
+        backupRoomKeys: backupResult.roomKeys.filter((r) => r.roomId === roomId).length,
         backupFailed: dbgBackupFailed,
         megolmSharesFound: sharesResult.length,
         cachedRowCount: allCached.length,
@@ -860,6 +872,7 @@ function DebugPanel({
       `${info.backupRestored} session(s)${info.backupFailed > 0 ? ` (${info.backupFailed} failed)` : ''}`,
       info.backupFailed > 0,
     ],
+    ['backup room keys', String(info.backupRoomKeys), false],
     ['megolm shares found', String(info.megolmSharesFound), false],
     ['cache rows', String(info.cachedRowCount), false],
     ['decode failed', String(info.decodeFailed), info.decodeFailed > 0],

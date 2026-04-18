@@ -1099,22 +1099,23 @@ const _backupRestoredUsers = new Set<string>();
  */
 export async function restoreSessionsFromBackup(
   userId: string,
-): Promise<{ restored: number; failed: number }> {
-  if (_backupRestoredUsers.has(userId)) return { restored: 0, failed: 0 };
+): Promise<{ restored: number; failed: number; roomKeys: Array<{ roomId: string; generation: number; key: Uint8Array }> }> {
+  if (_backupRestoredUsers.has(userId)) return { restored: 0, failed: 0, roomKeys: [] };
   _backupRestoredUsers.add(userId);
 
-  const { getBackupKey: bk, fromBase64: b64d, putInboundSession, toBase64: b64e } =
+  const { getBackupKey: bk, fromBase64: b64d, putInboundSession } =
     await import('@/lib/e2ee-core');
   const backupKey = await bk(userId);
-  if (!backupKey) return { restored: 0, failed: 0 };
+  if (!backupKey) return { restored: 0, failed: 0, roomKeys: [] };
 
   const rows = await listKeyBackups(userId);
   const megolmRows = rows.filter((r) => r.session_id && r.start_index != null);
-  if (megolmRows.length === 0) return { restored: 0, failed: 0 };
+  const roomKeyRows = rows.filter((r) => !r.session_id);
 
-  const { decryptSessionSnapshotFromBackup } = await import('@/lib/e2ee-core');
+  const { decryptSessionSnapshotFromBackup, decryptRoomKeyFromBackup } = await import('@/lib/e2ee-core');
   let restored = 0;
   let failed = 0;
+  const roomKeys: Array<{ roomId: string; generation: number; key: Uint8Array }> = [];
 
   for (const row of megolmRows) {
     try {
@@ -1145,7 +1146,30 @@ export async function restoreSessionsFromBackup(
       );
     }
   }
-  return { restored, failed };
+
+  // Also restore flat-key room keys. These are returned to the caller (loadAll)
+  // to merge into byGen so image attachments can decrypt.
+  for (const row of roomKeyRows) {
+    try {
+      const ct = await b64d(row.ciphertext);
+      const nonce = await b64d(row.nonce);
+      const rk = await decryptRoomKeyFromBackup({
+        ciphertext: ct,
+        nonce,
+        generation: row.generation,
+        backupKey,
+        roomId: row.room_id,
+      });
+      roomKeys.push({ roomId: row.room_id, generation: row.generation, key: rk.key as Uint8Array });
+    } catch (err) {
+      console.warn(
+        `room key backup restore failed for ${row.room_id.slice(0, 8)} gen ${row.generation}:`,
+        err,
+      );
+    }
+  }
+
+  return { restored, failed, roomKeys };
 }
 
 /**
