@@ -106,8 +106,9 @@ export interface RoomMemberRow {
   generation: number;
   wrapped_room_key: string;
   joined_at: string;
-  /** The device that wrote this row (signed wrap_signature). NOT NULL since 0016. */
-  signer_device_id: string;
+  /** The device that wrote this row (signed wrap_signature). Null when signing
+   *  device was deleted (ON DELETE SET NULL, migration 0037). */
+  signer_device_id: string | null;
   wrap_signature: string;
 }
 

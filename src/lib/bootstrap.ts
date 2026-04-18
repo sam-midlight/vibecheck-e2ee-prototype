@@ -620,7 +620,45 @@ async function rotateOneRoomAsAdmin(params: {
   const currentMembers = members.filter(
     (m) => m.generation === room.current_generation,
   );
-  const keeperUserIds = Array.from(new Set(currentMembers.map((m) => m.user_id)));
+
+  // Verify existing wrap_signatures before including users in the re-wrap list.
+  // A row with an unverifiable or missing signature is a ghost row (service-role
+  // injection or post-eviction self-re-insert) and must not receive the next key.
+  const signerIds = [
+    ...new Set(
+      currentMembers.map((m) => m.signer_device_id).filter((id): id is string => id != null),
+    ),
+  ];
+  const signerPubs =
+    signerIds.length > 0
+      ? await fetchDeviceEd25519PubsByIds(signerIds)
+      : new Map<string, Uint8Array>();
+
+  const verifiedCurrentMembers: typeof currentMembers = [];
+  for (const m of currentMembers) {
+    if (!m.signer_device_id || !m.wrap_signature) continue;
+    const signerPub = signerPubs.get(m.signer_device_id);
+    if (!signerPub) continue;
+    try {
+      await verifyMembershipWrap(
+        {
+          roomId: room.id,
+          generation: m.generation,
+          memberUserId: m.user_id,
+          memberDeviceId: m.device_id,
+          wrappedRoomKey: await fromBase64(m.wrapped_room_key),
+          signerDeviceId: m.signer_device_id,
+        },
+        await fromBase64(m.wrap_signature),
+        signerPub,
+      );
+      verifiedCurrentMembers.push(m);
+    } catch {
+      // Signature mismatch — ghost row, excluded from rotation targets.
+    }
+  }
+
+  const keeperUserIds = Array.from(new Set(verifiedCurrentMembers.map((m) => m.user_id)));
 
   type Target = { userId: string; device: PublicDevice };
   const targets: Target[] = [];
@@ -916,9 +954,46 @@ async function verifiedMemberDevices(roomId: string): Promise<
 > {
   const members = await listRoomMembers(roomId);
   const currentGen = members.reduce((g, m) => Math.max(g, m.generation), 0);
-  const uniqueUserIds = Array.from(
-    new Set(members.filter((m) => m.generation === currentGen).map((m) => m.user_id)),
-  );
+  const currentGenMembers = members.filter((m) => m.generation === currentGen);
+
+  // Verify existing wrap_signatures before deriving the device distribution list.
+  // Ghost rows (service-role injection or post-eviction self-re-insert) must not
+  // receive call-key envelopes or Megolm session shares.
+  const signerIds = [
+    ...new Set(
+      currentGenMembers.map((m) => m.signer_device_id).filter((id): id is string => id != null),
+    ),
+  ];
+  const signerPubs =
+    signerIds.length > 0
+      ? await fetchDeviceEd25519PubsByIds(signerIds)
+      : new Map<string, Uint8Array>();
+
+  const verifiedGenMembers: typeof currentGenMembers = [];
+  for (const m of currentGenMembers) {
+    if (!m.signer_device_id || !m.wrap_signature) continue;
+    const signerPub = signerPubs.get(m.signer_device_id);
+    if (!signerPub) continue;
+    try {
+      await verifyMembershipWrap(
+        {
+          roomId,
+          generation: m.generation,
+          memberUserId: m.user_id,
+          memberDeviceId: m.device_id,
+          wrappedRoomKey: await fromBase64(m.wrapped_room_key),
+          signerDeviceId: m.signer_device_id,
+        },
+        await fromBase64(m.wrap_signature),
+        signerPub,
+      );
+      verifiedGenMembers.push(m);
+    } catch {
+      // Ghost row — excluded from call-key / session distribution.
+    }
+  }
+
+  const uniqueUserIds = Array.from(new Set(verifiedGenMembers.map((m) => m.user_id)));
 
   const out: Array<{ userId: string; device: PublicDevice }> = [];
   for (const userId of uniqueUserIds) {
