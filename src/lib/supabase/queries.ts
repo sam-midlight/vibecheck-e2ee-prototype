@@ -1557,6 +1557,26 @@ export async function fetchMegolmSessionInfo(
   return data;
 }
 
+/**
+ * Fallback for sessions predating migration 0027: derive sender_device_id and
+ * generation from a blob row that used this session_id. The blob row always has
+ * these fields; megolm_sessions may not exist for old sessions.
+ */
+export async function fetchSessionInfoFromBlobs(
+  sessionId: string,
+): Promise<Pick<MegolmSessionInfoRow, 'sender_device_id' | 'generation'> | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('blobs')
+    .select('sender_device_id, generation')
+    .eq('session_id', sessionId)
+    .not('sender_device_id', 'is', null)
+    .limit(1)
+    .maybeSingle<{ sender_device_id: string; generation: number }>();
+  if (error) throw error;
+  return data;
+}
+
 /** Realtime: notify this device when a new megolm_session_share addressed to it arrives. */
 export function subscribeMegolmShares(
   deviceId: string,

@@ -82,6 +82,7 @@ import {
   startCall as rpcStartCall,
   upsertKeyBackup,
   fetchMegolmSessionInfo,
+  fetchSessionInfoFromBlobs,
   listKeyForwardRequestsForUser,
   deleteKeyForwardRequest,
   type CallEnvelopeInput,
@@ -1203,8 +1204,20 @@ export async function respondToKeyForwardRequests(
     if (req.requester_device_id === device.deviceId) continue;
     try {
       // Look up session metadata to find the sender device.
-      const sessionInfo = await fetchMegolmSessionInfo(req.session_id).catch(() => null);
-      if (!sessionInfo) continue;
+      // Primary: megolm_sessions table (exists for sessions created after migration 0027).
+      // Fallback: derive sender_device_id + generation from a blob row (covers pre-0027 sessions).
+      let sessionInfo = await fetchMegolmSessionInfo(req.session_id).catch(() => null);
+      if (!sessionInfo) {
+        const blobInfo = await fetchSessionInfoFromBlobs(req.session_id).catch(() => null);
+        if (!blobInfo) continue;
+        sessionInfo = {
+          session_id: req.session_id,
+          room_id: req.room_id,
+          sender_user_id: '',
+          sender_device_id: blobInfo.sender_device_id,
+          generation: blobInfo.generation,
+        };
+      }
 
       let snapshot: InboundSessionSnapshot | null = null;
 
