@@ -18,6 +18,7 @@ import {
 } from '@/lib/supabase/queries';
 import { loadEnrolledDevice } from '@/lib/bootstrap';
 import { subscribeIdentityChanges } from '@/lib/tab-sync';
+import { useDevMode } from '@/lib/use-dev-mode';
 import { IncomingCallToast } from './IncomingCallToast';
 import { KeyChangeBanner } from './KeyChangeBanner';
 import { PendingApprovalBanner } from './PendingApprovalBanner';
@@ -33,6 +34,7 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
   const [email, setEmail] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const [checking, setChecking] = useState(requireAuth);
+  const [devMode] = useDevMode();
 
   useEffect(() => {
     const supabase = getSupabase();
@@ -157,7 +159,7 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
           {email && (
             <>
               <Link href="/rooms" className="text-neutral-600 hover:underline dark:text-neutral-400">rooms</Link>
-              <Link href="/status" className="text-neutral-600 hover:underline dark:text-neutral-400">status</Link>
+              {devMode && <Link href="/status" className="text-neutral-600 hover:underline dark:text-neutral-400">status</Link>}
               <Link href="/settings" className="text-neutral-600 hover:underline dark:text-neutral-400">settings</Link>
             </>
           )}

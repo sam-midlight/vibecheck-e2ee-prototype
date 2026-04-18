@@ -250,36 +250,58 @@ export async function loadEnrolledDevice(
   if (!bundle) return null;
   const umk = await getUserMasterKey(userId);
 
-  // Opportunistic SSK pickup: if this device doesn't hold SSK locally
-  // but its server-side row has a signing_key_wrap, unseal it now.
-  // Covers devices approved before the cross-signing code was deployed,
-  // or where the initial pickup in the auth callback failed/was skipped.
+  // Opportunistic pickup: if this device is missing SSK or backup key in IDB,
+  // fetch the device row once and unseal whatever is available.
+  // Covers devices approved before cross-signing was deployed, or where the
+  // initial pickup in the auth callback failed/was swallowed.
   const { getSelfSigningKey: localSsk } = await import('@/lib/e2ee-core');
-  if (!(await localSsk(userId))) {
+  const needsSsk = !(await localSsk(userId));
+  const needsBk = !(await getBackupKey(userId));
+
+  if (needsSsk || needsBk) {
     try {
       const rows = await listDevices(userId);
       const myRow = rows.find((r) => r.id === bundle.deviceId);
-      if (myRow?.signing_key_wrap) {
-        const { fromBase64: b64d, getSodium, putSelfSigningKey, putUserSigningKey } =
-          await import('@/lib/e2ee-core');
-        const sodium = await getSodium();
-        const sealed = await b64d(myRow.signing_key_wrap);
-        const packed = sodium.crypto_box_seal_open(
-          sealed, bundle.x25519PublicKey, bundle.x25519PrivateKey,
-        );
-        const sskPriv = packed.slice(0, 64);
-        const uskPriv = packed.slice(64, 128);
-        const sskPub = sodium.crypto_sign_ed25519_sk_to_pk(sskPriv);
-        const uskPub = sodium.crypto_sign_ed25519_sk_to_pk(uskPriv);
-        sodium.memzero(packed);
-        await putSelfSigningKey(userId, { ed25519PublicKey: sskPub, ed25519PrivateKey: sskPriv });
-        await putUserSigningKey(userId, { ed25519PublicKey: uskPub, ed25519PrivateKey: uskPriv });
-        // Clean up the wrap from the server row.
-        const supabase = (await import('@/lib/supabase/client')).getSupabase();
-        await supabase.from('devices').update({ signing_key_wrap: null }).eq('id', bundle.deviceId);
+      const {
+        fromBase64: b64d, getSodium,
+        putSelfSigningKey, putUserSigningKey, putBackupKey: storeBk,
+      } = await import('@/lib/e2ee-core');
+      const sodium = await getSodium();
+
+      if (needsSsk && myRow?.signing_key_wrap) {
+        try {
+          const sealed = await b64d(myRow.signing_key_wrap);
+          const packed = sodium.crypto_box_seal_open(
+            sealed, bundle.x25519PublicKey, bundle.x25519PrivateKey,
+          );
+          const sskPriv = packed.slice(0, 64);
+          const uskPriv = packed.slice(64, 128);
+          const sskPub = sodium.crypto_sign_ed25519_sk_to_pk(sskPriv);
+          const uskPub = sodium.crypto_sign_ed25519_sk_to_pk(uskPriv);
+          sodium.memzero(packed);
+          await putSelfSigningKey(userId, { ed25519PublicKey: sskPub, ed25519PrivateKey: sskPriv });
+          await putUserSigningKey(userId, { ed25519PublicKey: uskPub, ed25519PrivateKey: uskPriv });
+          const supabase = (await import('@/lib/supabase/client')).getSupabase();
+          await supabase.from('devices').update({ signing_key_wrap: null }).eq('id', bundle.deviceId);
+        } catch (err) {
+          console.warn('opportunistic SSK pickup failed:', err);
+        }
+      }
+
+      if (needsBk && myRow?.backup_key_wrap) {
+        try {
+          const sealed = await b64d(myRow.backup_key_wrap);
+          const bk = sodium.crypto_box_seal_open(
+            sealed, bundle.x25519PublicKey, bundle.x25519PrivateKey,
+          );
+          await storeBk(userId, bk);
+          console.log('opportunistic backup key pickup succeeded');
+        } catch (err) {
+          console.warn('opportunistic backup key pickup failed:', err);
+        }
       }
     } catch (err) {
-      console.warn('opportunistic SSK pickup failed:', err);
+      console.warn('opportunistic key pickup failed:', err);
     }
   }
 
@@ -1022,6 +1044,10 @@ export async function reshareSessionsToDevice(params: {
  * current room. Creates one if none exists or if auto-rotation triggers.
  * Returns the session for callers to ratchet + encrypt with.
  */
+// Track which users have had backup restored this app session so we don't
+// re-download and re-decrypt the full key_backup table on every room load.
+const _backupRestoredUsers = new Set<string>();
+
 /**
  * Restore Megolm session snapshots from server-side key_backup into local
  * IDB. Called once on device enrollment (or first room load) so this device
@@ -1029,10 +1055,14 @@ export async function reshareSessionsToDevice(params: {
  *
  * Only restores sessions that have a backup_key-encrypted snapshot in
  * key_backup AND the local device holds the backup key.
+ * Runs at most once per user per app session (subsequent calls are no-ops).
  */
 export async function restoreSessionsFromBackup(
   userId: string,
 ): Promise<{ restored: number; failed: number }> {
+  if (_backupRestoredUsers.has(userId)) return { restored: 0, failed: 0 };
+  _backupRestoredUsers.add(userId);
+
   const { getBackupKey: bk, fromBase64: b64d, putInboundSession, toBase64: b64e } =
     await import('@/lib/e2ee-core');
   const backupKey = await bk(userId);

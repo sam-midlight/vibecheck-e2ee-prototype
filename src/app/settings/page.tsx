@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useDevMode } from '@/lib/use-dev-mode';
 import { AppShell } from '@/components/AppShell';
 import { PinSetupModal } from '@/components/PinSetupModal';
 import { PromoteDeviceModal } from '@/components/PromoteDeviceModal';
@@ -66,6 +67,7 @@ function SettingsInner() {
   const [showTos, setShowTos] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [devMode, setDevMode] = useDevMode();
 
   useEffect(() => {
     (async () => {
@@ -456,6 +458,24 @@ function SettingsInner() {
         >
           Review Terms of Service
         </button>
+      </section>
+
+      <section className="space-y-2">
+        <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">
+          Developer mode
+        </h2>
+        <label className="flex cursor-pointer items-center gap-3 text-sm">
+          <input
+            type="checkbox"
+            checked={devMode}
+            onChange={(e) => setDevMode(e.target.checked)}
+            className="h-4 w-4"
+          />
+          <span>Enable dev mode</span>
+        </label>
+        <p className="text-[11px] text-neutral-400">
+          Shows the sync/key debug panel in rooms and the status page in the nav.
+        </p>
       </section>
 
       <section className="space-y-1">

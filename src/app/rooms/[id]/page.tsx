@@ -31,6 +31,7 @@ import {
   type RoomKey,
 } from '@/lib/e2ee-core';
 import { ensureFreshSession } from '@/lib/bootstrap';
+import { useDevMode } from '@/lib/use-dev-mode';
 import {
   getBlobCacheForRoom,
   putBlobRows,
@@ -171,24 +172,36 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null);
+  const [devMode] = useDevMode();
   const roomKeyRef = useRef<RoomKey | null>(null);
   const roomKeysByGenRef = useRef<Map<number, RoomKey>>(new Map());
 
   const loadAll = useCallback(
     async (uid: string, dev: DeviceKeyBundle) => {
       const supabase = getSupabase();
-      const { data: roomRow, error: roomErr } = await supabase
-        .from('rooms')
-        .select('*')
-        .eq('id', roomId)
-        .maybeSingle<RoomRow>();
+
+      // Batch 1: all independent network fetches in parallel.
+      const [
+        { data: roomRow, error: roomErr },
+        myRows,
+        mems,
+        sharesResult,
+        dbgCursorBefore,
+      ] = await Promise.all([
+        supabase.from('rooms').select('*').eq('id', roomId).maybeSingle<RoomRow>(),
+        listMyRoomKeyRows(roomId, dev.deviceId),
+        listRoomMembers(roomId),
+        listMegolmSharesForDevice({ roomId, recipientDeviceId: dev.deviceId }).catch(() => [] as Awaited<ReturnType<typeof listMegolmSharesForDevice>>),
+        getRoomSyncCursor(roomId),
+      ]);
+
       if (roomErr || !roomRow) {
         throw new Error(roomErr?.message ?? 'room not found');
       }
       setRoom(roomRow);
+      setMembers(mems);
 
-      // Unwrap every generation this DEVICE is a member of.
-      const myRows = await listMyRoomKeyRows(roomId, dev.deviceId);
+      // Unwrap every generation this DEVICE is a member of (sync after fetch).
       const byGen = new Map<number, RoomKey>();
       for (const r of myRows) {
         try {
@@ -234,32 +247,36 @@ function RoomInner({ roomId }: { roomId: string }) {
         setRoomName(null);
       }
 
-      // Hydrate inbound Megolm sessions from two sources:
-      // 1. Direct session shares (sealed to this device by other senders)
-      // 2. Server-side key backup (encrypted under the backup key)
-      // Source 2 covers historical sessions that were backed up by other
-      // devices, enabling cross-device history access.
+      // Batch 2: backup restore + blob fetch run in parallel.
+      // Backup restore seeds IDB with historical sessions (once per session).
+      // Blob fetch is independent of sessions and can overlap.
+      const cursor = dbgCursorBefore;
       let dbgBackupRestored = 0;
       let dbgBackupFailed = 0;
-      try {
-        const { restoreSessionsFromBackup } = await import('@/lib/bootstrap');
-        const backupResult = await restoreSessionsFromBackup(uid);
-        dbgBackupRestored = backupResult.restored;
-        dbgBackupFailed = backupResult.failed;
-        if (backupResult.restored > 0) {
-          console.log(`restored ${backupResult.restored} session(s) from key backup`);
-        }
-      } catch (err) {
-        console.warn('session backup restore failed:', errorMessage(err));
+      const [backupResult, newServerRows] = await Promise.all([
+        (async () => {
+          try {
+            const { restoreSessionsFromBackup } = await import('@/lib/bootstrap');
+            return await restoreSessionsFromBackup(uid);
+          } catch (err) {
+            console.warn('session backup restore failed:', errorMessage(err));
+            return { restored: 0, failed: 0 };
+          }
+        })(),
+        cursor === null
+          ? listBlobs(roomId, MAX_CACHE_ROWS_PER_ROOM)
+          : listBlobsAfter(roomId, cursor),
+      ]);
+      dbgBackupRestored = backupResult.restored;
+      dbgBackupFailed = backupResult.failed;
+      if (backupResult.restored > 0) {
+        console.log(`restored ${backupResult.restored} session(s) from key backup`);
       }
-      let dbgSharesFound = 0;
+
+      // Hydrate inbound Megolm sessions from direct shares (fast IDB writes).
+      let dbgSharesFound = sharesResult.length;
       try {
-        const shares = await listMegolmSharesForDevice({
-          roomId,
-          recipientDeviceId: dev.deviceId,
-        });
-        dbgSharesFound = shares.length;
-        for (const share of shares) {
+        for (const share of sharesResult) {
           try {
             const sealed = await fromBase64(share.sealed_snapshot);
             const snapshot = await unsealSessionSnapshot(
@@ -274,21 +291,6 @@ function RoomInner({ roomId }: { roomId: string }) {
         }
       } catch (err) {
         console.warn('Megolm session hydration failed:', errorMessage(err));
-      }
-
-      const mems = await listRoomMembers(roomId);
-      setMembers(mems);
-
-      // --- Delta blob sync ---
-      // Cursor present → delta fetch (gte avoids missing same-ms rows).
-      // No cursor → first visit on this device, seed cache from server.
-      const dbgCursorBefore = await getRoomSyncCursor(roomId);
-      const cursor = dbgCursorBefore;
-      let newServerRows: BlobRow[];
-      if (cursor === null) {
-        newServerRows = await listBlobs(roomId, MAX_CACHE_ROWS_PER_ROOM);
-      } else {
-        newServerRows = await listBlobsAfter(roomId, cursor);
       }
 
       let trimmedIds: string[] = [];
@@ -313,9 +315,14 @@ function RoomInner({ roomId }: { roomId: string }) {
       for (const b of decoded) nickMap = updateNicknamesFromBlob(nickMap, b);
       setNicknames(nickMap);
 
-      // Server has more history if: cache is at capacity, or trim just happened.
+      // Server has more history if: cache is at capacity, trim just happened,
+      // OR this device enrolled mid-stream (byGen doesn't include gen 1) and
+      // there are messages that predate its enrollment to potentially load.
+      const minLoadedGen = byGen.size > 0 ? Math.min(...byGen.keys()) : null;
       setHasMoreHistory(
-        allCached.length >= MAX_CACHE_ROWS_PER_ROOM || trimmedIds.length > 0,
+        allCached.length >= MAX_CACHE_ROWS_PER_ROOM ||
+        trimmedIds.length > 0 ||
+        (minLoadedGen !== null && minLoadedGen > 1 && allCached.length > 0),
       );
 
       setDebugInfo({
@@ -323,7 +330,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         keysLoadedGens: [...byGen.keys()].sort((a, b) => a - b),
         backupRestored: dbgBackupRestored,
         backupFailed: dbgBackupFailed,
-        megolmSharesFound: dbgSharesFound,
+        megolmSharesFound: sharesResult.length,
         cachedRowCount: allCached.length,
         syncCursorWas: dbgCursorBefore,
         lastLoadedAt: new Date().toISOString(),
@@ -719,7 +726,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         onSent={ingestBlobRow}
       />
 
-      {debugInfo && (
+      {devMode && debugInfo && (
         <DebugPanel
           info={debugInfo}
           hasMoreHistory={hasMoreHistory}
