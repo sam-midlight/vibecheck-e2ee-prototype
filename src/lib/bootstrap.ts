@@ -1211,18 +1211,10 @@ export async function respondToKeyForwardRequests(
         signerEd25519Priv: device.ed25519PrivateKey,
       });
 
-      await insertMegolmSessionShare({
-        sessionId: req.session_id,
-        recipientDeviceId: req.requester_device_id,
-        sealedSnapshot: await toBase64(sealed),
-        startIndex: snapshot.startIndex,
-        signerDeviceId: device.deviceId,
-        shareSignature: await toBase64(sig),
-      });
-
-      // Also wrap the room key for the requester if they don't have it yet.
-      // Image attachments are room-key-encrypted (not Megolm), so without this
-      // the requester can read text from forwarded sessions but not images.
+      // Wrap the room key for the requester BEFORE inserting the session share.
+      // Image attachments are room-key-encrypted (not Megolm); inserting the
+      // share triggers the requester's subscribeMegolmShares → loadAll, so the
+      // room_members row must already exist by the time that loadAll runs.
       try {
         const existingRoomWrap = await getMyWrappedRoomKey({
           roomId: req.room_id,
@@ -1267,6 +1259,15 @@ export async function respondToKeyForwardRequests(
       } catch {
         // Room key wrap failure is non-fatal — text messages still readable.
       }
+
+      await insertMegolmSessionShare({
+        sessionId: req.session_id,
+        recipientDeviceId: req.requester_device_id,
+        sealedSnapshot: await toBase64(sealed),
+        startIndex: snapshot.startIndex,
+        signerDeviceId: device.deviceId,
+        shareSignature: await toBase64(sig),
+      });
 
       await deleteKeyForwardRequest(req.id).catch(() => {});
       fulfilled++;

@@ -150,6 +150,11 @@ interface DebugInfo {
   cachedRowCount: number;
   syncCursorWas: string | null;
   lastLoadedAt: string;
+  decodeFailed: number;
+  missingMegolmBlobs: number;
+  missingRoomKeyBlobs: number;
+  keyForwardRequestsPosted: number;
+  blobErrors: string[];
 }
 
 function RoomInner({ roomId }: { roomId: string }) {
@@ -323,13 +328,29 @@ function RoomInner({ roomId }: { roomId: string }) {
       for (const b of decoded) nickMap = updateNicknamesFromBlob(nickMap, b);
       setNicknames(nickMap);
 
+      // Classify decode failures for the debug panel.
+      const decodeFailed = decoded.filter((b) => !b.verified).length;
+      const missingMegolmBlobs = decoded.filter((b, i) => !b.verified && !!allCached[i]?.session_id).length;
+      const missingRoomKeyBlobs = decoded.filter((b, i) => !b.verified && !allCached[i]?.session_id).length;
+      const blobErrors = [...new Set(decoded.filter((b) => !b.verified && b.error).map((b) => b.error!))].slice(0, 4);
+
       // Post key-forward requests for any v4 blobs we still can't decrypt.
-      // Sibling devices will see these via realtime and respond with shares.
+      // Also: for blobs without a session_id (flat-key, e.g. images) that are
+      // missing their room key, find any session_id from the same generation and
+      // use it as a proxy — the responder will forward both the session and room key.
       const sessionsToRequest = new Set<string>();
       decoded.forEach((b, i) => {
         const raw = allCached[i];
         if (b.missingKey && raw?.session_id) sessionsToRequest.add(raw.session_id);
       });
+      // Proxy forward requests for missing room key generations (images).
+      const missingRoomKeyGens = new Set(
+        decoded.filter((b, i) => !b.verified && !allCached[i]?.session_id).map((b) => b.generation),
+      );
+      for (const gen of missingRoomKeyGens) {
+        const proxySid = allCached.find((r) => r.generation === gen && r.session_id)?.session_id;
+        if (proxySid) sessionsToRequest.add(proxySid);
+      }
       if (sessionsToRequest.size > 0) {
         void Promise.all(
           [...sessionsToRequest].map((sid) =>
@@ -362,6 +383,11 @@ function RoomInner({ roomId }: { roomId: string }) {
         cachedRowCount: allCached.length,
         syncCursorWas: dbgCursorBefore,
         lastLoadedAt: new Date().toISOString(),
+        decodeFailed,
+        missingMegolmBlobs,
+        missingRoomKeyBlobs,
+        keyForwardRequestsPosted: sessionsToRequest.size,
+        blobErrors,
       });
     },
     [roomId],
@@ -819,6 +845,10 @@ function DebugPanel({
     ],
     ['megolm shares found', String(info.megolmSharesFound), false],
     ['cache rows', String(info.cachedRowCount), false],
+    ['decode failed', String(info.decodeFailed), info.decodeFailed > 0],
+    ['↳ missing megolm session', String(info.missingMegolmBlobs), info.missingMegolmBlobs > 0],
+    ['↳ missing room key (images)', String(info.missingRoomKeyBlobs), info.missingRoomKeyBlobs > 0],
+    ['key fwd requests posted', String(info.keyForwardRequestsPosted), false],
     ['has more history', String(hasMoreHistory), false],
     [
       'sync cursor',
@@ -828,6 +858,7 @@ function DebugPanel({
       false,
     ],
     ['last loaded', new Date(info.lastLoadedAt).toLocaleTimeString(), false],
+    ...info.blobErrors.map((e, i): [string, string, boolean] => [`error[${i}]`, e, true]),
   ];
 
   return (

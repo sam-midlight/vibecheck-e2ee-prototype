@@ -20,9 +20,10 @@ function getBuildTime(): string {
   const now = new Date(Date.now() + 10 * 60 * 60 * 1000);
   const dd = String(now.getUTCDate()).padStart(2, "0");
   const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const yy = String(now.getUTCFullYear()).slice(2);
   const hh = String(now.getUTCHours()).padStart(2, "0");
   const min = String(now.getUTCMinutes()).padStart(2, "0");
-  return `${dd}/${mm} ${hh}:${min}`;
+  return `${dd}/${mm}/${yy} ${hh}:${min}`;
 }
 
 const { buildNumber, gitSha } = getGitVersion();
