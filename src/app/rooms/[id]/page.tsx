@@ -57,6 +57,7 @@ import {
   listBlobs,
   listBlobsAfter,
   listBlobsBefore,
+  fetchDeviceEd25519PubsByIds,
   listMyRoomKeyRows,
   listRoomMembers,
   renameRoom,
@@ -214,11 +215,34 @@ function RoomInner({ roomId }: { roomId: string }) {
       setRoom(roomRow);
       setMembers(mems);
 
-      // Unwrap every generation this DEVICE is a member of (sync after fetch).
+      // Unwrap every generation this DEVICE is a member of.
+      // Batch-fetch signer Ed25519 pubs so we can verify wrap_signature on each row.
+      const signerPubs = await fetchDeviceEd25519PubsByIds(
+        [...new Set(myRows.map((r) => r.signer_device_id))],
+      );
       const byGen = new Map<number, RoomKey>();
       for (const r of myRows) {
         try {
           const wrapped = await fromBase64(r.wrapped_room_key);
+          const signerPub = signerPubs.get(r.signer_device_id);
+          if (!signerPub) {
+            console.error(
+              `wrap_signature verification skipped for room ${roomId} gen ${r.generation}: signer device ${r.signer_device_id} not found`,
+            );
+          } else {
+            await verifyMembershipWrap(
+              {
+                roomId,
+                generation: r.generation,
+                memberUserId: r.user_id,
+                memberDeviceId: dev.deviceId,
+                wrappedRoomKey: wrapped,
+                signerDeviceId: r.signer_device_id,
+              },
+              await fromBase64(r.wrap_signature),
+              signerPub,
+            );
+          }
           const rk = await unwrapRoomKey(
             { wrapped, generation: r.generation },
             dev.x25519PublicKey,
@@ -227,7 +251,7 @@ function RoomInner({ roomId }: { roomId: string }) {
           byGen.set(r.generation, rk);
         } catch (err) {
           console.error(
-            `unwrap failed for room ${roomId} gen ${r.generation}`,
+            `key-load rejected for room ${roomId} gen ${r.generation}`,
             errorMessage(err),
           );
         }
@@ -1318,13 +1342,6 @@ function MemberList({
         throw new Error(`keeper ${uid.slice(0, 8)} has no active signed devices`);
       }
     }
-
-    // Trust for keepers is established at membership-change time (invite
-    // accept cryptographically verifies the envelope against the signer
-    // device's cert chain). We don't need to re-verify the keeper's current
-    // wrap at rotation — but we DO refuse to proceed if we can't resolve
-    // the keeper's devices (done above via fetchPublicDevices + verifyPublicDevice).
-    void verifyMembershipWrap;
 
     const { next, wraps } = await rotateRoomKey(
       roomKey.generation,

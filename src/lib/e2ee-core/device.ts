@@ -44,7 +44,7 @@ async function uuidBytes(id: string): Promise<Bytes> {
 
 function u64BE(n: number): Bytes {
   const buf = new Uint8Array(8);
-  new DataView(buf.buffer).setBigUint64(0, BigInt(n | 0), false);
+  new DataView(buf.buffer).setBigUint64(0, BigInt.asUintN(64, BigInt(Math.trunc(n))), false);
   return buf;
 }
 

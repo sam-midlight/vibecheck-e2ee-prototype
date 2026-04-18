@@ -538,20 +538,49 @@ export async function getMyWrappedRoomKey(params: {
 
 /**
  * All wrapped room keys THIS DEVICE holds for a room — one per generation.
- * Used by the room detail page to decrypt pre-rotation blobs.
+ * Includes the signer fields needed to verify wrap_signature at load time.
  */
 export async function listMyRoomKeyRows(
   roomId: string,
   deviceId: string,
-): Promise<Array<{ generation: number; wrapped_room_key: string }>> {
+): Promise<Array<{
+  generation: number;
+  user_id: string;
+  wrapped_room_key: string;
+  signer_device_id: string;
+  wrap_signature: string;
+}>> {
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from('room_members')
-    .select('generation, wrapped_room_key')
+    .select('generation, user_id, wrapped_room_key, signer_device_id, wrap_signature')
     .eq('room_id', roomId)
     .eq('device_id', deviceId);
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []) as typeof data extends null ? never[] : NonNullable<typeof data>;
+}
+
+/**
+ * Fetch the Ed25519 public keys for a set of device IDs in one query.
+ * Used to batch-resolve signer pubkeys before verifying wrap_signatures.
+ */
+export async function fetchDeviceEd25519PubsByIds(
+  deviceIds: string[],
+): Promise<Map<string, Bytes>> {
+  if (deviceIds.length === 0) return new Map();
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('devices')
+    .select('id, device_ed25519_pub')
+    .in('id', deviceIds);
+  if (error) throw error;
+  const out = new Map<string, Bytes>();
+  await Promise.all(
+    (data ?? []).map(async (r: { id: string; device_ed25519_pub: string }) => {
+      out.set(r.id, await fromBase64(r.device_ed25519_pub));
+    }),
+  );
+  return out;
 }
 
 export async function createInvite(params: {

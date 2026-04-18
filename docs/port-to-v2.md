@@ -8,6 +8,24 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
+### 2026-04-18 — Security fixes: u64BE timestamp truncation + wrap signature verification
+
+**No new migrations.** All changes are client-side only.
+
+**`src/lib/e2ee-core/membership.ts`, `device.ts`, `sas.ts`:**
+- **Fix:** `u64BE(n)` was encoding `BigInt(n | 0)` — `ToInt32` coercion silently discarded the upper 32 bits of any millisecond-epoch timestamp before the BigInt conversion. This meant only the lower 32 bits of `expiresAtMs`, `createdAtMs`, and `revokedAtMs` were covered by their respective Ed25519 signatures. Changed to `BigInt.asUintN(64, BigInt(Math.trunc(n)))` in all three files.
+  - **Impact on existing signed material:** Any cert, revocation, or invite envelope signed with the old code will fail verification against new code (the canonical message is different). Existing enrolled devices and pending invites will need to be re-issued after deploying. In practice, `Math.trunc(n) % 2^32 === n % 2^32` for non-negative integers, so the lower 32 bits are identical — only certs where `createdAtMs >= 2^32 ms` (never, epoch is ~1.74e12) would have had a wrong lower half. The real bug was the *upper 32 bits* being zeroed; the canonical messages change because `BigInt(n | 0)` for current timestamps produces a different BigInt than `BigInt(Math.trunc(n))` when the sign bit of the 32-bit residue is set (i.e., the 31st bit is 1, which happens periodically). **You must re-enroll devices and re-invite members after deploying this fix.**
+
+**`src/lib/supabase/queries.ts`:**
+- **Extended:** `listMyRoomKeyRows` now selects `user_id, signer_device_id, wrap_signature` alongside `generation` and `wrapped_room_key`. Return type updated accordingly.
+- **New:** `fetchDeviceEd25519PubsByIds(deviceIds)` — batch-fetches `device_ed25519_pub` for a set of device IDs in one query. Used by the wrap-signature verification path.
+
+**`src/app/rooms/[id]/page.tsx`:**
+- **Fix:** The key-load loop now verifies `wrap_signature` on each `room_members` row before accepting it. Batch-resolves signer Ed25519 pubkeys via `fetchDeviceEd25519PubsByIds`, then calls `verifyMembershipWrap` for each row. Rows that fail signature verification are rejected (skipped with `console.error`) — the room key at that generation is simply not loaded. A missing signer device row (e.g. device later deleted) logs a warning but does not block load, to avoid bricking rooms with missing signer state.
+- **Removed:** Dead `void verifyMembershipWrap` expression and its stale comment.
+
+---
+
 ### 2026-04-18 — Megolm session resolution hardening (race fix + key-forward correctness)
 
 **No new migrations.** All changes are client-side only.
