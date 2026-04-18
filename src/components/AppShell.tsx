@@ -9,6 +9,7 @@ import {
   clearUserMasterKey,
   clearSelfSigningKey,
   clearUserSigningKey,
+  hasWrappedIdentity,
   verifySskCrossSignature,
   verifyDeviceIssuance,
 } from '@/lib/e2ee-core';
@@ -113,6 +114,14 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
       const ok = await ensureIdentityStillValid(data.user.id);
       if (!mounted) return;
       if (!ok) {
+        // If the device is passphrase-locked (wrapped blob exists but no
+        // plaintext bundle), route to auth/callback to handle unlock — don't
+        // sign out and force another magic link.
+        const locked = await hasWrappedIdentity(data.user.id).catch(() => false);
+        if (locked) {
+          router.replace('/auth/callback');
+          return;
+        }
         await bootOut(data.user.id);
         return;
       }

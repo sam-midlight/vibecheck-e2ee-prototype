@@ -26,6 +26,7 @@ import {
   getInboundSession,
   putInboundSession,
   putOutboundSession,
+  type AutoRotationConfig,
   type DeviceKeyBundle,
   type ImageAttachmentHeader,
   type PublicDevice,
@@ -844,6 +845,16 @@ function RoomInner({ roomId }: { roomId: string }) {
         onSent={ingestBlobRow}
       />
 
+      {devMode && (
+        <TestPayloadButton
+          roomId={roomId}
+          userId={userId}
+          device={device}
+          roomKey={roomKey}
+          onSent={ingestBlobRow}
+        />
+      )}
+
       {devMode && debugInfo && (
         <DebugPanel
           info={debugInfo}
@@ -1070,13 +1081,15 @@ async function megolmEncrypt<T>(params: {
   roomKey: RoomKey;
   userId: string;
   device: DeviceKeyBundle;
+  config?: AutoRotationConfig;
 }): Promise<import('@/lib/e2ee-core').EncryptedBlob> {
-  const { payload, roomId, roomKey, userId, device } = params;
+  const { payload, roomId, roomKey, userId, device, config } = params;
   const session = await ensureFreshSession({
     roomId,
     generation: roomKey.generation,
     userId,
     device,
+    config,
   });
   const messageKey = await ratchetAndDerive(session);
   const blob = await encryptBlobV4({
@@ -2361,6 +2374,129 @@ function Composer({
       </div>
       {error && <p className="text-xs text-red-600">{error}</p>}
     </form>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Dev-only test payload button
+// ---------------------------------------------------------------------------
+
+function makeTestImage(label: string, bg: string, fg: string): Promise<File> {
+  return new Promise((resolve, reject) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 400;
+    canvas.height = 300;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) { reject(new Error('no 2d ctx')); return; }
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, 400, 300);
+    // Simple grid pattern
+    ctx.strokeStyle = fg;
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.3;
+    for (let x = 0; x < 400; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 300); ctx.stroke(); }
+    for (let y = 0; y < 300; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(400, y); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+    // Label box
+    ctx.fillStyle = fg;
+    ctx.font = 'bold 32px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, 200, 150);
+    canvas.toBlob((blob) => {
+      if (!blob) { reject(new Error('toBlob failed')); return; }
+      resolve(new File([blob], `${label.replace(/\s+/g, '-')}.png`, { type: 'image/png' }));
+    }, 'image/png');
+  });
+}
+
+const FORCE_ROTATE: AutoRotationConfig = { maxMessages: 0, maxAgeMs: 0 };
+
+const TEST_STEPS = [
+  { kind: 'text' as const, text: 'Test payload — message 1 of 7 (session A)' },
+  { kind: 'text' as const, text: 'Test payload — message 2 of 7 (session A)' },
+  { kind: 'image' as const, label: 'Image A', bg: '#1e3a5f', fg: '#7ec8e3' },
+  { kind: 'text' as const, text: 'Test payload — message 4 of 7 (session A, last)' },
+  // force-rotate flag on step 5 triggers a new Megolm session
+  { kind: 'text' as const, text: 'Test payload — message 5 of 7 (session B — new Megolm session)', forceRotate: true },
+  { kind: 'image' as const, label: 'Image B', bg: '#3b1f2b', fg: '#f4a0c0' },
+  { kind: 'text' as const, text: 'Test payload — message 7 of 7 (session B)' },
+];
+
+function TestPayloadButton({
+  roomId,
+  userId,
+  device,
+  roomKey,
+  onSent,
+}: {
+  roomId: string;
+  userId: string;
+  device: DeviceKeyBundle;
+  roomKey: RoomKey;
+  onSent: (row: BlobRow) => void;
+}) {
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const busy = status !== null;
+
+  async function run() {
+    setError(null);
+    const total = TEST_STEPS.length;
+    for (let i = 0; i < TEST_STEPS.length; i++) {
+      const step = TEST_STEPS[i];
+      setStatus(`${i + 1}/${total} — ${step.kind === 'image' ? 'encrypting + uploading image' : 'sending text'}`);
+      const config = step.forceRotate ? FORCE_ROTATE : undefined;
+
+      if (step.kind === 'text') {
+        const blob = await megolmEncrypt({
+          payload: { text: step.text, ts: Date.now() },
+          roomId,
+          roomKey,
+          userId,
+          device,
+          config,
+        });
+        const row = await insertBlob({ roomId, senderId: userId, senderDeviceId: device.deviceId, blob });
+        onSent(row);
+
+      } else {
+        const blobId = crypto.randomUUID();
+        const file = await makeTestImage(step.label, step.bg, step.fg);
+        let uploaded = false;
+        try {
+          const { encryptedBytes, header } = await prepareImageForUpload({ file, roomKey, roomId, blobId });
+          await uploadAttachment({ roomId, blobId, encryptedBytes });
+          uploaded = true;
+          const blob = await megolmEncrypt({ payload: header, roomId, roomKey, userId, device, config });
+          const row = await insertBlob({ roomId, senderId: userId, senderDeviceId: device.deviceId, blob, id: blobId });
+          onSent(row);
+        } catch (e) {
+          if (uploaded) await deleteAttachment({ roomId, blobId }).catch(() => {});
+          throw e;
+        }
+      }
+    }
+    setStatus(null);
+  }
+
+  return (
+    <div className="rounded border border-dashed border-amber-400 bg-amber-50 px-3 py-2 text-xs dark:border-amber-700 dark:bg-amber-950">
+      <div className="flex items-center gap-3">
+        <span className="font-mono font-semibold text-amber-700 dark:text-amber-400">DEV</span>
+        <button
+          onClick={() => { void run().catch((e) => { setStatus(null); setError(errorMessage(e)); }); }}
+          disabled={busy}
+          className="rounded border border-amber-400 bg-white px-3 py-1 font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-50 dark:border-amber-700 dark:bg-neutral-900 dark:text-amber-300 dark:hover:bg-neutral-800"
+        >
+          {busy ? status : 'send test payload'}
+        </button>
+        <span className="text-amber-700 dark:text-amber-500">
+          {busy ? `(${TEST_STEPS.length} msgs · 2 images · 2 Megolm sessions)` : '4 texts + 2 images, forces session rotation mid-sequence'}
+        </span>
+      </div>
+      {error && <p className="mt-1 text-red-600 dark:text-red-400">{error}</p>}
+    </div>
   );
 }
 
