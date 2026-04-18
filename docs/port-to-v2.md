@@ -2,6 +2,35 @@
 
 Checklist to move from "prototype verified" to "V2 app building on the proven E2EE core."
 
+---
+
+## Sync notes — what changed since the last stable cut
+
+> **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
+
+### 2026-04-18 — Phase 1–4 (sync fixes, ToS gate, room UX, Matrix-aligned local cache)
+
+**Migrations to apply (in order):**
+- `0033_room_limit.sql` — enforces a per-user room cap via a DB trigger. Required; the room-creation RPC will reject inserts without it.
+- `0034_tos_acceptances.sql` — adds `tos_acceptances (user_id, accepted_at)`. Required if you're using the ToS gate; harmless to apply if you're not.
+
+**New foundation files to copy:**
+- `src/lib/cache-store.ts` — Matrix-aligned local blob cache (separate `vibecheck-cache` IndexedDB). See §14 for full architecture. Wire into your room page the same way `src/app/rooms/[id]/page.tsx` does.
+- `src/components/TosModal.tsx` — ToS acceptance modal + gate. Copy if your app needs a ToS flow; skip if not.
+
+**Updated contracts in `src/lib/supabase/queries.ts`:**
+- **New:** `listBlobsAfter(roomId, fromCreatedAt)` — delta-fetch blobs at-or-after a cursor timestamp.
+- **New:** `listBlobsBefore(roomId, beforeCreatedAt, limit)` — backward pagination for "load earlier messages".
+- **New:** `hasTosAccepted(userId)` + `acceptTos(userId)` — ToS gate helpers. Only needed if you're using the ToS flow.
+
+**Updated auth callback (`src/app/auth/callback/page.tsx`):**
+- `handleNuclearConfirmed` now calls `wipeAppCache()` (from `cache-store.ts`) before the nuke sequence. If you've already ported `auth/callback/page.tsx`, add this call — without it, stale ciphertext from the old identity accumulates with no keys to decrypt it.
+
+**Room page (`src/app/rooms/[id]/page.tsx`):**
+- Full cache integration — `loadAll` uses delta sync via `listBlobsAfter`, `ingestBlobRow` writes to cache, `loadEarlier` falls back to server. See §14 for the pattern. If you've already ported this page, the old `listBlobs`-on-every-load approach still works but skips the cache performance wins.
+
+---
+
 ## 1. Bring the core module across
 
 Copy these things verbatim:
