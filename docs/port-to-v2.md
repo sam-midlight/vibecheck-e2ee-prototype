@@ -8,6 +8,34 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
+### 2026-04-19 — SECURITY: ghost-membership via mismatched device_id/user_id in kick_and_rotate
+
+**Migration to apply:** `0040_kick_rotate_device_ownership_check.sql`
+
+**Root cause:** `kick_and_rotate` validated that `p_signer_device_id` is owned by the caller but applied no ownership constraint to the `(user_id, device_id)` pairs inside the `p_wraps` JSON array. A malicious room creator could call the RPC with wrap entries where `device_id` belongs to an attacker-controlled device while `user_id` names a victim user. Three consequences:
+
+1. **Metadata leak after effective eviction.** `my_generations_for_room` is user-keyed (`WHERE user_id = auth.uid()`). A poisoned row with `user_id=Victim` causes the victim to pass the `room_members_read` RLS generation arm — letting them SELECT all new-gen `room_members` rows (other members' wrapped-key ciphertext) and all new blobs — even though their actual devices hold no usable key.
+2. **Attacker gets a second room-key copy.** The wrap sealed to the attacker's device is stored under the victim's `user_id` label; the attacker can decrypt the room key from their own device while the victim's real devices find no row at all.
+3. **No client-side tamper signal.** The `wrap_signature` for the mismatched row is cryptographically valid (the creator's device signs over the stated fields), so `verifyMembershipWrap` passes; the victim only learns something is wrong when `unwrapRoomKey` fails to open the sealed box.
+
+**What changed:**
+
+- **Migration 0040** adds an ownership check inside the `kick_and_rotate` wrap loop, immediately after the null/malformed-field check:
+  ```sql
+  if not exists (
+    select 1 from devices
+    where id = v_wrap_device and user_id = v_wrap_user and revoked_at_ms is null
+  ) then
+    raise exception 'wrap entry: device % does not belong to user % or is revoked', ...
+  ```
+  No schema change; pure function replacement.
+
+**V2 port actions:**
+- Apply migration 0040. It is a pure `CREATE OR REPLACE FUNCTION` — no schema change, no data migration.
+- If you have a custom version of `kick_and_rotate`, add the equivalent ownership check to your wrap loop. Any SECURITY DEFINER RPC that inserts `room_members` rows must independently verify `devices.user_id = room_members.user_id` — the FK on `device_id` only checks existence, not ownership.
+
+---
+
 ### 2026-04-19 — Fix: restore creator arm in room_members_insert
 
 **Migration to apply:** `0039_restore_creator_arm_room_members_insert.sql`
