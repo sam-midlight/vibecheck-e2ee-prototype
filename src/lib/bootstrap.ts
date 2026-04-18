@@ -1220,6 +1220,54 @@ export async function respondToKeyForwardRequests(
         shareSignature: await toBase64(sig),
       });
 
+      // Also wrap the room key for the requester if they don't have it yet.
+      // Image attachments are room-key-encrypted (not Megolm), so without this
+      // the requester can read text from forwarded sessions but not images.
+      try {
+        const existingRoomWrap = await getMyWrappedRoomKey({
+          roomId: req.room_id,
+          deviceId: req.requester_device_id,
+          generation: sessionInfo.generation,
+        }).catch(() => null);
+        if (!existingRoomWrap) {
+          const myRoomWrap = await getMyWrappedRoomKey({
+            roomId: req.room_id,
+            deviceId: device.deviceId,
+            generation: sessionInfo.generation,
+          }).catch(() => null);
+          if (myRoomWrap) {
+            const roomKey = await unwrapRoomKey(
+              { wrapped: myRoomWrap, generation: sessionInfo.generation },
+              device.x25519PublicKey,
+              device.x25519PrivateKey,
+            );
+            const roomWrap = await wrapRoomKeyFor(roomKey, requesterX25519Pub);
+            const roomSig = await signMembershipWrap(
+              {
+                roomId: req.room_id,
+                generation: sessionInfo.generation,
+                memberUserId: userId,
+                memberDeviceId: req.requester_device_id,
+                wrappedRoomKey: roomWrap.wrapped,
+                signerDeviceId: device.deviceId,
+              },
+              device.ed25519PrivateKey,
+            );
+            await addRoomMember({
+              roomId: req.room_id,
+              userId,
+              deviceId: req.requester_device_id,
+              generation: sessionInfo.generation,
+              wrappedRoomKey: roomWrap.wrapped,
+              signerDeviceId: device.deviceId,
+              wrapSignature: roomSig,
+            });
+          }
+        }
+      } catch {
+        // Room key wrap failure is non-fatal — text messages still readable.
+      }
+
       await deleteKeyForwardRequest(req.id).catch(() => {});
       fulfilled++;
     } catch (err) {

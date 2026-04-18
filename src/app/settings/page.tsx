@@ -483,7 +483,7 @@ function SettingsInner() {
           About
         </h2>
         <p className="font-mono text-xs text-neutral-500">
-          {process.env.NEXT_PUBLIC_BUILD_TIME ?? '--/--/--'} · {process.env.NEXT_PUBLIC_GIT_SHA ?? 'dev'}
+          {process.env.NEXT_PUBLIC_BUILD_TIME ?? '--/-- --:--'} · #{process.env.NEXT_PUBLIC_BUILD_NUMBER ?? '0'}
         </p>
       </section>
 
