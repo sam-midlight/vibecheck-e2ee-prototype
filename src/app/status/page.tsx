@@ -66,6 +66,12 @@ import {
 } from '@/lib/e2ee-core';
 import { loadEnrolledDevice, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
 import { browserSupportsE2EE } from '@/lib/livekit';
+import {
+  getBlobCacheForRoom,
+  clearBlobCacheForRoom,
+  getRoomSyncCursor,
+  putBlobRows,
+} from '@/lib/cache-store';
 
 const CHECK_NAMES = [
   'Sodium (libsodium WASM) ready',
@@ -89,6 +95,7 @@ const CHECK_NAMES = [
   'V2 device cert chain (MSK → SSK cross-sig → device cert)',
   'Megolm ratchet encrypt + decrypt roundtrip',
   'Cross-signing: SSK + USK cross-sig chain verifies',
+  'Local blob cache (IndexedDB read/write)',
 ] as const;
 
 type CheckName = (typeof CHECK_NAMES)[number];
@@ -788,6 +795,44 @@ export default function StatusPage() {
         uskCrossSignature: pubKeys.uskCrossSignature,
       });
       return { detail: 'published MSK → SSK ✓, MSK → USK ✓' };
+    });
+
+    // -----------------------------------------------------------------------
+    // Check 21: Local blob cache (IndexedDB read/write)
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[21], async () => {
+      const probeRoomId = 'status-probe-cache-test';
+      const probeBlobId = crypto.randomUUID();
+      const probeRow: BlobRow = {
+        id: probeBlobId,
+        room_id: probeRoomId,
+        sender_id: userId,
+        sender_device_id: ctx.device!.deviceId,
+        ciphertext: btoa('probe'),
+        nonce: btoa('nonce'),
+        signature: null,
+        generation: 1,
+        created_at: new Date().toISOString(),
+        session_id: null,
+        message_index: null,
+      };
+      await putBlobRows(probeRoomId, [probeRow]);
+      const fetched = await getBlobCacheForRoom(probeRoomId);
+      const found = fetched.find((r) => r.id === probeBlobId);
+      await clearBlobCacheForRoom(probeRoomId);
+      if (!found) throw new Error('written row not found on read-back');
+
+      // Report cache state for the probe test room
+      const [cursor, cached] = await Promise.all([
+        ctx.roomId ? getRoomSyncCursor(ctx.roomId) : Promise.resolve(null),
+        ctx.roomId ? getBlobCacheForRoom(ctx.roomId) : Promise.resolve([]),
+      ]);
+      const cursorLabel = cursor
+        ? new Date(cursor).toLocaleString()
+        : 'none (cold)';
+      return {
+        detail: `IDB open ✓, write→read→delete roundtrip OK · probe room: ${cached.length} rows cached, cursor ${cursorLabel}`,
+      };
     });
 
     finish(allOk);
