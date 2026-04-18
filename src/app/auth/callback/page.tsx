@@ -487,7 +487,7 @@ export default function AuthCallbackPage() {
           heading="Set a passphrase to protect this device"
           blurb="A passphrase is required. Without it, your identity keys would sit in this browser's IndexedDB as plaintext and be readable by browser extensions, disk forensics, or anyone else using this profile. Pick something you'll remember — if you forget it, recovery requires your 24-word phrase."
           onSave={async (passphrase) => {
-            const { getSelfSigningKey, getUserSigningKey } = await import('@/lib/e2ee-core');
+            const { getSelfSigningKey, getUserSigningKey, clearSelfSigningKey, clearUserSigningKey } = await import('@/lib/e2ee-core');
             const localSsk = await getSelfSigningKey(userId);
             const localUsk = await getUserSigningKey(userId);
             const blob = await wrapDeviceStateWithPin(
@@ -498,6 +498,12 @@ export default function AuthCallbackPage() {
               { ssk: localSsk, usk: localUsk },
             );
             await putWrappedIdentity(userId, blob);
+            // Clear plaintext keys — they're now only accessible via passphrase.
+            // Mirrors handleLockNow() in settings; unlock re-stashes them.
+            await clearDeviceBundle(userId);
+            await clearUserMasterKey(userId);
+            await clearSelfSigningKey(userId);
+            await clearUserSigningKey(userId);
             setStep('done');
             router.replace(pendingDest);
           }}

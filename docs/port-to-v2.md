@@ -8,6 +8,27 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
+### 2026-04-18 — Megolm session resolution hardening (race fix + key-forward correctness)
+
+**No new migrations.** All changes are client-side only.
+
+**`src/lib/supabase/queries.ts`:**
+- **New:** `fetchMegolmShareForSession({ sessionId, recipientDeviceId })` — targeted single-row lookup on `megolm_session_shares` by `(session_id, recipient_device_id)`. No room-id join needed; `session_id` is globally unique. Used by the two server-fallback paths below.
+
+**`src/app/rooms/[id]/page.tsx`:**
+- `resolveMegolmMessageKey` now accepts `device: DeviceKeyBundle` and gains a **server-side fallback path**: on IDB miss, calls `fetchMegolmShareForSession`, unseals the snapshot, writes it to IDB via `putInboundSession`, then derives the message key inline. Eliminates the **first-message Megolm race** where a realtime blob notification arrived before the session share had been hydrated into IDB — the message would display as undecryptable for up to 1 second then fix itself. The 1-second `missingKeyReloadRef` retry remains as a safety net for the edge case where the share write is literally in-flight.
+
+**`src/lib/bootstrap.ts`:**
+- `respondToKeyForwardRequests` — two correctness fixes:
+  1. **Outbound session ID guard (Bug A):** The outbound-session branch now verifies `outbound.sessionId === req.session_id` before exporting. Previously, if the session had been rotated (100 messages or 7 days), `getOutboundSession` returned the *current* session (S2) while the forward request was for the old session (S1). The code exported S2's key material but stored it under S1's `session_id` — a corrupt share that would silently fail to decrypt. With the guard, a mismatch sets `snapshot = null` and the existing `if (!snapshot) continue` skips cleanly.
+  2. **Inbound IDB fallback (Bug B):** The inbound-session branch now falls back to `fetchMegolmShareForSession` + unseal + `putInboundSession` when `getInboundSession` misses. Previously, if the responder device held the share in `megolm_session_shares` on the server but hadn't run `loadAll` for that room recently, the forward request was silently skipped and the requester never got the key. Same server-fallback pattern as the `resolveMegolmMessageKey` fix above.
+- `putInboundSession` and `unsealSessionSnapshot` added to the top-level e2ee-core static import (were previously only in a dynamic import inside `restoreSessionsFromBackup`).
+
+**Auth callback (`src/app/auth/callback/page.tsx`):**
+- PIN setup `onSave` handler now clears all four plaintext IDB stores (`deviceBundle`, `userMasterKey`, `selfSigningKey`, `userSigningKey`) immediately after `putWrappedIdentity`. Previously, the stores remained populated after PIN setup so any page load before the first explicit "lock now" could access plaintext keys without entering the PIN. The device is now locked from the moment setup completes.
+
+---
+
 ### 2026-04-18 — Matrix-aligned key forwarding, backup restore, multi-device healing
 
 **Migrations to apply (in order):**

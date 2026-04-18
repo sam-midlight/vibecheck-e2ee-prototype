@@ -44,8 +44,10 @@ import {
   createOutboundSession,
   exportSessionSnapshot,
   getInboundSession,
+  putInboundSession,
   sealSessionSnapshot,
   signSessionShare,
+  unsealSessionSnapshot,
   getOutboundSession,
   putOutboundSession,
   shouldRotateSession,
@@ -83,6 +85,7 @@ import {
   upsertKeyBackup,
   fetchMegolmSessionInfo,
   fetchSessionInfoFromBlobs,
+  fetchMegolmShareForSession,
   listKeyForwardRequestsForUser,
   deleteKeyForwardRequest,
   type CallEnvelopeInput,
@@ -1223,11 +1226,40 @@ export async function respondToKeyForwardRequests(
 
       if (sessionInfo.sender_device_id === device.deviceId) {
         // This is OUR outbound session — export from current IDB state.
+        // Guard: IDB holds only the latest session per room. If this session
+        // was rotated (100 messages / 7 days), the slot holds a different
+        // session and we must NOT export it under the requested session_id —
+        // that would produce a corrupt share with wrong key material.
         const outbound = await getOutboundSession(sessionInfo.room_id, device.deviceId);
-        if (outbound) snapshot = exportSessionSnapshot(outbound, userId, device.deviceId);
+        if (outbound && (await toBase64(outbound.sessionId)) === req.session_id) {
+          snapshot = exportSessionSnapshot(outbound, userId, device.deviceId);
+        }
+        // If IDs don't match the session was rotated; snapshot stays null → skip.
       } else {
-        // Inbound session from another sender — look up from IDB.
+        // Inbound session from another sender — IDB first, server fallback.
         snapshot = await getInboundSession(req.session_id, sessionInfo.sender_device_id);
+        if (!snapshot) {
+          // IDB may be stale (loadAll not run for this room recently). Fetch
+          // the share directly from the server and hydrate into IDB so we can
+          // forward it now and decode it fast next time.
+          try {
+            const share = await fetchMegolmShareForSession({
+              sessionId: req.session_id,
+              recipientDeviceId: device.deviceId,
+            });
+            if (share) {
+              const sealed = await fromBase64(share.sealed_snapshot);
+              snapshot = await unsealSessionSnapshot(
+                sealed,
+                device.x25519PublicKey,
+                device.x25519PrivateKey,
+              );
+              await putInboundSession(req.session_id, sessionInfo.sender_device_id, snapshot);
+            }
+          } catch {
+            // share not available — skip
+          }
+        }
       }
 
       if (!snapshot) continue;

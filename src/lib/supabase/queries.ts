@@ -933,6 +933,22 @@ export interface MegolmSessionShareRow {
   created_at: string;
 }
 
+/** Fetch a single Megolm session share by session_id + recipient device. */
+export async function fetchMegolmShareForSession(params: {
+  sessionId: string;
+  recipientDeviceId: string;
+}): Promise<MegolmSessionShareRow | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('megolm_session_shares')
+    .select('*')
+    .eq('session_id', params.sessionId)
+    .eq('recipient_device_id', params.recipientDeviceId)
+    .maybeSingle();
+  if (error) throw error;
+  return (data as MegolmSessionShareRow | null) ?? null;
+}
+
 /** Fetch all Megolm session shares addressed to a specific device for a room. */
 export async function listMegolmSharesForDevice(params: {
   roomId: string;
