@@ -65,6 +65,7 @@ import {
   subscribeRoomMetadata,
   listMegolmSharesForDevice,
   insertKeyForwardRequest,
+  listMyPendingKeyForwardRequests,
   subscribeMegolmShares,
   uploadAttachment,
   type BlobRow,
@@ -154,6 +155,7 @@ interface DebugInfo {
   missingMegolmBlobs: number;
   missingRoomKeyBlobs: number;
   keyForwardRequestsPosted: number;
+  pendingForwardRequests: number;
   blobErrors: string[];
 }
 
@@ -374,6 +376,10 @@ function RoomInner({ roomId }: { roomId: string }) {
         (minLoadedGen !== null && minLoadedGen > 1 && allCached.length > 0),
       );
 
+      const pendingForwardRequests = await listMyPendingKeyForwardRequests(dev.deviceId)
+        .then((r) => r.length)
+        .catch(() => -1);
+
       setDebugInfo({
         currentGen: roomRow.current_generation,
         keysLoadedGens: [...byGen.keys()].sort((a, b) => a - b),
@@ -387,6 +393,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         missingMegolmBlobs,
         missingRoomKeyBlobs,
         keyForwardRequestsPosted: sessionsToRequest.size,
+        pendingForwardRequests,
         blobErrors,
       });
     },
@@ -849,6 +856,7 @@ function DebugPanel({
     ['↳ missing megolm session', String(info.missingMegolmBlobs), info.missingMegolmBlobs > 0],
     ['↳ missing room key (images)', String(info.missingRoomKeyBlobs), info.missingRoomKeyBlobs > 0],
     ['key fwd requests posted', String(info.keyForwardRequestsPosted), false],
+    ['key fwd pending (unanswered)', info.pendingForwardRequests < 0 ? 'err' : String(info.pendingForwardRequests), info.pendingForwardRequests > 0],
     ['has more history', String(hasMoreHistory), false],
     [
       'sync cursor',

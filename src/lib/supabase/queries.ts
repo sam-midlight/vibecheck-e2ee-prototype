@@ -1493,6 +1493,20 @@ export async function listKeyForwardRequestsForUser(
   return (data ?? []) as KeyForwardRequestRow[];
 }
 
+/** Fetch unexpired key forward requests posted BY this device (to check if they've been answered). */
+export async function listMyPendingKeyForwardRequests(
+  deviceId: string,
+): Promise<KeyForwardRequestRow[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('key_forward_requests')
+    .select('*')
+    .eq('requester_device_id', deviceId)
+    .gt('expires_at', new Date().toISOString());
+  if (error) throw error;
+  return (data ?? []) as KeyForwardRequestRow[];
+}
+
 /** Delete a fulfilled key forward request. */
 export async function deleteKeyForwardRequest(id: string): Promise<void> {
   const supabase = getSupabase();
