@@ -33,7 +33,15 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 **Key architectural insight (document for V2):** backup restores Megolm sessions (text) and room keys (images) separately. Megolm sessions restore text. Room keys restore the ability to decrypt image attachment bytes. Both must be restored — if only sessions are restored, text shows but images don't. `restoreSessionsFromBackup` now handles both; `loadAll` merges the room keys into `byGen`.
 
-**Known limitation:** `key_forward_requests` RLS is `user_id = auth.uid()` — only sibling devices (same user) can see and respond to requests. Sessions from the OTHER user in a chat cannot be forwarded this way. Messages from the other user in pre-`megolm_sessions` history (sent before migration 0027 was applied) are permanently unrecoverable on new devices because `respondToKeyForwardRequests` uses `fetchMegolmSessionInfo` to find the sender device, which returns null for those old sessions. Forward secrecy working as designed for truly old history.
+**Known limitation — old messages unrecoverable on new devices (parked):** A new device enrolled after several room rotations may find some historical messages and image attachments permanently undecryptable. Root causes, in order of impact:
+
+1. **Pre-0027 outbound sessions lost from IDB.** The phone's own outbound Megolm sessions for old generations are overwritten in IDB when a new session is created. If the sibling device was the sender, it can no longer forward the session. The `fetchSessionInfoFromBlobs` fallback recovers the `sender_device_id` from a blob row, but if no IDB snapshot exists there is nothing to forward.
+
+2. **Pre-0027 room key backups absent.** Room keys for early generations were created before `encryptRoomKeyForBackup` was wired into `wrapRoomKeyForAllMyDevices`. Those generations have no `key_backup` rows, so `restoreSessionsFromBackup` returns zero room keys for them. Image attachments (room-key encrypted) from those generations cannot decrypt even when their Megolm blob headers can.
+
+3. **`key_forward_requests` is intra-user only.** The RLS policy `user_id = auth.uid()` means only sibling devices (same user account) can see and respond to requests. The other user in a chat cannot receive the request and cannot forward their own sessions.
+
+**Practical impact:** text and images sent after migration 0027 and after `encryptRoomKeyForBackup` was wired up are fully recoverable on any new sibling device. Content from the very early prototype period (gens 1–12 in the test room) is not. This is acceptable forward-secrecy behaviour — V2 will not have this gap because 0027 and room key backup both apply from day one.
 
 ---
 
