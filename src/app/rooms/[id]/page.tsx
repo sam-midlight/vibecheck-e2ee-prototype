@@ -137,6 +137,17 @@ export default function RoomDetailPage({
   );
 }
 
+interface DebugInfo {
+  currentGen: number;
+  keysLoadedGens: number[];
+  backupRestored: number;
+  backupFailed: number;
+  megolmSharesFound: number;
+  cachedRowCount: number;
+  syncCursorWas: string | null;
+  lastLoadedAt: string;
+}
+
 function RoomInner({ roomId }: { roomId: string }) {
   const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
@@ -159,6 +170,7 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [activeCall, setActiveCall] = useState<CallRow | null>(null);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null);
   const roomKeyRef = useRef<RoomKey | null>(null);
   const roomKeysByGenRef = useRef<Map<number, RoomKey>>(new Map());
 
@@ -227,20 +239,26 @@ function RoomInner({ roomId }: { roomId: string }) {
       // 2. Server-side key backup (encrypted under the backup key)
       // Source 2 covers historical sessions that were backed up by other
       // devices, enabling cross-device history access.
+      let dbgBackupRestored = 0;
+      let dbgBackupFailed = 0;
       try {
         const { restoreSessionsFromBackup } = await import('@/lib/bootstrap');
         const backupResult = await restoreSessionsFromBackup(uid);
+        dbgBackupRestored = backupResult.restored;
+        dbgBackupFailed = backupResult.failed;
         if (backupResult.restored > 0) {
           console.log(`restored ${backupResult.restored} session(s) from key backup`);
         }
       } catch (err) {
         console.warn('session backup restore failed:', errorMessage(err));
       }
+      let dbgSharesFound = 0;
       try {
         const shares = await listMegolmSharesForDevice({
           roomId,
           recipientDeviceId: dev.deviceId,
         });
+        dbgSharesFound = shares.length;
         for (const share of shares) {
           try {
             const sealed = await fromBase64(share.sealed_snapshot);
@@ -264,7 +282,8 @@ function RoomInner({ roomId }: { roomId: string }) {
       // --- Delta blob sync ---
       // Cursor present → delta fetch (gte avoids missing same-ms rows).
       // No cursor → first visit on this device, seed cache from server.
-      const cursor = await getRoomSyncCursor(roomId);
+      const dbgCursorBefore = await getRoomSyncCursor(roomId);
+      const cursor = dbgCursorBefore;
       let newServerRows: BlobRow[];
       if (cursor === null) {
         newServerRows = await listBlobs(roomId, MAX_CACHE_ROWS_PER_ROOM);
@@ -298,6 +317,17 @@ function RoomInner({ roomId }: { roomId: string }) {
       setHasMoreHistory(
         allCached.length >= MAX_CACHE_ROWS_PER_ROOM || trimmedIds.length > 0,
       );
+
+      setDebugInfo({
+        currentGen: roomRow.current_generation,
+        keysLoadedGens: [...byGen.keys()].sort((a, b) => a - b),
+        backupRestored: dbgBackupRestored,
+        backupFailed: dbgBackupFailed,
+        megolmSharesFound: dbgSharesFound,
+        cachedRowCount: allCached.length,
+        syncCursorWas: dbgCursorBefore,
+        lastLoadedAt: new Date().toISOString(),
+      });
     },
     [roomId],
   );
@@ -688,6 +718,98 @@ function RoomInner({ roomId }: { roomId: string }) {
         roomKey={roomKey}
         onSent={ingestBlobRow}
       />
+
+      {debugInfo && (
+        <DebugPanel
+          info={debugInfo}
+          hasMoreHistory={hasMoreHistory}
+          rtStatus={rtStatus}
+          deviceId={device.deviceId}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+function DebugPanel({
+  info,
+  hasMoreHistory,
+  rtStatus,
+  deviceId,
+}: {
+  info: DebugInfo;
+  hasMoreHistory: boolean;
+  rtStatus: string;
+  deviceId: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  const missingGens: number[] = [];
+  for (let g = 1; g <= info.currentGen; g++) {
+    if (!info.keysLoadedGens.includes(g)) missingGens.push(g);
+  }
+
+  const rows: [string, string, boolean?][] = [
+    ['device', deviceId.slice(0, 8) + '…', false],
+    ['realtime', rtStatus, rtStatus !== 'SUBSCRIBED'],
+    ['current gen', String(info.currentGen), false],
+    [
+      'keys loaded',
+      info.keysLoadedGens.length === 0
+        ? 'none'
+        : info.keysLoadedGens.join(', '),
+      false,
+    ],
+    [
+      'keys missing',
+      missingGens.length === 0 ? 'none' : missingGens.join(', '),
+      missingGens.length > 0,
+    ],
+    [
+      'backup restored',
+      `${info.backupRestored} session(s)${info.backupFailed > 0 ? ` (${info.backupFailed} failed)` : ''}`,
+      info.backupFailed > 0,
+    ],
+    ['megolm shares found', String(info.megolmSharesFound), false],
+    ['cache rows', String(info.cachedRowCount), false],
+    ['has more history', String(hasMoreHistory), false],
+    [
+      'sync cursor',
+      info.syncCursorWas
+        ? new Date(info.syncCursorWas).toLocaleString()
+        : 'none (cold start)',
+      false,
+    ],
+    ['last loaded', new Date(info.lastLoadedAt).toLocaleTimeString(), false],
+  ];
+
+  return (
+    <div className="rounded border border-neutral-200 text-xs dark:border-neutral-800">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center justify-between px-3 py-2 text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300"
+      >
+        <span className="font-mono font-semibold tracking-tight">sync / key debug</span>
+        <span>{open ? '▾' : '▸'}</span>
+      </button>
+      {open && (
+        <div className="border-t border-neutral-200 px-3 py-2 dark:border-neutral-800">
+          <table className="w-full">
+            <tbody>
+              {rows.map(([label, value, warn]) => (
+                <tr key={label}>
+                  <td className="w-40 py-0.5 pr-3 text-neutral-400">{label}</td>
+                  <td className={`py-0.5 font-mono ${warn ? 'text-amber-600 dark:text-amber-400' : 'text-neutral-700 dark:text-neutral-300'}`}>
+                    {value}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
