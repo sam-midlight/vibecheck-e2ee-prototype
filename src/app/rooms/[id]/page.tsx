@@ -977,51 +977,21 @@ async function resolveSenderDeviceEd(
 async function resolveMegolmMessageKey(
   sessionIdB64: string,
   messageIndex: number,
-  roomId: string,
   senderDeviceId: string,
-  device: DeviceKeyBundle,
 ): Promise<Uint8Array | null> {
-  // 1. IDB fast path — backup-restored and pre-hydrated sessions land here.
-  if (senderDeviceId) {
-    try {
-      const snapshot = await getInboundSession(sessionIdB64, senderDeviceId);
-      if (snapshot && messageIndex >= snapshot.startIndex) {
-        const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
-        return mk.key;
-      }
-    } catch {
-      // fall through to server path
-    }
-  }
-
-  // 2. Server share fallback — for realtime blobs or unknown senderDeviceId.
+  // IDB-only path. loadAll hydrates all shares into IDB before decoding, so
+  // this is always sufficient. Realtime blobs that miss here set missingKey=true
+  // and missingKeyReloadRef triggers a loadAll re-try within 1s.
+  if (!senderDeviceId) return null;
   try {
-    const shares = await listMegolmSharesForDevice({
-      roomId,
-      recipientDeviceId: device.deviceId,
-    });
-    for (const share of shares) {
-      if (share.session_id !== sessionIdB64) continue;
-      try {
-        const sealed = await fromBase64(share.sealed_snapshot);
-        const snapshot = await unsealSessionSnapshot(
-          sealed,
-          device.x25519PublicKey,
-          device.x25519PrivateKey,
-        );
-        await putInboundSession(sessionIdB64, snapshot.senderDeviceId, snapshot);
-        if (messageIndex >= snapshot.startIndex) {
-          const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
-          return mk.key;
-        }
-      } catch {
-        // try next share
-      }
+    const snapshot = await getInboundSession(sessionIdB64, senderDeviceId);
+    if (snapshot && messageIndex >= snapshot.startIndex) {
+      const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
+      return mk.key;
     }
   } catch {
-    // server fetch failed
+    // session not in IDB
   }
-
   return null;
 }
 
@@ -1080,7 +1050,7 @@ async function decodeAndVerify(
           roomKey: { key: new Uint8Array(0), generation: blob.generation }, // unused for v4
           resolveSenderDeviceEd25519Pub: resolveSenderDeviceEd,
           resolveMegolmKey: (sid, mi) =>
-            resolveMegolmMessageKey(sid, mi, row.room_id, row.sender_device_id ?? '', device),
+            resolveMegolmMessageKey(sid, mi, row.sender_device_id ?? ''),
         });
         return {
           id: row.id,
