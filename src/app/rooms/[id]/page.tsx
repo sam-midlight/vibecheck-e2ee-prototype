@@ -23,6 +23,7 @@ import {
   unwrapRoomKey,
   verifyMembershipWrap,
   verifyPublicDevice,
+  getInboundSession,
   putInboundSession,
   putOutboundSession,
   type DeviceKeyBundle,
@@ -880,48 +881,61 @@ async function resolveSenderDeviceEd(
 }
 
 /**
- * Megolm key resolver: given a session_id (base64) + message_index,
- * looks up the local inbound session snapshot (hydrated on room load)
- * and derives the message key. Falls back to fetching from the server
- * on cache miss.
+ * Megolm key resolver: given session_id + message_index + senderDeviceId,
+ * derives the message key.
+ *
+ * Priority:
+ * 1. IDB inbound session — populated by backup restore or share hydration.
+ * 2. Server share fallback — covers realtime blobs that arrived after hydration.
  */
 async function resolveMegolmMessageKey(
   sessionIdB64: string,
   messageIndex: number,
   roomId: string,
+  senderDeviceId: string,
   device: DeviceKeyBundle,
 ): Promise<Uint8Array | null> {
-  // IDB stores are keyed by `${sessionId}:${senderDeviceId}`. We don't
-  // know the senderDeviceId from the blob row alone, but the batch
-  // hydration in loadAll already cached it. Try a direct server fetch
-  // as fallback if the IDB lookup misses — this covers realtime blobs
-  // that arrived after the initial hydration.
-  // Quick path: check all IDB entries. Since we can't enumerate by
-  // sessionId prefix in a keyPath store, we'll try the server shares
-  // which we already cached during hydration.
-  const shares = await listMegolmSharesForDevice({
-    roomId,
-    recipientDeviceId: device.deviceId,
-  });
-  for (const share of shares) {
-    if (share.session_id !== sessionIdB64) continue;
-    // Try IDB first (already hydrated)
+  // 1. IDB fast path — backup-restored and pre-hydrated sessions land here.
+  if (senderDeviceId) {
     try {
-      const sealed = await fromBase64(share.sealed_snapshot);
-      const snapshot = await unsealSessionSnapshot(
-        sealed,
-        device.x25519PublicKey,
-        device.x25519PrivateKey,
-      );
-      await putInboundSession(sessionIdB64, snapshot.senderDeviceId, snapshot);
-      if (messageIndex >= snapshot.startIndex) {
+      const snapshot = await getInboundSession(sessionIdB64, senderDeviceId);
+      if (snapshot && messageIndex >= snapshot.startIndex) {
         const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
         return mk.key;
       }
     } catch {
-      // try next share
+      // fall through to server path
     }
   }
+
+  // 2. Server share fallback — for realtime blobs or unknown senderDeviceId.
+  try {
+    const shares = await listMegolmSharesForDevice({
+      roomId,
+      recipientDeviceId: device.deviceId,
+    });
+    for (const share of shares) {
+      if (share.session_id !== sessionIdB64) continue;
+      try {
+        const sealed = await fromBase64(share.sealed_snapshot);
+        const snapshot = await unsealSessionSnapshot(
+          sealed,
+          device.x25519PublicKey,
+          device.x25519PrivateKey,
+        );
+        await putInboundSession(sessionIdB64, snapshot.senderDeviceId, snapshot);
+        if (messageIndex >= snapshot.startIndex) {
+          const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
+          return mk.key;
+        }
+      } catch {
+        // try next share
+      }
+    }
+  } catch {
+    // server fetch failed
+  }
+
   return null;
 }
 
@@ -1013,7 +1027,7 @@ async function decodeAndVerify(
           roomKey: { key: new Uint8Array(0), generation: blob.generation }, // unused for v4
           resolveSenderDeviceEd25519Pub: resolveSenderDeviceEd,
           resolveMegolmKey: (sid, mi) =>
-            resolveMegolmMessageKey(sid, mi, row.room_id, device),
+            resolveMegolmMessageKey(sid, mi, row.room_id, row.sender_device_id ?? '', device),
         });
         return {
           id: row.id,
