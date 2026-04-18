@@ -8,6 +8,33 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
+### 2026-04-19 — CRITICAL: post-eviction self-re-insertion + rotator ghost-row gap
+
+**Migrations to apply:** `0038_tighten_room_members_insert_policy.sql`
+
+**Root cause (two related vulnerabilities):**
+
+1. **Post-eviction self-re-insertion (HIGH).** The `room_members_insert` RLS policy (set in migration 0008) allowed `user_id = auth.uid()` with no generation or membership constraint. A user who was kicked via `kick_and_rotate` retained a valid Supabase session and could immediately re-INSERT themselves into `room_members` at the new current generation with arbitrary (garbage) content. Because `rotateOneRoomAsAdmin` builds its re-wrap list by reading raw `room_members` rows, the re-inserted user would be included in the next admin rotation and receive a valid new-generation room key — restoring their access without any invite or crypto ceremony.
+
+2. **Rotator does not verify existing member row signatures (HIGH).** `rotateOneRoomAsAdmin` and `verifiedMemberDevices` in `bootstrap.ts` collected re-wrap targets by calling `listRoomMembers` then `fetchAndVerifyDevices` per user. They verified device certificates but never called `verifyMembershipWrap` on the existing `room_members` rows. A ghost row (injected via service_role bypassing RLS, or via the self-re-insert above) with any or null `wrap_signature` passed through silently. The intent of migration 0011's signed-membership defense — that rows with unverifiable signatures must be rejected — was enforced only at key-load time (when the receiving device unwraps its own key), not at rotation time when the rotator decides whom to re-wrap for.
+
+**What changed:**
+
+- **Migration 0038** rewrites `room_members_insert` to two narrow arms:
+  - *(a)* Device has a valid outstanding invite for this room (`invited_device_id` match + `expires_at_ms` check) — the standard accept-invite path.
+  - *(b)* Caller is already a current-generation member (`is_room_member_at(room_id, auth.uid(), room_current_generation(room_id))`) — covers co-device self-wrap (`wrapRoomKeyForAllMyDevices`) and sibling-device key-forwarding (`respondToKeyForwardRequests`, which inserts at historical generations — the generation constraint is intentionally absent from this arm). The creator arm is dropped entirely: `kick_and_rotate` is `SECURITY DEFINER` and bypasses RLS; no direct-insert path in the codebase requires it.
+
+- **`rotateOneRoomAsAdmin` (bootstrap.ts)** — after filtering to current-gen rows, batch-fetches signer Ed25519 pubs via `fetchDeviceEd25519PubsByIds` and calls `verifyMembershipWrap` on every row. Rows whose signature does not verify (ghost rows, garbage self-re-inserts) are silently excluded from `keeperUserIds` and therefore receive no key in the next generation.
+
+- **`verifiedMemberDevices` (bootstrap.ts)** — same verification pass applied to the call-key and Megolm session distribution path. Ghost rows no longer receive call-key envelopes or session shares.
+
+- **`RoomMemberRow.signer_device_id`** type corrected from `string` to `string | null` in `queries.ts` to match the DB state after migration 0037 (`ON DELETE SET NULL`).
+
+**V2 port actions:**
+- Apply migration 0038 before deploying. It is a pure RLS policy replacement — no schema change, no data migration needed.
+- If you have a custom `room_members_insert` policy, verify it enforces the same two conditions. An unconstrained `user_id = auth.uid()` arm is the attack surface; remove it.
+- Ensure any code path that determines "who to re-wrap for" during key rotation calls `verifyMembershipWrap` on existing rows before including users in the wrap target list. Relying solely on device-cert verification (`fetchAndVerifyDevices`) is insufficient — it proves the device is legitimate but not that its `room_members` row was legitimately written.
+
 ### 2026-04-18 — CRITICAL: wrap-signature verification bypass + nuke FK fix
 
 **Migration to apply:**
@@ -75,6 +102,12 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 **Auth callback (`src/app/auth/callback/page.tsx`):**
 - PIN setup `onSave` handler now clears all four plaintext IDB stores (`deviceBundle`, `userMasterKey`, `selfSigningKey`, `userSigningKey`) immediately after `putWrappedIdentity`. Previously, the stores remained populated after PIN setup so any page load before the first explicit "lock now" could access plaintext keys without entering the PIN. The device is now locked from the moment setup completes.
+
+---
+
+### 2026-04-19 — CRITICAL: post-eviction self-re-insertion + rotator ghost-row gap
+
+See full entry at the top of this section. Migration: `0038_tighten_room_members_insert_policy.sql`.
 
 ---
 
