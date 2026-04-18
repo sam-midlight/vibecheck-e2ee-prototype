@@ -272,7 +272,7 @@ function RoomInner({ roomId }: { roomId: string }) {
             return await restoreSessionsFromBackup(uid);
           } catch (err) {
             console.warn('session backup restore failed:', errorMessage(err));
-            return { restored: 0, failed: 0 };
+            return { restored: 0, failed: 0, roomKeys: [] as Array<{ roomId: string; generation: number; key: Uint8Array }> };
           }
         })(),
         cursor === null
