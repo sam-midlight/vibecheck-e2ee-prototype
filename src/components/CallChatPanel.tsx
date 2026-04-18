@@ -25,6 +25,7 @@ import {
   ratchetAndDerive,
   unsealSessionSnapshot,
   unwrapRoomKey,
+  verifyMembershipWrap,
   verifyPublicDevice,
   type DeviceKeyBundle,
   type RoomKey,
@@ -32,6 +33,7 @@ import {
 import { ensureFreshSession } from '@/lib/bootstrap';
 import {
   decodeBlobRow,
+  fetchDeviceEd25519PubsByIds,
   fetchPublicDevices,
   fetchUserMasterKeyPub,
   insertBlob,
@@ -194,11 +196,28 @@ export function CallChatPanel({ roomId, userId, device }: Props) {
       try {
         setLoading(true);
         const rows = await listMyRoomKeyRows(roomId, device.deviceId);
+        const signerPubs = await fetchDeviceEd25519PubsByIds(
+          [...new Set(rows.map((r) => r.signer_device_id))],
+        );
         const byGen = new Map<number, RoomKey>();
         let maxGen = 0;
         for (const r of rows) {
           try {
             const wrapped = await fromBase64(r.wrapped_room_key);
+            const signerPub = signerPubs.get(r.signer_device_id);
+            if (!signerPub) continue;
+            await verifyMembershipWrap(
+              {
+                roomId,
+                generation: r.generation,
+                memberUserId: r.user_id,
+                memberDeviceId: device.deviceId,
+                wrappedRoomKey: wrapped,
+                signerDeviceId: r.signer_device_id,
+              },
+              await fromBase64(r.wrap_signature),
+              signerPub,
+            );
             const rk = await unwrapRoomKey(
               { wrapped, generation: r.generation },
               device.x25519PublicKey,

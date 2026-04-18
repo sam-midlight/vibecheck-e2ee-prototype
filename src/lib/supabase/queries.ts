@@ -537,6 +537,38 @@ export async function getMyWrappedRoomKey(params: {
 }
 
 /**
+ * Like getMyWrappedRoomKey but also returns the fields needed to verify the
+ * wrap_signature before trusting the key material.
+ */
+export async function getMyRoomKeyRow(params: {
+  roomId: string;
+  deviceId: string;
+  generation: number;
+}): Promise<{
+  wrapped_room_key: string;
+  /** Null when the signing device was deleted (ON DELETE SET NULL). */
+  signer_device_id: string | null;
+  wrap_signature: string;
+  user_id: string;
+} | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('room_members')
+    .select('wrapped_room_key, signer_device_id, wrap_signature, user_id')
+    .eq('room_id', params.roomId)
+    .eq('device_id', params.deviceId)
+    .eq('generation', params.generation)
+    .maybeSingle<{
+      wrapped_room_key: string;
+      signer_device_id: string | null;
+      wrap_signature: string;
+      user_id: string;
+    }>();
+  if (error) throw error;
+  return data;
+}
+
+/**
  * All wrapped room keys THIS DEVICE holds for a room — one per generation.
  * Includes the signer fields needed to verify wrap_signature at load time.
  */

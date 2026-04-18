@@ -23,7 +23,6 @@ import {
   deleteInvitesForUserInRoom,
   fetchPublicDevices,
   fetchUserMasterKeyPub,
-  getMyWrappedRoomKey,
   listMyInvites,
   listMyRooms,
   renameRoom,
@@ -31,7 +30,7 @@ import {
   type RoomInviteRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
-import { loadEnrolledDevice, sendInviteToAllDevices, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
+import { loadEnrolledDevice, sendInviteToAllDevices, verifyAndUnwrapMyRoomKey, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
 import { verifyPublicDevice as verifyPublicDeviceChain } from '@/lib/e2ee-core';
 
 function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
@@ -66,17 +65,13 @@ function RoomsInner() {
         rooms.map(async (r): Promise<[string, string] | null> => {
           if (!r.name_ciphertext || !r.name_nonce) return null;
           try {
-            const wrapped = await getMyWrappedRoomKey({
+            const roomKey = await verifyAndUnwrapMyRoomKey({
               roomId: r.id,
-              deviceId: device.deviceId,
+              userId: userId!,
+              device,
               generation: r.current_generation,
             });
-            if (!wrapped) return null;
-            const roomKey = await unwrapRoomKey(
-              { wrapped, generation: r.current_generation },
-              device.x25519PublicKey,
-              device.x25519PrivateKey,
-            );
+            if (!roomKey) return null;
             const name = await decryptRoomName({
               ciphertext: await fromBase64(r.name_ciphertext),
               nonce: await fromBase64(r.name_nonce),
@@ -746,17 +741,13 @@ function InviteForm({
         );
       }
 
-      const myWrapped = await getMyWrappedRoomKey({
+      const roomKey = await verifyAndUnwrapMyRoomKey({
         roomId,
-        deviceId: device.deviceId,
+        userId,
+        device,
         generation: room.current_generation,
       });
-      if (!myWrapped) throw new Error('you are not a current-generation member of that room');
-      const roomKey = await unwrapRoomKey(
-        { wrapped: myWrapped, generation: room.current_generation },
-        device.x25519PublicKey,
-        device.x25519PrivateKey,
-      );
+      if (!roomKey) throw new Error('you are not a current-generation member of that room');
       // Matrix-style: wrap for EVERY active device the invitee has, so
       // they can accept from any device — not just whichever one we pick.
       await sendInviteToAllDevices({

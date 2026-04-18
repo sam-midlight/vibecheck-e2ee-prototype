@@ -8,7 +8,38 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
-### 2026-04-18 — Security fixes: u64BE timestamp truncation + wrap signature verification
+### 2026-04-18 — CRITICAL: wrap-signature verification bypass + nuke FK fix
+
+**Migration to apply:**
+- `0036_signer_device_id_on_delete_set_null.sql` — changes `room_members.signer_device_id` FK from `ON DELETE RESTRICT` to `ON DELETE SET NULL`. Required: without this, `nuke_identity` raises FK violation 23503 when other users' `room_members` rows still reference a device belonging to the nuked user as `signer_device_id`. The SET NULL semantics mean a null signer is treated the same as an unresolvable signer — the client rejects the row.
+
+**Root cause (CRITICAL — ghost key injection):** The `wrap_signature` field added in migration 0011 was only verified at one callsite (`rooms/[id]/page.tsx`) and even there incorrectly: the `unwrapRoomKey` call sat *outside* the `if (signerPub)` guard, so a missing signer would fall through and decrypt the row anyway — rendering the signature check an effective no-op. All other callsites (`rooms/page.tsx`, `CallChatPanel.tsx`, `PendingApprovalBanner.tsx`, `status/page.tsx`, `bootstrap.ts`) used `getMyWrappedRoomKey` which returned only `wrapped_room_key` with no signature fields, so verification was structurally impossible. A Supabase service-role attacker (or malicious RLS bypass) could have injected a `room_members` row with arbitrary `wrapped_room_key` content that would be silently accepted by every client. `PendingApprovalBanner.tsx` was especially dangerous: on approval it re-wraps the corrupt key for the newly-enrolled device, spreading the injection to every future device.
+
+**`src/lib/supabase/queries.ts`:**
+- **New:** `getMyRoomKeyRow({ roomId, deviceId, generation })` — fetches `wrapped_room_key, signer_device_id, wrap_signature, user_id` for a single `(room_id, device_id, generation)` row. `signer_device_id` typed `string | null` (SET NULL FK). This is the canonical fetch for verified unwrap.
+
+**`src/lib/bootstrap.ts`:**
+- **New export:** `verifyAndUnwrapMyRoomKey({ roomId, userId, device, generation })` — the single verified-unwrap path. Calls `getMyRoomKeyRow`, rejects null signer (`signer_device_id = null` means the signing device was deleted — row unverifiable, throws), batch-resolves the signer's Ed25519 pub via `fetchDeviceEd25519PubsByIds`, calls `verifyMembershipWrap`, then unwraps. Returns `RoomKey | null` (null = no row). Throws on verification or decrypt failure — callers must not silently swallow these.
+- **Fixed:** `rotateOneRoomAsAdmin` and `respondToKeyForwardRequests` — both replaced bare `getMyWrappedRoomKey` + `unwrapRoomKey` with `verifyAndUnwrapMyRoomKey`.
+
+**`src/app/rooms/[id]/page.tsx`:**
+- **Fix (critical):** The `unwrapRoomKey` call is now inside the signer-pub guard, not outside it. A row with no resolvable signer pub is now skipped with `continue` rather than decrypted anyway.
+
+**`src/app/rooms/page.tsx`:**
+- **Fixed:** Room-name decrypt and invite-send paths both replaced with `verifyAndUnwrapMyRoomKey`. A corrupt key sealed into an outgoing invite would have spread to the invitee.
+
+**`src/components/CallChatPanel.tsx`:**
+- **Fixed:** Key-load loop now batch-resolves signer pubs, calls `verifyMembershipWrap` per row, and `continue`s on missing signer — matching the fix in `rooms/[id]/page.tsx`. Previously fetched signature fields from `listMyRoomKeyRows` but never read or verified them.
+
+**`src/components/PendingApprovalBanner.tsx`:**
+- **Fixed (highest-risk callsite):** Replaced `getMyWrappedRoomKey` + `unwrapRoomKey` with `verifyAndUnwrapMyRoomKey`. On device approval, this iterates ALL rooms and re-wraps keys for the new device — an unverified corrupt key here would have spread silently to every newly-enrolled device.
+
+**`src/app/status/page.tsx`:**
+- **Fixed:** Both diagnostic-test callsites replaced with `verifyAndUnwrapMyRoomKey`.
+
+---
+
+### 2026-04-18 — Security fixes: u64BE timestamp truncation + wrap signature verification (partial — superseded by entry above)
 
 **No new migrations.** All changes are client-side only.
 
@@ -21,7 +52,7 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 - **New:** `fetchDeviceEd25519PubsByIds(deviceIds)` — batch-fetches `device_ed25519_pub` for a set of device IDs in one query. Used by the wrap-signature verification path.
 
 **`src/app/rooms/[id]/page.tsx`:**
-- **Fix:** The key-load loop now verifies `wrap_signature` on each `room_members` row before accepting it. Batch-resolves signer Ed25519 pubkeys via `fetchDeviceEd25519PubsByIds`, then calls `verifyMembershipWrap` for each row. Rows that fail signature verification are rejected (skipped with `console.error`) — the room key at that generation is simply not loaded. A missing signer device row (e.g. device later deleted) logs a warning but does not block load, to avoid bricking rooms with missing signer state.
+- **Fix (partial — see critical fix above for the complete correction):** The key-load loop now verifies `wrap_signature` on each `room_members` row before accepting it. Batch-resolves signer Ed25519 pubkeys via `fetchDeviceEd25519PubsByIds`, then calls `verifyMembershipWrap` for each row. Rows that fail verification are rejected. NOTE: the original version of this entry stated "a missing signer device row logs a warning but does not block load" — that was incorrect; missing signer now throws/rejects via `verifyAndUnwrapMyRoomKey`.
 - **Removed:** Dead `void verifyMembershipWrap` expression and its stale comment.
 
 ---

@@ -36,7 +36,6 @@ import {
   signDeviceIssuanceV2,
   signMembershipWrap,
   toBase64,
-  unwrapRoomKey,
   wrapRoomKeyFor,
   type Bytes,
   type SelfSigningKey,
@@ -44,10 +43,10 @@ import {
 } from '@/lib/e2ee-core';
 import { errorMessage } from '@/lib/errors';
 import { getSupabase } from '@/lib/supabase/client';
+import { verifyAndUnwrapMyRoomKey } from '@/lib/bootstrap';
 import {
   addRoomMember,
   deleteApprovalRequest,
-  getMyWrappedRoomKey,
   listPendingApprovalRequests,
   listMyRooms,
   registerDevice,
@@ -348,18 +347,13 @@ async function rewrapRoomsForNewDevice(params: {
   const rooms = await listMyRooms(userId);
   for (const room of rooms) {
     try {
-      const myWrapped = await getMyWrappedRoomKey({
+      const roomKey = await verifyAndUnwrapMyRoomKey({
         roomId: room.id,
-        deviceId: myBundle.deviceId,
+        userId,
+        device: myBundle,
         generation: room.current_generation,
       });
-      if (!myWrapped) continue;
-
-      const roomKey = await unwrapRoomKey(
-        { wrapped: myWrapped, generation: room.current_generation },
-        myBundle.x25519PublicKey,
-        myBundle.x25519PrivateKey,
-      );
+      if (!roomKey) continue;
 
       const wrap = await wrapRoomKeyFor(roomKey, newDeviceX25519Pub);
       const sig = await signMembershipWrap(

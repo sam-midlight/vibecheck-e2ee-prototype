@@ -34,6 +34,7 @@ import {
   signMembershipWrap,
   toBase64,
   unwrapRoomKey,
+  verifyMembershipWrap,
   unwrapCallKey,
   verifySskCrossSignature,
   verifyCallEnvelope,
@@ -55,6 +56,7 @@ import {
   type CallKey,
   type DeviceKeyBundle,
   type InboundSessionSnapshot,
+  type RoomKey,
   type OutboundMegolmSession,
   type PublicDevice,
   type SelfSigningKey,
@@ -67,9 +69,11 @@ import { broadcastIdentityChange } from '@/lib/tab-sync';
 import {
   addRoomMember,
   createInvite,
+  fetchDeviceEd25519PubsByIds,
   fetchPublicDevices,
   fetchUserMasterKeyPub,
   fetchCallKeyEnvelope,
+  getMyRoomKeyRow,
   getMyWrappedRoomKey,
   insertMegolmSession,
   listKeyBackups,
@@ -600,21 +604,17 @@ async function rotateOneRoomAsAdmin(params: {
 }): Promise<void> {
   const { device, room } = params;
 
-  const myWrapped = await getMyWrappedRoomKey({
+  const roomKey = await verifyAndUnwrapMyRoomKey({
     roomId: room.id,
-    deviceId: device.deviceId,
+    userId: params.userId,
+    device,
     generation: room.current_generation,
   });
-  if (!myWrapped) {
+  if (!roomKey) {
     throw new Error(
       `no current-gen wrapped key on this device for room ${room.id.slice(0, 8)}`,
     );
   }
-  const roomKey = await unwrapRoomKey(
-    { wrapped: myWrapped, generation: room.current_generation },
-    device.x25519PublicKey,
-    device.x25519PrivateKey,
-  );
 
   const members = await listRoomMembers(room.id);
   const currentMembers = members.filter(
@@ -1180,6 +1180,48 @@ export async function restoreSessionsFromBackup(
 }
 
 /**
+ * Fetch this device's wrapped room key for the given generation, verify the
+ * wrap_signature against the signer device's published Ed25519 pub, then
+ * unseal the box. Returns null if no row exists. Throws on signature mismatch
+ * or decrypt failure so the caller can distinguish "not a member" from
+ * "tampered row".
+ */
+export async function verifyAndUnwrapMyRoomKey(params: {
+  roomId: string;
+  userId: string;
+  device: DeviceKeyBundle;
+  generation: number;
+}): Promise<RoomKey | null> {
+  const { roomId, userId, device, generation } = params;
+  const row = await getMyRoomKeyRow({ roomId, deviceId: device.deviceId, generation });
+  if (!row) return null;
+  if (!row.signer_device_id) {
+    throw new Error('wrap signer device was deleted — row unverifiable, rejected');
+  }
+  const wrapped = await fromBase64(row.wrapped_room_key);
+  const signerPubs = await fetchDeviceEd25519PubsByIds([row.signer_device_id]);
+  const signerPub = signerPubs.get(row.signer_device_id);
+  if (!signerPub) {
+    throw new Error(
+      `wrap_signature signer ${row.signer_device_id} not found — row rejected`,
+    );
+  }
+  await verifyMembershipWrap(
+    {
+      roomId,
+      generation,
+      memberUserId: userId,
+      memberDeviceId: device.deviceId,
+      wrappedRoomKey: wrapped,
+      signerDeviceId: row.signer_device_id,
+    },
+    await fromBase64(row.wrap_signature),
+    signerPub,
+  );
+  return unwrapRoomKey({ wrapped, generation }, device.x25519PublicKey, device.x25519PrivateKey);
+}
+
+/**
  * Check for pending key-forward requests from sibling devices (same user,
  * different device) and respond to each by inserting a megolm_session_share.
  *
@@ -1294,17 +1336,13 @@ export async function respondToKeyForwardRequests(
           generation: sessionInfo.generation,
         }).catch(() => null);
         if (!existingRoomWrap) {
-          const myRoomWrap = await getMyWrappedRoomKey({
+          const roomKey = await verifyAndUnwrapMyRoomKey({
             roomId: req.room_id,
-            deviceId: device.deviceId,
+            userId,
+            device,
             generation: sessionInfo.generation,
           }).catch(() => null);
-          if (myRoomWrap) {
-            const roomKey = await unwrapRoomKey(
-              { wrapped: myRoomWrap, generation: sessionInfo.generation },
-              device.x25519PublicKey,
-              device.x25519PrivateKey,
-            );
+          if (roomKey) {
             const roomWrap = await wrapRoomKeyFor(roomKey, requesterX25519Pub);
             const roomSig = await signMembershipWrap(
               {

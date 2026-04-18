@@ -227,22 +227,22 @@ function RoomInner({ roomId }: { roomId: string }) {
           const signerPub = signerPubs.get(r.signer_device_id);
           if (!signerPub) {
             console.error(
-              `wrap_signature verification skipped for room ${roomId} gen ${r.generation}: signer device ${r.signer_device_id} not found`,
+              `wrap_signature signer ${r.signer_device_id} not found for room ${roomId} gen ${r.generation} — row rejected`,
             );
-          } else {
-            await verifyMembershipWrap(
-              {
-                roomId,
-                generation: r.generation,
-                memberUserId: r.user_id,
-                memberDeviceId: dev.deviceId,
-                wrappedRoomKey: wrapped,
-                signerDeviceId: r.signer_device_id,
-              },
-              await fromBase64(r.wrap_signature),
-              signerPub,
-            );
+            continue;
           }
+          await verifyMembershipWrap(
+            {
+              roomId,
+              generation: r.generation,
+              memberUserId: r.user_id,
+              memberDeviceId: dev.deviceId,
+              wrappedRoomKey: wrapped,
+              signerDeviceId: r.signer_device_id,
+            },
+            await fromBase64(r.wrap_signature),
+            signerPub,
+          );
           const rk = await unwrapRoomKey(
             { wrapped, generation: r.generation },
             dev.x25519PublicKey,

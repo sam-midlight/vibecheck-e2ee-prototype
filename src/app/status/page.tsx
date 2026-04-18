@@ -12,7 +12,6 @@ import {
   downloadAttachment,
   fetchPublicDevices,
   fetchUserMasterKeyPub,
-  getMyWrappedRoomKey,
   insertBlob,
   listDevices,
   registerDevice,
@@ -53,7 +52,6 @@ import {
   verifyCrossSigningChain,
   verifyDeviceIssuance,
   unwrapCallKey,
-  unwrapRoomKey,
   unwrapUserMasterKeyWithPhrase,
   verifyCallEnvelope,
   verifyMessage,
@@ -64,7 +62,7 @@ import {
   type RoomKey,
   type UserMasterKey,
 } from '@/lib/e2ee-core';
-import { loadEnrolledDevice, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
+import { loadEnrolledDevice, verifyAndUnwrapMyRoomKey, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
 import { browserSupportsE2EE } from '@/lib/livekit';
 import {
   getBlobCacheForRoom,
@@ -572,17 +570,13 @@ export default function StatusPage() {
           roomKey: ctx.roomKey!,
           signerDevice: ctx.device!,
         });
-        const tempWrapped = await getMyWrappedRoomKey({
+        const tempRk = await verifyAndUnwrapMyRoomKey({
           roomId: ctx.roomId!,
-          deviceId: tempId,
+          userId,
+          device: tempBundle,
           generation: ctx.roomKey!.generation,
         });
-        if (!tempWrapped) throw new Error('no wrap created for temp device');
-        const tempRk = await unwrapRoomKey(
-          { wrapped: tempWrapped, generation: ctx.roomKey!.generation },
-          tempBundle.x25519PublicKey,
-          tempBundle.x25519PrivateKey,
-        );
+        if (!tempRk) throw new Error('no wrap created for temp device');
         const keysMatch = await bytesEqual(tempRk.key, ctx.roomKey!.key);
         if (!keysMatch) throw new Error('temp device unwrapped a different key');
         return { detail: `temp device ${tempId.slice(0, 8)} wrapped + unwrapped OK` };
@@ -918,19 +912,13 @@ async function findOrCreateTestRoom(
         (err) => console.warn('orphan status-room cleanup failed', err),
       );
     }
-    const wrapped = await getMyWrappedRoomKey({
+    const roomKey = await verifyAndUnwrapMyRoomKey({
       roomId: keep.id,
-      deviceId: device.deviceId,
+      userId,
+      device,
       generation: keep.current_generation,
     });
-    if (wrapped) {
-      const roomKey = await unwrapRoomKey(
-        { wrapped, generation: keep.current_generation },
-        device.x25519PublicKey,
-        device.x25519PrivateKey,
-      );
-      return { roomId: keep.id, roomKey };
-    }
+    if (roomKey) return { roomId: keep.id, roomKey };
     // Stale probe room (e.g. after identity nuke) — delete it so we
     // create a fresh one with valid membership below.
     await supabase.from('rooms').delete().eq('id', keep.id).then(
