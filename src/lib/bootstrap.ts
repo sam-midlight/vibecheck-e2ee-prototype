@@ -43,6 +43,7 @@ import {
   zeroCallKey,
   createOutboundSession,
   exportSessionSnapshot,
+  getInboundSession,
   sealSessionSnapshot,
   signSessionShare,
   getOutboundSession,
@@ -51,6 +52,7 @@ import {
   type AutoRotationConfig,
   type CallKey,
   type DeviceKeyBundle,
+  type InboundSessionSnapshot,
   type OutboundMegolmSession,
   type PublicDevice,
   type SelfSigningKey,
@@ -79,6 +81,9 @@ import {
   rotateCallKey as rpcRotateCallKey,
   startCall as rpcStartCall,
   upsertKeyBackup,
+  fetchMegolmSessionInfo,
+  listKeyForwardRequestsForUser,
+  deleteKeyForwardRequest,
   type CallEnvelopeInput,
   type RoomRow,
 } from '@/lib/supabase/queries';
@@ -996,6 +1001,41 @@ export async function createAndDistributeSession(params: {
   }
 
   await putOutboundSession(roomId, device.deviceId, session);
+
+  // Matrix-aligned backup: store the session at its INITIAL index (0) so any
+  // device that restores from backup can decrypt ALL messages in this session.
+  // We do this once at creation — upsertKeyBackup uses ignoreDuplicates so
+  // subsequent calls (e.g. from old code paths) can never overwrite it.
+  try {
+    const bk = await getBackupKey(userId);
+    if (bk) {
+      const { encryptSessionSnapshotForBackup } = await import('@/lib/e2ee-core');
+      const sessionIdB64 = await toBase64(session.sessionId);
+      const enc = await encryptSessionSnapshotForBackup({
+        snapshot: {
+          chainKeyAtIndex: session.chainKey,
+          startIndex: session.messageIndex, // = 0 at session creation
+          senderUserId: userId,
+          senderDeviceId: device.deviceId,
+        },
+        sessionId: sessionIdB64,
+        backupKey: bk,
+        roomId,
+      });
+      await upsertKeyBackup({
+        userId,
+        roomId,
+        generation,
+        ciphertext: await toBase64(enc.ciphertext),
+        nonce: await toBase64(enc.nonce),
+        sessionId: sessionIdB64,
+        startIndex: 0,
+      });
+    }
+  } catch (err) {
+    console.warn('Megolm session backup at creation failed:', errorMessage(err));
+  }
+
   return session;
 }
 
@@ -1106,6 +1146,87 @@ export async function restoreSessionsFromBackup(
     }
   }
   return { restored, failed };
+}
+
+/**
+ * Check for pending key-forward requests from sibling devices (same user,
+ * different device) and respond to each by inserting a megolm_session_share.
+ *
+ * Called on every room load. If this device has the session in IDB (either as
+ * an inbound share or as its own outbound session), it seals and signs a
+ * snapshot addressed to the requesting device. The requester picks it up on
+ * its next `loadAll` via `listMegolmSharesForDevice` + session hydration.
+ */
+export async function respondToKeyForwardRequests(
+  userId: string,
+  device: DeviceKeyBundle,
+): Promise<{ fulfilled: number }> {
+  const supabase = getSupabase();
+  let requests: Awaited<ReturnType<typeof listKeyForwardRequestsForUser>>;
+  try {
+    requests = await listKeyForwardRequestsForUser(userId);
+  } catch {
+    return { fulfilled: 0 };
+  }
+  if (requests.length === 0) return { fulfilled: 0 };
+
+  let fulfilled = 0;
+  for (const req of requests) {
+    // Skip our own requests — we can't forward to ourselves.
+    if (req.requester_device_id === device.deviceId) continue;
+    try {
+      // Look up session metadata to find the sender device.
+      const sessionInfo = await fetchMegolmSessionInfo(req.session_id).catch(() => null);
+      if (!sessionInfo) continue;
+
+      let snapshot: InboundSessionSnapshot | null = null;
+
+      if (sessionInfo.sender_device_id === device.deviceId) {
+        // This is OUR outbound session — export from current IDB state.
+        const outbound = await getOutboundSession(sessionInfo.room_id, device.deviceId);
+        if (outbound) snapshot = exportSessionSnapshot(outbound, userId, device.deviceId);
+      } else {
+        // Inbound session from another sender — look up from IDB.
+        snapshot = await getInboundSession(req.session_id, sessionInfo.sender_device_id);
+      }
+
+      if (!snapshot) continue;
+
+      // Fetch requester's X25519 pub to seal the snapshot to them.
+      const { data: devRow } = await supabase
+        .from('devices')
+        .select('device_x25519_pub')
+        .eq('id', req.requester_device_id)
+        .maybeSingle<{ device_x25519_pub: string }>();
+      if (!devRow) continue;
+
+      const requesterX25519Pub = await fromBase64(devRow.device_x25519_pub);
+      const sealed = await sealSessionSnapshot(snapshot, requesterX25519Pub);
+      const sessionIdBytes = await fromBase64(req.session_id);
+      const sig = await signSessionShare({
+        sessionId: sessionIdBytes,
+        recipientDeviceId: req.requester_device_id,
+        sealedSnapshot: sealed,
+        signerDeviceId: device.deviceId,
+        signerEd25519Priv: device.ed25519PrivateKey,
+      });
+
+      await insertMegolmSessionShare({
+        sessionId: req.session_id,
+        recipientDeviceId: req.requester_device_id,
+        sealedSnapshot: await toBase64(sealed),
+        startIndex: snapshot.startIndex,
+        signerDeviceId: device.deviceId,
+        shareSignature: await toBase64(sig),
+      });
+
+      await deleteKeyForwardRequest(req.id).catch(() => {});
+      fulfilled++;
+    } catch (err) {
+      console.warn(`key forward respond failed for request ${req.id.slice(0, 8)}:`, errorMessage(err));
+    }
+  }
+  return { fulfilled };
 }
 
 export async function ensureFreshSession(params: {

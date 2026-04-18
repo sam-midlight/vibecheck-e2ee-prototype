@@ -31,7 +31,7 @@ import {
   type PublicDevice,
   type RoomKey,
 } from '@/lib/e2ee-core';
-import { ensureFreshSession } from '@/lib/bootstrap';
+import { ensureFreshSession, respondToKeyForwardRequests } from '@/lib/bootstrap';
 import { useDevMode } from '@/lib/use-dev-mode';
 import {
   getBlobCacheForRoom,
@@ -64,6 +64,8 @@ import {
   subscribeRoomCalls,
   subscribeRoomMetadata,
   listMegolmSharesForDevice,
+  insertKeyForwardRequest,
+  subscribeMegolmShares,
   uploadAttachment,
   type BlobRow,
   type CallRow,
@@ -294,6 +296,11 @@ function RoomInner({ roomId }: { roomId: string }) {
         console.warn('Megolm session hydration failed:', errorMessage(err));
       }
 
+      // Respond to any pending key forward requests from sibling devices.
+      // This is fast (no-op when no requests exist) and ensures the phone
+      // answers the laptop's requests the next time either opens the room.
+      void respondToKeyForwardRequests(uid, dev).catch(() => {});
+
       let trimmedIds: string[] = [];
       if (newServerRows.length > 0) {
         await putBlobRows(roomId, newServerRows);
@@ -315,6 +322,26 @@ function RoomInner({ roomId }: { roomId: string }) {
       let nickMap: NicknameMap = new Map();
       for (const b of decoded) nickMap = updateNicknamesFromBlob(nickMap, b);
       setNicknames(nickMap);
+
+      // Post key-forward requests for any v4 blobs we still can't decrypt.
+      // Sibling devices will see these via realtime and respond with shares.
+      const sessionsToRequest = new Set<string>();
+      decoded.forEach((b, i) => {
+        const raw = allCached[i];
+        if (b.missingKey && raw?.session_id) sessionsToRequest.add(raw.session_id);
+      });
+      if (sessionsToRequest.size > 0) {
+        void Promise.all(
+          [...sessionsToRequest].map((sid) =>
+            insertKeyForwardRequest({
+              userId: uid,
+              requesterDeviceId: dev.deviceId,
+              sessionId: sid,
+              roomId,
+            }).catch(() => {}),
+          ),
+        );
+      }
 
       // Server has more history if: cache is at capacity, trim just happened,
       // OR this device enrolled mid-stream (byGen doesn't include gen 1) and
@@ -482,6 +509,16 @@ function RoomInner({ roomId }: { roomId: string }) {
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [device, userId, loadAll]);
+
+  // When a sibling device responds to our key forward request by inserting a
+  // new megolm_session_share, re-run loadAll so we hydrate it into IDB and
+  // re-decode the previously-unreadable messages.
+  useEffect(() => {
+    if (!device || !userId) return;
+    return subscribeMegolmShares(device.deviceId, () => {
+      void loadAll(userId, device);
+    });
   }, [device, userId, loadAll]);
 
   // Live-call indicator: subscribe to `calls` for this room + seed the
@@ -971,39 +1008,6 @@ async function megolmEncrypt<T>(params: {
   });
   // Persist updated session (ratchet advanced).
   await putOutboundSession(roomId, device.deviceId, session);
-
-  // Back up the session snapshot to key_backup if a backup key exists.
-  try {
-    const { getBackupKey, encryptSessionSnapshotForBackup, toBase64: b64 } =
-      await import('@/lib/e2ee-core');
-    const { upsertKeyBackup } = await import('@/lib/supabase/queries');
-    const bk = await getBackupKey(userId);
-    if (bk) {
-      const sessionIdB64 = await b64(session.sessionId);
-      const enc = await encryptSessionSnapshotForBackup({
-        snapshot: {
-          chainKeyAtIndex: session.chainKey,
-          startIndex: session.messageIndex, // current index after ratchet
-          senderUserId: userId,
-          senderDeviceId: device.deviceId,
-        },
-        sessionId: sessionIdB64,
-        backupKey: bk,
-        roomId,
-      });
-      await upsertKeyBackup({
-        userId,
-        roomId,
-        generation: session.generation,
-        ciphertext: await b64(enc.ciphertext),
-        nonce: await b64(enc.nonce),
-        sessionId: sessionIdB64,
-        startIndex: session.messageIndex,
-      });
-    }
-  } catch (err) {
-    console.warn('Megolm session backup failed:', err);
-  }
 
   return blob;
 }

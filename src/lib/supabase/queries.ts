@@ -1436,8 +1436,128 @@ export async function upsertKeyBackup(params: {
   };
   if (params.sessionId != null) row.session_id = params.sessionId;
   if (params.startIndex != null) row.start_index = params.startIndex;
-  const { error } = await supabase.from('key_backup').upsert(row);
+  // Matrix-aligned: for Megolm session backups, store the EARLIEST known index
+  // (written once at session creation) and never overwrite with a later index.
+  // ignoreDuplicates maps to ON CONFLICT DO NOTHING so the initial index-0
+  // snapshot is preserved. Flat room-key backups also benefit: the room key is
+  // fixed per generation so overwriting is redundant and can only hurt.
+  const { error } = await supabase.from('key_backup').upsert(row, { ignoreDuplicates: true });
   if (error) throw error;
+}
+
+// ---------------------------------------------------------------------------
+// key_forward_requests (migration 0035)
+// ---------------------------------------------------------------------------
+
+export interface KeyForwardRequestRow {
+  id: string;
+  user_id: string;
+  requester_device_id: string;
+  session_id: string;
+  room_id: string;
+  created_at: string;
+  expires_at: string;
+}
+
+/** Post a request asking sibling devices to forward a missing Megolm session. */
+export async function insertKeyForwardRequest(params: {
+  userId: string;
+  requesterDeviceId: string;
+  sessionId: string;
+  roomId: string;
+}): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.from('key_forward_requests').upsert(
+    {
+      user_id: params.userId,
+      requester_device_id: params.requesterDeviceId,
+      session_id: params.sessionId,
+      room_id: params.roomId,
+    },
+    { onConflict: 'requester_device_id,session_id', ignoreDuplicates: true },
+  );
+  if (error) throw error;
+}
+
+/** Fetch all unexpired key forward requests for a user (read by sibling devices). */
+export async function listKeyForwardRequestsForUser(
+  userId: string,
+): Promise<KeyForwardRequestRow[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('key_forward_requests')
+    .select('*')
+    .eq('user_id', userId)
+    .gt('expires_at', new Date().toISOString());
+  if (error) throw error;
+  return (data ?? []) as KeyForwardRequestRow[];
+}
+
+/** Delete a fulfilled key forward request. */
+export async function deleteKeyForwardRequest(id: string): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.from('key_forward_requests').delete().eq('id', id);
+  if (error) throw error;
+}
+
+/** Realtime: notify this device when new key forward requests arrive for its user. */
+export function subscribeKeyForwardRequests(
+  userId: string,
+  onRow: (row: KeyForwardRequestRow) => void,
+): () => void {
+  const supabase = getSupabase();
+  const channel = supabase
+    .channel(`key-fwd-req:${userId}`)
+    .on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'key_forward_requests', filter: `user_id=eq.${userId}` },
+      (payload) => onRow(payload.new as KeyForwardRequestRow),
+    )
+    .subscribe();
+  return () => { void supabase.removeChannel(channel); };
+}
+
+// ---------------------------------------------------------------------------
+// megolm_sessions — metadata lookup for key forwarding
+// ---------------------------------------------------------------------------
+
+export interface MegolmSessionInfoRow {
+  session_id: string;
+  room_id: string;
+  sender_user_id: string;
+  sender_device_id: string;
+  generation: number;
+}
+
+/** Fetch session metadata needed to forward a session (room_id, sender_device_id). */
+export async function fetchMegolmSessionInfo(
+  sessionId: string,
+): Promise<MegolmSessionInfoRow | null> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('megolm_sessions')
+    .select('session_id, room_id, sender_user_id, sender_device_id, generation')
+    .eq('session_id', sessionId)
+    .maybeSingle<MegolmSessionInfoRow>();
+  if (error) throw error;
+  return data;
+}
+
+/** Realtime: notify this device when a new megolm_session_share addressed to it arrives. */
+export function subscribeMegolmShares(
+  deviceId: string,
+  onRow: (row: MegolmSessionShareRow) => void,
+): () => void {
+  const supabase = getSupabase();
+  const channel = supabase
+    .channel(`megolm-shares:${deviceId}`)
+    .on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'megolm_session_shares', filter: `recipient_device_id=eq.${deviceId}` },
+      (payload) => onRow(payload.new as MegolmSessionShareRow),
+    )
+    .subscribe();
+  return () => { void supabase.removeChannel(channel); };
 }
 
 export async function listKeyBackups(
