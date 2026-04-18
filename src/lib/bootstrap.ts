@@ -1097,16 +1097,19 @@ const _backupRestoredUsers = new Set<string>();
  * key_backup AND the local device holds the backup key.
  * Runs at most once per user per app session (subsequent calls are no-ops).
  */
+type BackupRestoreResult = { restored: number; failed: number; roomKeys: Array<{ roomId: string; generation: number; key: Uint8Array }> };
+
 export async function restoreSessionsFromBackup(
   userId: string,
-): Promise<{ restored: number; failed: number; roomKeys: Array<{ roomId: string; generation: number; key: Uint8Array }> }> {
-  if (_backupRestoredUsers.has(userId)) return { restored: 0, failed: 0, roomKeys: [] };
+): Promise<BackupRestoreResult> {
+  const empty: BackupRestoreResult = { restored: 0, failed: 0, roomKeys: [] };
+  if (_backupRestoredUsers.has(userId)) return empty;
   _backupRestoredUsers.add(userId);
 
   const { getBackupKey: bk, fromBase64: b64d, putInboundSession } =
     await import('@/lib/e2ee-core');
   const backupKey = await bk(userId);
-  if (!backupKey) return { restored: 0, failed: 0, roomKeys: [] };
+  if (!backupKey) return empty;
 
   const rows = await listKeyBackups(userId);
   const megolmRows = rows.filter((r) => r.session_id && r.start_index != null);
