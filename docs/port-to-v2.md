@@ -358,3 +358,44 @@ Before calling V2 ready:
 - Lose all devices (clear IndexedDB on both), confirm the user is correctly routed to "no identity on device, but identity exists on server" state — and guided to re-pair, not to a broken dead-end.
 - Rotate the recovery phrase on device A, refresh the tab between "new UMK generated" and "UMK pub published" (devtools → disable cache + throttle), then reload and re-enter the new phrase. The account should recover via the new blob rather than lock out. (Proves SSSS ordering.)
 - Create a room on A, approve a new device B, confirm B's `devices.backup_key_wrap` gets populated and B can decrypt backed-up history. Then on a third device C, enter the recovery phrase and confirm C downloads + decrypts `key_backup` rows for every room. (Proves the three backup-key paths.)
+
+## 14. Local blob cache (Matrix-aligned)
+
+`src/lib/cache-store.ts` is a portable app-level cache layer. It lives in a separate `vibecheck-cache` IndexedDB so the e2ee-core crypto store stays pure. Copy it verbatim alongside `e2ee-core/` and wire it into your room page as the prototype does.
+
+**Architecture:**
+
+```
+Server (Supabase)
+  └── blobs: ciphertext rows (authoritative, unbounded)
+
+vibecheck-cache IndexedDB (this device)
+  ├── blobCache  key: "${roomId}:${blobId}"   value: BlobRow (ciphertext)
+  │              index byRoomTime: [roomId, createdAt]
+  └── roomSyncCursor  key: roomId             value: { lastCreatedAt }
+
+In-memory React state
+  └── DecodedBlob[]  — plaintext, ephemeral, never persisted
+```
+
+**Delta sync pattern** (implemented in `src/app/rooms/[id]/page.tsx` `loadAll`):
+- No cursor → first visit → `listBlobs(roomId, 500)` → seed cache → set cursor to latest `created_at`
+- Cursor present → `listBlobsAfter(roomId, cursor)` → merge new rows → advance cursor
+- After delta: re-decode all cached rows to handle missingKey re-tries and generation changes
+
+**Realtime path** (`ingestBlobRow`): each arriving blob is also written to cache and advances the cursor so the next delta fetch is minimal.
+
+**Pagination** (`loadEarlier`): fetches from server via `listBlobsBefore(roomId, oldest.createdAt, 100)`. Older rows are prepended to React state but NOT cached — they're intentionally outside the 500-row window. `hasMoreHistory` is set to false when the server returns 0 rows.
+
+**`MAX_CACHE_ROWS_PER_ROOM = 500`**: trim fires after every delta write, keeping the newest 500 rows. Returns deleted IDs so React state can be updated. V2 apps with larger payloads (notes, rich data) can tune this constant. The server always has the full history for reports and pagination.
+
+**Invariants V2 must preserve:**
+
+- `wipeAppCache()` must be called alongside identity nuke (`handleNuclearConfirmed` in `auth/callback/page.tsx`). Without it, stale ciphertext from the old identity accumulates in the cache with no corresponding decryption keys.
+- `clearBlobCacheForRoom(roomId)` on leave room, delete room, and stale-membership abandon. Prevents a re-joined user from seeing a stale pre-join cache on first load.
+- `removeBlobFromCache(roomId, blobId)` on blob delete. Keeps cache consistent with server state.
+- Ciphertext only — never store `DecodedBlob` (plaintext) in IndexedDB. Same posture as Element Web.
+
+**Security note:** the cache is not additionally encrypted. Same-origin isolation is the security boundary, same as Element Web. Keys stay PIN-protected in the e2ee-core store; the cache is meaningless without them. Future hardening path: encrypt `blobCache` entries under the device X25519 key — documented as deferred, not yet implemented.
+
+**Reports / export:** bypass the cache entirely and query the server directly via `listBlobs` (or a paginated equivalent). The cache is a display convenience; it is bounded at 500 rows and may be stale. Any feature that needs complete authoritative history must go to the server.

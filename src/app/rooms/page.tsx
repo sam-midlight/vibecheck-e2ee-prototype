@@ -54,6 +54,7 @@ function RoomsInner() {
   const [rooms, setRooms] = useState<RoomRow[]>([]);
   const [invites, setInvites] = useState<RoomInviteRow[]>([]);
   const [names, setNames] = useState<Map<string, string>>(new Map());
+  const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -144,6 +145,16 @@ function RoomsInner() {
     return () => clearInterval(interval);
   }, [userId, reload]);
 
+  // Re-sync when tab becomes visible (catches missed realtime events while hidden).
+  useEffect(() => {
+    if (!userId) return;
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void reload(userId);
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [userId, reload]);
+
   if (loading || !userId) {
     return <p className="text-sm text-neutral-500">loading…</p>;
   }
@@ -185,6 +196,7 @@ function RoomsInner() {
                 invite={invite}
                 userId={userId}
                 device={device}
+                roomCount={rooms.length}
                 onDone={() => void reload(userId)}
               />
             ))}
@@ -195,48 +207,88 @@ function RoomsInner() {
       <section>
         <div className="flex items-center justify-between">
           <h2 className="text-base font-semibold">Your rooms</h2>
+          <span className="text-xs text-neutral-500">{rooms.length}/100</span>
         </div>
+
+        {rooms.length >= 90 && (
+          <div className={`mt-2 rounded border px-3 py-2 text-xs ${
+            rooms.length >= 100
+              ? 'border-red-300 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200'
+              : 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200'
+          }`}>
+            {rooms.length >= 100
+              ? 'Room limit reached. Leave a room before creating or joining a new one.'
+              : `You're in ${rooms.length}/100 rooms. Approaching the limit.`}
+          </div>
+        )}
+
+        {rooms.length > 0 && (
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => e.key === 'Escape' && setSearch('')}
+            placeholder="search rooms…"
+            className="mt-2 block w-full rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-900"
+          />
+        )}
+
         {rooms.length === 0 && (
           <p className="mt-2 text-sm text-neutral-500">No rooms yet. Create one below.</p>
         )}
-        <ul className="mt-2 space-y-2">
-          {rooms.map((room) => {
-            const name = names.get(room.id);
-            return (
-              <li
-                key={room.id}
-                className="flex items-center justify-between rounded border border-neutral-200 px-3 py-2 text-sm dark:border-neutral-800"
-              >
-                <div className="min-w-0">
-                  {name ? (
-                    <span className="font-medium">{name}</span>
-                  ) : (
-                    <span className="font-mono text-xs text-neutral-500">
-                      {room.id.slice(0, 8)}
-                    </span>
-                  )}
-                  <span className="ml-2 rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] uppercase dark:bg-neutral-900">
-                    {room.kind}
-                  </span>
-                  <span className="ml-2 text-xs text-neutral-500">
-                    gen {room.current_generation}
-                  </span>
-                  {room.parent_room_id && (
-                    <span className="ml-2 text-xs text-neutral-500">
-                      ↳ child of {room.parent_room_id.slice(0, 8)}
-                    </span>
-                  )}
-                </div>
-                <Link
-                  href={`/rooms/${room.id}`}
-                  className="ml-2 rounded bg-neutral-900 px-2 py-1 text-xs text-white transition-transform duration-150 hover:bg-neutral-700 active:scale-95 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
-                >
-                  open →
-                </Link>
-              </li>
-            );
-          })}
-        </ul>
+
+        {(() => {
+          const q = search.trim().toLowerCase();
+          const visible = q
+            ? rooms.filter((r) => {
+                const name = names.get(r.id) ?? '';
+                return name.toLowerCase().includes(q) || r.id.toLowerCase().includes(q);
+              })
+            : rooms;
+          return (
+            <ul className="mt-2 space-y-2">
+              {visible.map((room) => {
+                const name = names.get(room.id);
+                return (
+                  <li
+                    key={room.id}
+                    className="flex items-center justify-between rounded border border-neutral-200 px-3 py-2 text-sm dark:border-neutral-800"
+                  >
+                    <div className="min-w-0">
+                      {name ? (
+                        <span className="font-medium">{name}</span>
+                      ) : (
+                        <span className="font-mono text-xs text-neutral-500">
+                          {room.id.slice(0, 8)}
+                        </span>
+                      )}
+                      <span className="ml-2 rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] uppercase dark:bg-neutral-900">
+                        {room.kind}
+                      </span>
+                      <span className="ml-2 text-xs text-neutral-500">
+                        gen {room.current_generation}
+                      </span>
+                      {room.parent_room_id && (
+                        <span className="ml-2 text-xs text-neutral-500">
+                          ↳ child of {room.parent_room_id.slice(0, 8)}
+                        </span>
+                      )}
+                    </div>
+                    <Link
+                      href={`/rooms/${room.id}`}
+                      className="ml-2 rounded bg-neutral-900 px-2 py-1 text-xs text-white transition-transform duration-150 hover:bg-neutral-700 active:scale-95 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
+                    >
+                      open →
+                    </Link>
+                  </li>
+                );
+              })}
+              {q && visible.length === 0 && (
+                <li className="py-2 text-sm text-neutral-500">No rooms match &ldquo;{search}&rdquo;</li>
+              )}
+            </ul>
+          );
+        })()}
       </section>
 
       {device && (
@@ -268,17 +320,23 @@ function InviteCard({
   invite,
   userId,
   device,
+  roomCount,
   onDone,
 }: {
   invite: RoomInviteRow;
   userId: string;
   device: DeviceKeyBundle;
+  roomCount: number;
   onDone: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function accept() {
+    if (roomCount >= 100) {
+      setError('Room limit reached — leave a room before accepting this invite.');
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -463,6 +521,10 @@ function CreateRoomForm({
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
+    if (rooms.length >= 100) {
+      setError('Room limit reached — leave a room before creating a new one.');
+      return;
+    }
     setBusy(true);
     setError(null);
     try {

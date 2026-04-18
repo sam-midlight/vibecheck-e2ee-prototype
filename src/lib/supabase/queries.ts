@@ -795,6 +795,40 @@ export async function listBlobs(
   return ((data ?? []) as BlobRow[]).reverse();
 }
 
+/** Fetch blobs created at or after `fromCreatedAt` (gte — handles same-ms duplicates safely). */
+export async function listBlobsAfter(
+  roomId: string,
+  fromCreatedAt: string,
+): Promise<BlobRow[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('blobs')
+    .select('*')
+    .eq('room_id', roomId)
+    .gte('created_at', fromCreatedAt)
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as BlobRow[];
+}
+
+/** Fetch blobs created before `beforeCreatedAt`, newest-first, limited to `limit`. Returns oldest → newest. */
+export async function listBlobsBefore(
+  roomId: string,
+  beforeCreatedAt: string,
+  limit = 100,
+): Promise<BlobRow[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('blobs')
+    .select('*')
+    .eq('room_id', roomId)
+    .lt('created_at', beforeCreatedAt)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return ((data ?? []) as BlobRow[]).reverse();
+}
+
 export function subscribeBlobs(
   roomId: string,
   onBlob: (row: BlobRow) => void,
@@ -1779,6 +1813,28 @@ export function subscribeRoomMetadata(
   return () => {
     void supabase.removeChannel(channel);
   };
+}
+
+// ---------------------------------------------------------------------------
+// ToS acceptances
+// ---------------------------------------------------------------------------
+
+export async function hasTosAccepted(userId: string, version: string): Promise<boolean> {
+  const supabase = getSupabase();
+  const { data } = await supabase
+    .from('tos_acceptances')
+    .select('version')
+    .eq('user_id', userId)
+    .maybeSingle<{ version: string }>();
+  return data?.version === version;
+}
+
+export async function acceptTos(userId: string, version: string): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from('tos_acceptances')
+    .upsert({ user_id: userId, version, accepted_at: new Date().toISOString() });
+  if (error) throw error;
 }
 
 export async function nukeIdentityServer(userId: string): Promise<void> {

@@ -593,16 +593,23 @@ function CallInner({ roomId }: { roomId: string }) {
     if (!device || !adapterRef.current) return;
     const callId = adapterRef.current.callId;
     try {
-      await rpcLeaveCall({ callId, deviceId: device.deviceId });
-      // Wake the next designated rotator so remaining members re-key
-      // immediately (backward secrecy). Fire-and-forget is fine; if it
-      // fails, the heartbeat-grace path (phase 7) will catch it within 30s.
-      broadcastCallSignaling(callId, {
-        type: 'member_left',
-        deviceId: device.deviceId,
-      }).catch((e) => console.warn('leave broadcast failed', errorMessage(e)));
+      const members = await listCallMembers(callId);
+      const activeOthers = filterActiveCallMembers(members).filter(
+        (m) => m.device_id !== device.deviceId,
+      );
+      if (activeOthers.length === 0) {
+        // Last person in the call — end it entirely rather than leaving a
+        // zombie call that blocks rejoining and never gets cleaned up.
+        await rpcEndCall(callId);
+      } else {
+        await rpcLeaveCall({ callId, deviceId: device.deviceId });
+        broadcastCallSignaling(callId, {
+          type: 'member_left',
+          deviceId: device.deviceId,
+        }).catch((e) => console.warn('leave broadcast failed', errorMessage(e)));
+      }
     } catch (e) {
-      console.warn('leave_call rpc failed', errorMessage(e));
+      console.warn('leave/end call rpc failed', errorMessage(e));
     }
     await teardown('local');
     // eslint-disable-next-line react-hooks/exhaustive-deps

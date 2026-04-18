@@ -38,6 +38,7 @@ import {
   revokeDevice,
   type DeviceRow,
 } from '@/lib/supabase/queries';
+import { TosModal, TOS_CURRENT_VERSION } from '@/components/TosModal';
 
 export default function SettingsPage() {
   return (
@@ -61,6 +62,8 @@ function SettingsInner() {
   const [showModal, setShowModal] = useState(false);
   const [showPinSetup, setShowPinSetup] = useState(false);
   const [showPromote, setShowPromote] = useState(false);
+  const [showRevoked, setShowRevoked] = useState(false);
+  const [showTos, setShowTos] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -241,6 +244,10 @@ function SettingsInner() {
         <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">
           Recovery phrase
         </h2>
+        <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+          If you lose access to all your devices <strong>and</strong> your 24-word recovery
+          phrase, your account cannot be recovered. You will need to create a new account.
+        </div>
         {hasPhrase === null ? (
           <p className="text-sm text-neutral-500">checking…</p>
         ) : !umk ? (
@@ -323,7 +330,7 @@ function SettingsInner() {
           <p className="text-sm text-neutral-500">(no devices yet)</p>
         ) : (
           <ul className="space-y-2">
-            {devices.map((d) => {
+            {devices.filter((d) => showRevoked || d.revoked_at_ms == null).map((d) => {
               const isSelf = device?.deviceId === d.id;
               const revoked = d.revoked_at_ms != null;
               const label =
@@ -371,6 +378,16 @@ function SettingsInner() {
               );
             })}
           </ul>
+        )}
+        {devices.some((d) => d.revoked_at_ms != null) && (
+          <button
+            onClick={() => setShowRevoked((v) => !v)}
+            className="text-[11px] text-neutral-500 underline underline-offset-2 hover:text-neutral-800 dark:hover:text-neutral-200"
+          >
+            {showRevoked
+              ? 'hide revoked devices'
+              : `show ${devices.filter((d) => d.revoked_at_ms != null).length} revoked device(s)`}
+          </button>
         )}
         {!canRevoke && (
           <p className="text-[11px] text-neutral-500">
@@ -429,6 +446,30 @@ function SettingsInner() {
         )}
       </section>
 
+      <section className="space-y-3">
+        <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">
+          Legal
+        </h2>
+        <button
+          onClick={() => setShowTos(true)}
+          className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
+        >
+          Review Terms of Service
+        </button>
+      </section>
+
+      <section className="space-y-1">
+        <h2 className="text-sm font-medium uppercase tracking-wide text-neutral-500">
+          About
+        </h2>
+        <p className="font-mono text-xs text-neutral-500">
+          v{process.env.NEXT_PUBLIC_BUILD_NUMBER ?? '0'} · {process.env.NEXT_PUBLIC_GIT_SHA ?? 'dev'}
+        </p>
+        <p className="text-[11px] text-neutral-400">
+          Build number matches the GitHub commit count. SHA links to the exact commit.
+        </p>
+      </section>
+
       {error && (
         <p className="text-sm text-red-600 dark:text-red-400">Error: {error}</p>
       )}
@@ -460,6 +501,14 @@ function SettingsInner() {
               setUsk(await getUserSigningKey(userId));
             }
           }}
+        />
+      )}
+
+      {showTos && userId && (
+        <TosModal
+          userId={userId}
+          readOnly
+          onClose={() => setShowTos(false)}
         />
       )}
 

@@ -42,9 +42,12 @@ import {
   fetchPublicDevices,
   fetchUserMasterKeyPub,
   hasRecoveryBlob,
+  hasTosAccepted,
   nukeIdentityServer,
   setDeviceDisplayNameCiphertext,
 } from '@/lib/supabase/queries';
+import { TosModal, TOS_CURRENT_VERSION } from '@/components/TosModal';
+import { wipeAppCache } from '@/lib/cache-store';
 
 type Step =
   | 'exchanging-code'
@@ -53,6 +56,7 @@ type Step =
   | 'publishing-identity'
   | 'registering-device'
   | 'offer-recovery-setup'
+  | 'require-tos'
   | 'require-pin-setup'
   | 'device-linking-chooser'
   | 'awaiting-approval'
@@ -138,11 +142,16 @@ export default function AuthCallbackPage() {
   const ranRef = useRef(false);
 
   /**
-   * Gate for the final "navigate into the app" moment. If a wrapped
-   * identity doesn't exist for this user on this device, the user must
-   * set a passphrase before proceeding (enforced default — Point 19).
+   * Gate for the final "navigate into the app" moment. Checks ToS acceptance
+   * first, then PIN setup, then navigates. Both are mandatory before entry.
    */
   async function proceedOrRequirePin(uid: string, dest: '/rooms' | '/status') {
+    const tosAccepted = await hasTosAccepted(uid, TOS_CURRENT_VERSION);
+    if (!tosAccepted) {
+      setPendingDest(dest);
+      setStep('require-tos');
+      return;
+    }
     const wrapped = await hasWrappedIdentity(uid);
     if (!wrapped) {
       setPendingDest(dest);
@@ -348,6 +357,9 @@ export default function AuthCallbackPage() {
       // brand-new identity.
       await clearWrappedIdentity(userId);
       await nukeIdentityServer(userId);
+      // Purge the local blob cache — stale ciphertext from the old identity
+      // would be unreadable by the new device keys anyway.
+      await wipeAppCache().catch(() => {});
       // Sibling tabs still holding the old identity must reload — their MSK
       // pub no longer exists on the server and any operation will fail.
       broadcastIdentityChange('identity-nuked', userId);
@@ -450,6 +462,21 @@ export default function AuthCallbackPage() {
           onError={(msg) => {
             setError(msg);
             setStep('error');
+          }}
+        />
+      )}
+
+      {step === 'require-tos' && userId && (
+        <TosModal
+          userId={userId}
+          onAccepted={async () => {
+            const wrapped = await hasWrappedIdentity(userId);
+            if (!wrapped) {
+              setStep('require-pin-setup');
+            } else {
+              setStep('done');
+              router.replace(pendingDest);
+            }
           }}
         />
       )}

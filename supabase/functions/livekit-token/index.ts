@@ -199,12 +199,16 @@ Deno.serve(async (req: Request) => {
   const expSec = nowSec + ttlSec;
 
   const header = { alg: 'HS256', typ: 'JWT' };
+  // Append the mint timestamp so each token gets a unique LiveKit participant
+  // identity even if the same device rejoins the same call within the SFU's
+  // grace window. Without this, rapid leave→rejoin fails with "already exists".
+  const sessionId = `${userId}:${deviceId}:${nowSec * 1000}`;
   const payload: JsonRecord = {
     iss: LIVEKIT_API_KEY,
-    sub: `${userId}:${deviceId}`,
+    sub: sessionId,
     nbf: nowSec,
     exp: expSec,
-    name: `${userId}:${deviceId}`,
+    name: sessionId,
     video: {
       room: `call:${callId}`,
       roomJoin: true,

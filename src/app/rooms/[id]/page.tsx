@@ -32,6 +32,16 @@ import {
 } from '@/lib/e2ee-core';
 import { ensureFreshSession } from '@/lib/bootstrap';
 import {
+  getBlobCacheForRoom,
+  putBlobRows,
+  trimBlobCache,
+  removeBlobFromCache,
+  clearBlobCacheForRoom,
+  getRoomSyncCursor,
+  putRoomSyncCursor,
+  MAX_CACHE_ROWS_PER_ROOM,
+} from '@/lib/cache-store';
+import {
   decodeBlobRow,
   deleteAttachment,
   deleteBlob,
@@ -43,6 +53,8 @@ import {
   kickAndRotate,
   fetchActiveCallForRoom,
   listBlobs,
+  listBlobsAfter,
+  listBlobsBefore,
   listMyRoomKeyRows,
   listRoomMembers,
   renameRoom,
@@ -145,6 +157,8 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [staleMembership, setStaleMembership] = useState(false);
   const [leaveBusy, setLeaveBusy] = useState(false);
   const [activeCall, setActiveCall] = useState<CallRow | null>(null);
+  const [hasMoreHistory, setHasMoreHistory] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const roomKeyRef = useRef<RoomKey | null>(null);
   const roomKeysByGenRef = useRef<Map<number, RoomKey>>(new Map());
 
@@ -247,17 +261,43 @@ function RoomInner({ roomId }: { roomId: string }) {
       const mems = await listRoomMembers(roomId);
       setMembers(mems);
 
-      const rows = await listBlobs(roomId);
+      // --- Delta blob sync ---
+      // Cursor present → delta fetch (gte avoids missing same-ms rows).
+      // No cursor → first visit on this device, seed cache from server.
+      const cursor = await getRoomSyncCursor(roomId);
+      let newServerRows: BlobRow[];
+      if (cursor === null) {
+        newServerRows = await listBlobs(roomId, MAX_CACHE_ROWS_PER_ROOM);
+      } else {
+        newServerRows = await listBlobsAfter(roomId, cursor);
+      }
+
+      let trimmedIds: string[] = [];
+      if (newServerRows.length > 0) {
+        await putBlobRows(roomId, newServerRows);
+        trimmedIds = await trimBlobCache(roomId);
+        const latest = newServerRows[newServerRows.length - 1];
+        await putRoomSyncCursor(roomId, latest.created_at);
+      } else if (cursor === null) {
+        // Empty room on first visit — mark as synced so next load is a delta.
+        await putRoomSyncCursor(roomId, new Date().toISOString());
+      }
+
+      // Re-decode everything in cache. Handles: missingKey re-try after
+      // session hydration, generation changes, and first-load seeding.
+      const allCached = await getBlobCacheForRoom(roomId);
       const decoded = await Promise.all(
-        rows.map((row) => decodeAndVerify(row, byGen, uid, dev)),
+        allCached.map((r) => decodeAndVerify(r, byGen, uid, dev)),
       );
       setBlobs(decoded);
-      // Build the nickname map from the full history — the latest ts wins
-      // per sender. Nickname blobs are stored alongside messages and
-      // filtered out of the visible feed by isSystemPayload.
       let nickMap: NicknameMap = new Map();
       for (const b of decoded) nickMap = updateNicknamesFromBlob(nickMap, b);
       setNicknames(nickMap);
+
+      // Server has more history if: cache is at capacity, or trim just happened.
+      setHasMoreHistory(
+        allCached.length >= MAX_CACHE_ROWS_PER_ROOM || trimmedIds.length > 0,
+      );
     },
     [roomId],
   );
@@ -285,6 +325,30 @@ function RoomInner({ roomId }: { roomId: string }) {
     })();
   }, [loadAll]);
 
+  async function loadEarlier() {
+    if (loadingEarlier || !userId || !device) return;
+    const oldest = blobs[0]?.createdAt;
+    if (!oldest) return;
+    setLoadingEarlier(true);
+    try {
+      const rows = await listBlobsBefore(roomId, oldest, 100);
+      if (rows.length === 0) {
+        setHasMoreHistory(false);
+        return;
+      }
+      const decoded = await Promise.all(
+        rows.map((r) => decodeAndVerify(r, roomKeysByGenRef.current, userId, device)),
+      );
+      // Prepend to state — NOT written to cache (older than the cache window)
+      setBlobs((prev) => [...decoded, ...prev]);
+      if (rows.length < 100) setHasMoreHistory(false);
+    } catch (e) {
+      console.error('loadEarlier failed', errorMessage(e));
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }
+
   async function abandonStaleMembership() {
     if (!userId) return;
     setLeaveBusy(true);
@@ -299,12 +363,15 @@ function RoomInner({ roomId }: { roomId: string }) {
         .eq('room_id', roomId)
         .eq('user_id', userId);
       if (delErr) throw delErr;
+      await clearBlobCacheForRoom(roomId).catch(() => {});
       router.replace('/rooms');
     } catch (e) {
       setError(errorMessage(e));
       setLeaveBusy(false);
     }
   }
+
+  const missingKeyReloadRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const ingestBlobRow = useCallback(
     async (row: BlobRow) => {
@@ -316,8 +383,16 @@ function RoomInner({ roomId }: { roomId: string }) {
         return [...prev, decoded];
       });
       setNicknames((prev) => updateNicknamesFromBlob(prev, decoded));
+      if (decoded.missingKey) {
+        if (missingKeyReloadRef.current) clearTimeout(missingKeyReloadRef.current);
+        missingKeyReloadRef.current = setTimeout(() => void loadAll(userId, device), 1000);
+      }
+      // Write to cache and advance cursor so next delta fetch is minimal.
+      void putBlobRows(roomId, [row])
+        .then(() => putRoomSyncCursor(roomId, row.created_at))
+        .catch((err) => console.warn('cache write failed', errorMessage(err)));
     },
-    [device, userId],
+    [device, userId, loadAll, roomId],
   );
 
   useEffect(() => {
@@ -360,6 +435,16 @@ function RoomInner({ roomId }: { roomId: string }) {
       clearInterval(interval);
     };
   }, [roomId, device, userId, loadAll]);
+
+  // Re-sync when tab becomes visible (catches missed realtime events while hidden).
+  useEffect(() => {
+    if (!device || !userId) return;
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void loadAll(userId, device);
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [device, userId, loadAll]);
 
   // Live-call indicator: subscribe to `calls` for this room + seed the
   // current state on mount. Drives the call button's "live" badge.
@@ -489,6 +574,7 @@ function RoomInner({ roomId }: { roomId: string }) {
                 }
                 try {
                   await deleteRoom(roomId);
+                  await clearBlobCacheForRoom(roomId).catch(() => {});
                   router.replace('/rooms');
                 } catch (e) {
                   setError(errorMessage(e));
@@ -524,7 +610,10 @@ function RoomInner({ roomId }: { roomId: string }) {
         roomKey={roomKey}
         nicknames={nicknames}
         onChange={() => void loadAll(userId, device)}
-        onLeft={() => router.replace('/rooms')}
+        onLeft={async () => {
+          await clearBlobCacheForRoom(roomId).catch(() => {});
+          router.replace('/rooms');
+        }}
         onSendNickname={async (name) => {
           const blob = await megolmEncrypt({
             payload: { type: 'nickname', name, ts: Date.now() } satisfies NicknamePayload,
@@ -563,6 +652,18 @@ function RoomInner({ roomId }: { roomId: string }) {
           For pair rooms, the per-room members-cap trigger from 0007 rejects
           a 3rd distinct user at DB level. */}
 
+      {hasMoreHistory && (
+        <div className="flex justify-center">
+          <button
+            onClick={() => void loadEarlier()}
+            disabled={loadingEarlier}
+            className="rounded border border-neutral-300 px-3 py-1.5 text-xs text-neutral-600 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-400"
+          >
+            {loadingEarlier ? 'loading…' : 'load earlier messages'}
+          </button>
+        </div>
+      )}
+
       <BlobFeed
         blobs={blobs}
         selfUserId={userId}
@@ -576,6 +677,7 @@ function RoomInner({ roomId }: { roomId: string }) {
           }
           await deleteBlob(blobId);
           setBlobs((prev) => prev.filter((b) => b.id !== blobId));
+          await removeBlobFromCache(roomId, blobId).catch(() => {});
         }}
       />
 
