@@ -8,6 +8,22 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
+### 2026-04-19 — Fix: restore creator arm in room_members_insert
+
+**Migration to apply:** `0039_restore_creator_arm_room_members_insert.sql`
+
+**Root cause:** Migration 0038 dropped the `created_by = auth.uid()` arm from `room_members_insert` on the grounds that `kick_and_rotate` (SECURITY DEFINER) handles all post-creation membership inserts. That reasoning is correct for rotations but misses the initial room-creation path: `createRoom → wrapRoomKeyForAllMyDevices → addRoomMember` is a direct client-side insert. For a brand-new room the caller has no outstanding invite and is not yet a current-gen member, so both 0038 arms fail. `wrapRoomKeyForAllMyDevices` catches the RLS error per-device and warns without re-throwing, so the caller receives an in-memory `RoomKey` with no corresponding `room_members` row. Any subsequent blob insert then fails (42501) because `blobs_member_insert` checks `room_members` for the user at that generation.
+
+**What changed:**
+
+- **Migration 0039** adds arm *(c)* back to `room_members_insert`: `created_by = auth.uid()` on the parent room. This is safe because `kick_and_rotate` is creator-only — a creator can never be evicted by other members — so this arm does not reopen the post-eviction re-insertion hole closed by 0038. A creator who self-leaves (kick_and_rotate with themselves as evictee) retaining the ability to re-add themselves is consistent with room ownership.
+
+**V2 port actions:**
+- Apply migration 0039. Pure RLS policy replacement — no schema change, no data migration.
+- If you applied 0038 and created rooms in the gap period, those rooms have no creator `room_members` row. Delete and recreate them, or use `kick_and_rotate` (which is SECURITY DEFINER) to bootstrap a new generation with correct membership.
+
+---
+
 ### 2026-04-19 — CRITICAL: post-eviction self-re-insertion + rotator ghost-row gap
 
 **Migrations to apply:** `0038_tighten_room_members_insert_policy.sql`
@@ -107,7 +123,7 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 ### 2026-04-19 — CRITICAL: post-eviction self-re-insertion + rotator ghost-row gap
 
-See full entry at the top of this section. Migration: `0038_tighten_room_members_insert_policy.sql`.
+See full entry at the top of this section. Migrations: `0038_tighten_room_members_insert_policy.sql` then `0039_restore_creator_arm_room_members_insert.sql`.
 
 ---
 
