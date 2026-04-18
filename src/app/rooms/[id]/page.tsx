@@ -67,6 +67,7 @@ import {
   insertKeyForwardRequest,
   listMyPendingKeyForwardRequests,
   subscribeMegolmShares,
+  subscribeKeyForwardRequests,
   uploadAttachment,
   type BlobRow,
   type CallRow,
@@ -553,6 +554,15 @@ function RoomInner({ roomId }: { roomId: string }) {
       void loadAll(userId, device);
     });
   }, [device, userId, loadAll]);
+
+  // When a sibling device (e.g. laptop) posts a key forward request, respond
+  // immediately rather than waiting for the next loadAll tick.
+  useEffect(() => {
+    if (!device || !userId) return;
+    return subscribeKeyForwardRequests(userId, () => {
+      void respondToKeyForwardRequests(userId, device).catch(() => {});
+    });
+  }, [device, userId]);
 
   // Live-call indicator: subscribe to `calls` for this room + seed the
   // current state on mount. Drives the call button's "live" badge.
