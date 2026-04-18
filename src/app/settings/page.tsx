@@ -483,10 +483,10 @@ function SettingsInner() {
           About
         </h2>
         <p className="font-mono text-xs text-neutral-500">
-          v{process.env.NEXT_PUBLIC_BUILD_NUMBER ?? '0'} · {process.env.NEXT_PUBLIC_GIT_SHA ?? 'dev'}
+          {process.env.NEXT_PUBLIC_BUILD_TIME ?? '--/-- --:--'} · #{process.env.NEXT_PUBLIC_BUILD_NUMBER ?? '0'}
         </p>
         <p className="text-[11px] text-neutral-400">
-          Build number matches the GitHub commit count. SHA links to the exact commit.
+          Build time is UTC+10. # is the GitHub commit count.
         </p>
       </section>
 

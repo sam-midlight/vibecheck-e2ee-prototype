@@ -15,12 +15,23 @@ function getGitVersion(): { buildNumber: string; gitSha: string } {
   }
 }
 
+function getBuildTime(): string {
+  // UTC+10 (AEST, no DST adjustment)
+  const now = new Date(Date.now() + 10 * 60 * 60 * 1000);
+  const dd = String(now.getUTCDate()).padStart(2, "0");
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const hh = String(now.getUTCHours()).padStart(2, "0");
+  const min = String(now.getUTCMinutes()).padStart(2, "0");
+  return `${dd}/${mm} ${hh}:${min}`;
+}
+
 const { buildNumber, gitSha } = getGitVersion();
 
 const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_BUILD_NUMBER: buildNumber,
     NEXT_PUBLIC_GIT_SHA: gitSha,
+    NEXT_PUBLIC_BUILD_TIME: getBuildTime(),
   },
 };
 
