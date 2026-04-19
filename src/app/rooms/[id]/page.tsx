@@ -1,6 +1,7 @@
 'use client';
 
 import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { useRouter } from 'next/navigation';
 import { AppShell } from '@/components/AppShell';
 import { errorMessage } from '@/lib/errors';
@@ -11,6 +12,7 @@ import {
   decryptImageAttachment,
   decryptRoomName,
   deriveMessageKeyAtIndex,
+  deriveMessageKeyAtIndexAndAdvance,
   encryptBlobV4,
   encryptRoomName,
   fromBase64,
@@ -190,9 +192,23 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [devMode] = useDevMode();
   const roomKeyRef = useRef<RoomKey | null>(null);
   const roomKeysByGenRef = useRef<Map<number, RoomKey>>(new Map());
+  const isLoadingRef = useRef(false);
+  const pendingRef = useRef(false);
+  const loadAllRef = useRef<(uid: string, dev: DeviceKeyBundle) => Promise<void>>(async () => {});
+
+  // Stable Map reference for BlobFeed — only a new object when the generation
+  // set actually changes, not on every loadAll that recreates the Map.
+  const genKey = useMemo(
+    () => [...roomKeysByGen.keys()].sort((a, b) => a - b).join(','),
+    [roomKeysByGen],
+  );
+  const stableRoomKeysByGen = useMemo(() => roomKeysByGen, [genKey]);
 
   const loadAll = useCallback(
     async (uid: string, dev: DeviceKeyBundle) => {
+      if (isLoadingRef.current) { pendingRef.current = true; return; }
+      isLoadingRef.current = true;
+      try {
       const supabase = getSupabase();
 
       // Batch 1: all independent network fetches in parallel.
@@ -302,7 +318,7 @@ function RoomInner({ roomId }: { roomId: string }) {
           }
         })(),
         cursor === null
-          ? listBlobs(roomId, MAX_CACHE_ROWS_PER_ROOM)
+          ? listBlobs(roomId, 50)
           : listBlobsAfter(roomId, cursor),
       ]);
       dbgBackupRestored = backupResult.restored;
@@ -360,9 +376,8 @@ function RoomInner({ roomId }: { roomId: string }) {
       // Re-decode everything in cache. Handles: missingKey re-try after
       // session hydration, generation changes, and first-load seeding.
       const allCached = await getBlobCacheForRoom(roomId);
-      const decoded = await Promise.all(
-        allCached.map((r) => decodeAndVerify(r, byGen, uid, dev)),
-      );
+      const decoded: DecodedBlob[] = [];
+      for (const r of allCached) decoded.push(await decodeAndVerify(r, byGen, uid, dev));
       setBlobs(decoded);
       let nickMap: NicknameMap = new Map();
       for (const b of decoded) nickMap = updateNicknamesFromBlob(nickMap, b);
@@ -435,9 +450,18 @@ function RoomInner({ roomId }: { roomId: string }) {
         pendingForwardRequests,
         blobErrors,
       });
+    } finally {
+      isLoadingRef.current = false;
+      if (pendingRef.current) {
+        pendingRef.current = false;
+        void loadAllRef.current(uid, dev);
+      }
+    }
     },
     [roomId],
   );
+
+  useEffect(() => { loadAllRef.current = loadAll; }, [loadAll]);
 
   useEffect(() => {
     (async () => {
@@ -473,11 +497,13 @@ function RoomInner({ roomId }: { roomId: string }) {
         setHasMoreHistory(false);
         return;
       }
-      const decoded = await Promise.all(
-        rows.map((r) => decodeAndVerify(r, roomKeysByGenRef.current, userId, device)),
-      );
+      const decoded: DecodedBlob[] = [];
+      for (const r of rows) decoded.push(await decodeAndVerify(r, roomKeysByGenRef.current, userId, device));
       // Prepend to state — NOT written to cache (older than the cache window)
-      setBlobs((prev) => [...decoded, ...prev]);
+      setBlobs((prev) => {
+        const combined = [...decoded, ...prev];
+        return combined.length > 300 ? combined.slice(0, 300) : combined;
+      });
       if (rows.length < 100) setHasMoreHistory(false);
     } catch (e) {
       console.error('loadEarlier failed', errorMessage(e));
@@ -808,24 +834,15 @@ function RoomInner({ roomId }: { roomId: string }) {
           For pair rooms, the per-room members-cap trigger from 0007 rejects
           a 3rd distinct user at DB level. */}
 
-      {hasMoreHistory && (
-        <div className="flex justify-center">
-          <button
-            onClick={() => void loadEarlier()}
-            disabled={loadingEarlier}
-            className="rounded border border-neutral-300 px-3 py-1.5 text-xs text-neutral-600 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-400"
-          >
-            {loadingEarlier ? 'loading…' : 'load earlier messages'}
-          </button>
-        </div>
-      )}
-
       <BlobFeed
         blobs={blobs}
         selfUserId={userId}
         roomId={roomId}
-        roomKeysByGen={roomKeysByGen}
+        roomKeysByGen={stableRoomKeysByGen}
         nicknames={nicknames}
+        hasMoreHistory={hasMoreHistory}
+        loadingEarlier={loadingEarlier}
+        onLoadEarlier={() => void loadEarlier()}
         onDelete={async (blobId, hasImage) => {
           if (!confirm('Delete this message?')) return;
           if (hasImage) {
@@ -1037,8 +1054,9 @@ async function resolveMegolmMessageKey(
   try {
     const snapshot = await getInboundSession(sessionIdB64, senderDeviceId);
     if (snapshot && messageIndex >= snapshot.startIndex) {
-      const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
-      return mk.key;
+      const { messageKey, nextSnapshot } = await deriveMessageKeyAtIndexAndAdvance(snapshot, messageIndex);
+      void putInboundSession(sessionIdB64, senderDeviceId, nextSnapshot).catch(() => {});
+      return messageKey.key;
     }
   } catch {
     // fall through
@@ -1060,8 +1078,9 @@ async function resolveMegolmMessageKey(
     );
     await putInboundSession(sessionIdB64, senderDeviceId, snapshot);
     if (messageIndex >= snapshot.startIndex) {
-      const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
-      return mk.key;
+      const { messageKey, nextSnapshot } = await deriveMessageKeyAtIndexAndAdvance(snapshot, messageIndex);
+      void putInboundSession(sessionIdB64, senderDeviceId, nextSnapshot).catch(() => {});
+      return messageKey.key;
     }
   } catch {
     // share not found or unseal failed — missingKeyReloadRef handles retry
@@ -1724,6 +1743,9 @@ function BlobFeed({
   roomKeysByGen,
   nicknames,
   onDelete,
+  onLoadEarlier,
+  loadingEarlier,
+  hasMoreHistory,
 }: {
   blobs: DecodedBlob[];
   selfUserId: string;
@@ -1731,15 +1753,18 @@ function BlobFeed({
   roomKeysByGen: Map<number, RoomKey>;
   nicknames: NicknameMap;
   onDelete: (blobId: string, hasImage: boolean) => Promise<void>;
+  onLoadEarlier: () => void;
+  loadingEarlier: boolean;
+  hasMoreHistory: boolean;
 }) {
   const [showSystem, setShowSystem] = useState(false);
+  const parentRef = useRef<HTMLDivElement>(null);
+  const prevLengthRef = useRef(0);
+
   const sorted = useMemo(
     () => [...blobs].sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
     [blobs],
   );
-  // Always drop rows this device can't decrypt (wrong generation). They're
-  // from periods you weren't a member of the room; surfacing them just adds
-  // noise and confuses returning members who were re-invited after a kick.
   const decryptable = useMemo(() => sorted.filter((b) => !b.missingKey), [sorted]);
   const visible = useMemo(
     () =>
@@ -1749,6 +1774,45 @@ function BlobFeed({
     [decryptable, showSystem],
   );
   const hiddenCount = decryptable.length - visible.length;
+
+  const virtualizer = useVirtualizer({
+    count: visible.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 72,
+    overscan: 8,
+    measureElement:
+      typeof window !== 'undefined' && navigator.userAgent.indexOf('Firefox') === -1
+        ? (el) => el?.getBoundingClientRect().height
+        : undefined,
+  });
+
+  // Scroll to bottom when new messages are appended at the live end.
+  useEffect(() => {
+    if (visible.length > prevLengthRef.current && prevLengthRef.current > 0) {
+      virtualizer.scrollToIndex(visible.length - 1, { behavior: 'smooth' });
+    }
+    prevLengthRef.current = visible.length;
+  }, [visible.length, virtualizer]);
+
+  // Scroll to bottom on first load.
+  useEffect(() => {
+    if (visible.length > 0) {
+      virtualizer.scrollToIndex(visible.length - 1, { behavior: 'auto' });
+    }
+    // Only on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Trigger earlier-message load when scrolled near the top.
+  useEffect(() => {
+    const el = parentRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      if (el.scrollTop < 120 && hasMoreHistory && !loadingEarlier) onLoadEarlier();
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [hasMoreHistory, loadingEarlier, onLoadEarlier]);
 
   return (
     <section className="rounded border border-neutral-200 p-3 dark:border-neutral-800">
@@ -1771,52 +1835,73 @@ function BlobFeed({
           </button>
         )}
       </div>
+      {loadingEarlier && (
+        <p className="mb-2 text-center text-xs text-neutral-500">loading earlier…</p>
+      )}
       {visible.length === 0 && (
         <p className="text-sm text-neutral-500">no messages yet</p>
       )}
-      <ul className="space-y-2">
-        {visible.map((b) => {
-          const selfBubble =
-            b.senderId === selfUserId
-              ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900'
-              : 'bg-neutral-100 dark:bg-neutral-900';
-          const imageHeader = b.verified ? asImagePayload(b.payload) : null;
-          return (
-            <li key={b.id} className={`group relative rounded px-3 py-2 text-sm ${selfBubble}`}>
-              <div className="mb-1 flex items-center justify-between gap-2 text-[10px] uppercase tracking-wide opacity-70">
-                <span>
-                  {displayNameFor(b.senderId, selfUserId, nicknames)}
-                  {b.verified ? ' · ✓ signed' : ' · ✗ invalid'}
-                </span>
-                <span>{new Date(b.createdAt).toLocaleTimeString()}</span>
+      {/* Virtualised scroll container — fixed height, dynamic rows */}
+      <div ref={parentRef} className="h-[480px] overflow-y-auto">
+        <div style={{ height: `${virtualizer.getTotalSize()}px`, position: 'relative' }}>
+          {virtualizer.getVirtualItems().map((item) => {
+            const b = visible[item.index];
+            const selfBubble =
+              b.senderId === selfUserId
+                ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900'
+                : 'bg-neutral-100 dark:bg-neutral-900';
+            const imageHeader = b.verified ? asImagePayload(b.payload) : null;
+            return (
+              <div
+                key={b.id}
+                data-index={item.index}
+                ref={virtualizer.measureElement}
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  transform: `translateY(${item.start}px)`,
+                  paddingBottom: '8px',
+                }}
+              >
+                <div className={`group relative rounded px-3 py-2 text-sm ${selfBubble}`}>
+                  <div className="mb-1 flex items-center justify-between gap-2 text-[10px] uppercase tracking-wide opacity-70">
+                    <span>
+                      {displayNameFor(b.senderId, selfUserId, nicknames)}
+                      {b.verified ? ' · ✓ signed' : ' · ✗ invalid'}
+                    </span>
+                    <span>{new Date(b.createdAt).toLocaleTimeString()}</span>
+                  </div>
+                  {b.senderId === selfUserId && b.verified && (
+                    <button
+                      onClick={() => void onDelete(b.id, !!imageHeader)}
+                      className="absolute right-2 top-2 rounded bg-red-600/80 px-1.5 py-0.5 text-[10px] text-white opacity-0 transition group-hover:opacity-100"
+                    >
+                      delete
+                    </button>
+                  )}
+                  {!b.verified ? (
+                    <p className="text-xs text-red-500">error: {b.error}</p>
+                  ) : imageHeader ? (
+                    <ImageAttachment
+                      roomId={roomId}
+                      blobId={b.id}
+                      generation={b.generation}
+                      header={imageHeader}
+                      roomKeysByGen={roomKeysByGen}
+                    />
+                  ) : (
+                    <pre className="whitespace-pre-wrap break-words font-mono text-xs">
+                      {safeStringify(b.payload)}
+                    </pre>
+                  )}
+                </div>
               </div>
-              {b.senderId === selfUserId && b.verified && (
-                <button
-                  onClick={() => void onDelete(b.id, !!imageHeader)}
-                  className="absolute right-2 top-2 rounded bg-red-600/80 px-1.5 py-0.5 text-[10px] text-white opacity-0 transition group-hover:opacity-100"
-                >
-                  delete
-                </button>
-              )}
-              {!b.verified ? (
-                <p className="text-xs text-red-500">error: {b.error}</p>
-              ) : imageHeader ? (
-                <ImageAttachment
-                  roomId={roomId}
-                  blobId={b.id}
-                  generation={b.generation}
-                  header={imageHeader}
-                  roomKeysByGen={roomKeysByGen}
-                />
-              ) : (
-                <pre className="whitespace-pre-wrap break-words font-mono text-xs">
-                  {safeStringify(b.payload)}
-                </pre>
-              )}
-            </li>
-          );
-        })}
-      </ul>
+            );
+          })}
+        </div>
+      </div>
     </section>
   );
 }

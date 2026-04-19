@@ -13,6 +13,7 @@
   "dependencies": {
     "@scure/bip39": "^2.0.1",
     "@supabase/supabase-js": "^2.103.0",
+    "@tanstack/react-virtual": "^3.13.24",
     "idb": "^8.0.3",
     "libsodium-wrappers-sumo": "^0.8.3",
     "livekit-client": "^2.18.3",

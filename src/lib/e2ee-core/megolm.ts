@@ -185,6 +185,38 @@ export async function deriveMessageKeyAtIndex(
   return { key, index: targetIndex };
 }
 
+/**
+ * Like deriveMessageKeyAtIndex but also returns the session snapshot advanced
+ * to targetIndex+1. Callers persist nextSnapshot so subsequent decrypts start
+ * from the advanced cursor rather than re-ratcheting from startIndex (O(1) vs O(n)).
+ */
+export async function deriveMessageKeyAtIndexAndAdvance(
+  snapshot: InboundSessionSnapshot,
+  targetIndex: number,
+): Promise<{ messageKey: MegolmMessageKey; nextSnapshot: InboundSessionSnapshot }> {
+  if (targetIndex < snapshot.startIndex) {
+    throw new CryptoError(
+      `cannot derive key at index ${targetIndex} — snapshot starts at ${snapshot.startIndex}`,
+      'BAD_GENERATION',
+    );
+  }
+  const sodium = await getSodium();
+  let chain: Uint8Array = new Uint8Array(snapshot.chainKeyAtIndex);
+  for (let i = snapshot.startIndex; i < targetIndex; i++) {
+    const next = new Uint8Array(await advanceChainKey(chain));
+    sodium.memzero(chain);
+    chain = next;
+  }
+  // chain is at targetIndex — derive message key, then advance one more step
+  const key = await deriveMessageKey(chain);
+  const nextChain = new Uint8Array(await advanceChainKey(chain));
+  sodium.memzero(chain);
+  return {
+    messageKey: { key, index: targetIndex },
+    nextSnapshot: { ...snapshot, chainKeyAtIndex: nextChain, startIndex: targetIndex + 1 },
+  };
+}
+
 /** Check whether an outbound session should be rotated (Phase 4 trigger). */
 export function shouldRotateSession(
   session: OutboundMegolmSession,

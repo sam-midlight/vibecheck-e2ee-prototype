@@ -8,6 +8,44 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
+### 2026-04-19 — PERF: loadAll serialization, O(1) ratchet cursor, stable Map prop, virtualised timeline
+
+**No migrations required.** Pure JS/React changes; safe to apply to any existing deployment.
+
+**Background — three architectural bottlenecks closed:**
+
+1. **`loadAll` concurrent invocations** — five async sources (RT metadata subscription, 30 s poll, `visibilitychange`, Megolm shares subscription, missing-key debounce) could fire `loadAll` simultaneously, racing on `setBlobs` / `setRoomKeysByGen`. Fixed with a serialization guard: a second caller while a load is in flight sets a pending flag; after the first finishes it re-runs exactly once.
+
+2. **O(n²) Megolm ratchet loop** — `resolveMegolmMessageKey` called `deriveMessageKeyAtIndex` and discarded the intermediate chain state. On the next `loadAll` the same IDB snapshot was read with `startIndex=0`, re-running the full ratchet loop for every message. For a 500-message session: ~125 000 WASM HMAC calls per page load. Fixed by adding `deriveMessageKeyAtIndexAndAdvance` to `megolm.ts` — derives the message key and returns the session snapshot advanced to `targetIndex+1` in one pass. The resolver writes the advanced snapshot to IDB so subsequent decrypts start at the current index (O(1) per already-seen message). The `Promise.all(allCached.map(...))` batch in `loadAll` and `loadEarlier` is replaced with sequential iteration to eliminate the IDB cursor race that parallel writes created.
+
+3. **Spurious BlobFeed re-renders and unbounded DOM** — `setRoomKeysByGen(new Map(byGen))` produced a new Map object on every `loadAll`, triggering a full BlobFeed reconcile even when no generation changed. BlobFeed also rendered all messages as a flat DOM list with no virtualisation. Fixed with: (a) a `stableRoomKeysByGen` memo keyed on the sorted generation list, (b) `@tanstack/react-virtual` virtualised scroll container — only visible rows are in the DOM, (c) initial load capped at 50 messages (was 500), (d) `loadEarlier` trims the in-memory list at 300 total to bound memory, (e) scroll-to-top replaces the manual "load earlier" button.
+
+**Files changed:**
+
+- `src/lib/e2ee-core/megolm.ts` — new export `deriveMessageKeyAtIndexAndAdvance`
+- `src/app/rooms/[id]/page.tsx` — all five fixes above
+- `package.json` / `package-lock.json` — added `@tanstack/react-virtual`
+
+**Matrix alignment notes:**
+
+- Ratchet cursor persistence matches libolm / vodozemac: the stored inbound session reflects the highest-decrypted index, not the original snapshot start index. Recipients that join mid-session receive a snapshot at the current index; earlier messages remain undecryptable (forward secrecy by design).
+- Sequential decode (no `Promise.all`) mirrors Element Web's serial event-queue processing. Eliminates a class of IDB write races without sacrificing throughput — with O(1) ratchet, per-message cost is one IDB read + one HMAC + one ChaCha20 decrypt.
+- Virtualised windowed timeline matches the Matrix "windowed timeline" concept: a fixed live window with backwards pagination that evicts from the live end when the prepend buffer exceeds 300 rows.
+- Plaintext is never persisted (neither in IDB nor in the blob cache). Ciphertext-only invariant preserved.
+
+**V2 porting notes:**
+
+- Copy the updated `megolm.ts` in full — `deriveMessageKeyAtIndexAndAdvance` is a new public API.
+- `BlobFeed` now requires three additional props: `onLoadEarlier: () => void`, `loadingEarlier: boolean`, `hasMoreHistory: boolean`. If you rewrite the message-feed UI, replicate the scroll-trigger pattern and the 300-row trim in `loadEarlier`.
+- The 50-message initial load and 300-row memory cap are conservative for the current prototype scale. Tune via the literal constants in `loadAll` (`listBlobs(roomId, 50)`) and `loadEarlier` (`combined.length > 300`) — larger values are safe; smaller values increase pagination frequency.
+- `@tanstack/react-virtual` is now a required dependency. Pin to the same minor version to avoid virtualiser API drift.
+
+**Delta sync documentation update** (supersedes the note in §14):
+- First visit: `listBlobs(roomId, 50)` — was 500. Cursor is set after the 50-row seed; subsequent `loadAll` calls fetch only new rows via `listBlobsAfter`.
+- `loadEarlier` still fetches 100 rows at a time from the server via `listBlobsBefore`, but now trims the in-memory list to 300 rather than growing without bound.
+
+---
+
 ### 2026-04-19 — SECURITY: ghost-membership via mismatched device_id/user_id in kick_and_rotate
 
 **Migration to apply:** `0040_kick_rotate_device_ownership_check.sql`
@@ -595,9 +633,9 @@ In-memory React state
 ```
 
 **Delta sync pattern** (implemented in `src/app/rooms/[id]/page.tsx` `loadAll`):
-- No cursor → first visit → `listBlobs(roomId, 500)` → seed cache → set cursor to latest `created_at`
+- No cursor → first visit → `listBlobs(roomId, 50)` → seed cache → set cursor to latest `created_at`
 - Cursor present → `listBlobsAfter(roomId, cursor)` → merge new rows → advance cursor
-- After delta: re-decode all cached rows to handle missingKey re-tries and generation changes
+- After delta: re-decode cached rows sequentially (not `Promise.all`) to avoid IDB ratchet-cursor races
 
 **Realtime path** (`ingestBlobRow`): each arriving blob is also written to cache and advances the cursor so the next delta fetch is minimal.
 
