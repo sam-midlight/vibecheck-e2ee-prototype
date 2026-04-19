@@ -399,8 +399,9 @@ function runTest(testFile: string): { exitCode: number; output: string } {
       cwd: ROOT,
       timeout: 120_000,
       shell: true,
+      encoding: 'utf8',
     });
-    return { exitCode: 0, output: out.toString().trim() };
+    return { exitCode: 0, output: out.trim() };
   } catch (e: any) {
     const output = [e.stdout?.toString(), e.stderr?.toString()]
       .filter(Boolean).join('\n').trim();
