@@ -162,6 +162,8 @@ export function exportSessionSnapshot(
  * The snapshot must have startIndex <= targetIndex. Returns a new
  * MegolmMessageKey.
  */
+const yieldToMain = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+
 export async function deriveMessageKeyAtIndex(
   snapshot: InboundSessionSnapshot,
   targetIndex: number,
@@ -176,6 +178,9 @@ export async function deriveMessageKeyAtIndex(
   // Advance chain key from startIndex to targetIndex
   let chain: Uint8Array = new Uint8Array(snapshot.chainKeyAtIndex);
   for (let i = snapshot.startIndex; i < targetIndex; i++) {
+    if ((i - snapshot.startIndex) % 25 === 24) {
+      await yieldToMain();
+    }
     const next = new Uint8Array(await advanceChainKey(chain));
     sodium.memzero(chain);
     chain = next;
@@ -203,6 +208,9 @@ export async function deriveMessageKeyAtIndexAndAdvance(
   const sodium = await getSodium();
   let chain: Uint8Array = new Uint8Array(snapshot.chainKeyAtIndex);
   for (let i = snapshot.startIndex; i < targetIndex; i++) {
+    if ((i - snapshot.startIndex) % 25 === 24) {
+      await yieldToMain();
+    }
     const next = new Uint8Array(await advanceChainKey(chain));
     sodium.memzero(chain);
     chain = next;
