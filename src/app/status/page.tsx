@@ -84,7 +84,7 @@ void verifyDeviceIssuance;
 const CHECK_NAMES = [
   'Sodium (libsodium WASM) ready',
   'Identity keys present in IndexedDB',
-  'Published Ed25519 pubkey matches local',
+  'Published Ed25519 pubkey verified',
   'Self-signature on published identity is valid',
   'Encrypt + decrypt roundtrip (local, in-memory)',
   'Test room exists in Supabase',
@@ -94,7 +94,7 @@ const CHECK_NAMES = [
   'Tamper detection (AEAD rejects modified ciphertext)',
   'Devices linked to this account',
   'Approval code hash round-trip',
-  'Recovery phrase wrap + unwrap (local)',
+  'Recovery phrase wrap + unwrap',
   'Image attachment roundtrip (encrypt → upload → download → decrypt)',
   'Multi-device room key wrap + unwrap',
   'Call envelope sign + wrap + verify + unwrap roundtrip',
@@ -161,12 +161,13 @@ export default function StatusPage() {
     const runStep = async <T,>(
       name: CheckName,
       fn: () => Promise<{ detail?: string; result?: T }>,
+      timeoutMs = 15_000,
     ): Promise<T | undefined> => {
       setCheck(name, { status: 'running' });
       const t0 = performance.now();
-      // Per-check 15s cap so one hanging probe doesn't freeze the whole page.
+      // Per-check cap so one hanging probe doesn't freeze the whole page.
       const timeout = new Promise<{ detail?: string; result?: T }>((_, reject) =>
-        setTimeout(() => reject(new Error('check timed out after 15s')), 15_000),
+        setTimeout(() => reject(new Error(`check timed out after ${timeoutMs / 1000}s`)), timeoutMs),
       );
       try {
         const { detail, result } = await Promise.race([fn(), timeout]);
@@ -332,10 +333,11 @@ export default function StatusPage() {
         };
         // Free-tier Supabase realtime tenants cold-start: the first SUBSCRIBE
         // after an idle period regularly takes 8–14 seconds to handshake.
-        // Give it 30 so a cold probe doesn't flash red on first page load.
+        // 25s here — fires before runStep's 30s outer cap — so unsubscribe()
+        // is called on the way out rather than leaking the channel.
         const timer = setTimeout(() => {
-          finish(() => reject(new Error('realtime subscription timeout (30s)')));
-        }, 30000);
+          finish(() => reject(new Error('realtime subscription timeout (25s)')));
+        }, 25_000);
         const start = performance.now();
         let inserted = false;
         const insertOnce = async () => {
@@ -387,7 +389,7 @@ export default function StatusPage() {
       });
       const rtMs = await seen;
       return { detail: `echoed back in ${rtMs}ms` };
-    });
+    }, 30_000);
 
     // -----------------------------------------------------------------------
     // Check 8: Ciphertext opacity (no plaintext leaks to DB)
@@ -423,19 +425,13 @@ export default function StatusPage() {
     // Check 9: Tamper detection (AEAD rejects modified ciphertext)
     // -----------------------------------------------------------------------
     await runStep(CHECK_NAMES[9], async () => {
-      const row = ctx.lastBlobRow!;
-      const cipher = await fromBase64(row.ciphertext);
-      const tampered = new Uint8Array(cipher);
+      const decoded = await decodeBlobRow(ctx.lastBlobRow!);
+      const tampered = new Uint8Array(decoded.ciphertext);
       tampered[0] = tampered[0] ^ 0x01;
-      const blob = {
-        nonce: await fromBase64(row.nonce),
-        ciphertext: tampered,
-        signature: row.signature ? await fromBase64(row.signature) : new Uint8Array(0),
-        generation: row.generation,
-      };
+      const tamperedBlob = { ...decoded, ciphertext: tampered };
       try {
         await decryptBlob({
-          blob,
+          blob: tamperedBlob,
           roomId: ctx.roomId!,
           roomKey: ctx.roomKey!,
           resolveSenderDeviceEd25519Pub: async (_uid, did) =>
