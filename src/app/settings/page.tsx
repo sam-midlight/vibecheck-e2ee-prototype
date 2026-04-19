@@ -511,11 +511,15 @@ function SettingsInner() {
           onDone={async (result) => {
             setShowPromote(false);
             if (result === 'promoted') {
-              const { getUserMasterKey, getSelfSigningKey, getUserSigningKey } =
-                await import('@/lib/e2ee-core');
-              setUmk(await getUserMasterKey(userId));
-              setSsk(await getSelfSigningKey(userId));
-              setUsk(await getUserSigningKey(userId));
+              try {
+                const { getUserMasterKey, getSelfSigningKey, getUserSigningKey } =
+                  await import('@/lib/e2ee-core');
+                setUmk(await getUserMasterKey(userId));
+                setSsk(await getSelfSigningKey(userId));
+                setUsk(await getUserSigningKey(userId));
+              } catch (e) {
+                setError(errorMessage(e));
+              }
             }
           }}
         />
@@ -539,15 +543,19 @@ function SettingsInner() {
           onDone={async (result) => {
             setShowModal(false);
             if (result === 'saved') {
-              setHasPhrase(true);
-              // The rotation swapped the locally-held keys; pick up the new ones.
-              const { getUserMasterKey, getSelfSigningKey, getUserSigningKey } =
-                await import('@/lib/e2ee-core');
-              setUmk(await getUserMasterKey(userId));
-              setSsk(await getSelfSigningKey(userId));
-              setUsk(await getUserSigningKey(userId));
-              if (typeof window !== 'undefined') {
-                localStorage.removeItem(`recovery_skipped_${userId}`);
+              try {
+                setHasPhrase(true);
+                // The rotation swapped the locally-held keys; pick up the new ones.
+                const { getUserMasterKey, getSelfSigningKey, getUserSigningKey } =
+                  await import('@/lib/e2ee-core');
+                setUmk(await getUserMasterKey(userId));
+                setSsk(await getSelfSigningKey(userId));
+                setUsk(await getUserSigningKey(userId));
+                if (typeof window !== 'undefined') {
+                  localStorage.removeItem(`recovery_skipped_${userId}`);
+                }
+              } catch (e) {
+                setError(errorMessage(e));
               }
             }
           }}

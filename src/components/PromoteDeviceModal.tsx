@@ -49,7 +49,7 @@ interface Props {
   userId: string;
   /** If true, we also need the PIN passphrase to re-wrap the local blob. */
   pinEnabled: boolean;
-  onDone: (result: 'promoted' | 'cancelled') => void;
+  onDone: (result: 'promoted' | 'cancelled') => void | Promise<void>;
 }
 
 export function PromoteDeviceModal({ userId, pinEnabled, onDone }: Props) {
@@ -155,7 +155,7 @@ export function PromoteDeviceModal({ userId, pinEnabled, onDone }: Props) {
         await putWrappedIdentity(userId, rewrapped);
       }
 
-      onDone('promoted');
+      await onDone('promoted');
     } catch (err) {
       setError(errorMessage(err));
     } finally {

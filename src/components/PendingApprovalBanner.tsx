@@ -140,11 +140,12 @@ function ApprovalCard({
   onResolved: () => void;
 }) {
   const [code, setCode] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [approveBusy, setApproveBusy] = useState(false);
+  const [dismissBusy, setDismissBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function approve() {
-    setBusy(true);
+    setApproveBusy(true);
     setError(null);
     try {
       if (!/^[0-9]{6}$/.test(code)) {
@@ -271,19 +272,20 @@ function ApprovalCard({
     } catch (err) {
       setError(errorMessage(err));
     } finally {
-      setBusy(false);
+      setApproveBusy(false);
     }
   }
 
   async function dismiss() {
-    setBusy(true);
+    setDismissBusy(true);
     try {
       await deleteApprovalRequest(request.id);
       onResolved();
     } catch (err) {
       console.error('dismiss approval failed:', errorMessage(err));
+      setError(errorMessage(err));
     } finally {
-      setBusy(false);
+      setDismissBusy(false);
     }
   }
 
@@ -308,14 +310,14 @@ function ApprovalCard({
         />
         <button
           onClick={() => void approve()}
-          disabled={busy || code.length !== 6}
+          disabled={approveBusy || code.length !== 6}
           className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
         >
-          {busy ? 'working…' : 'approve'}
+          {approveBusy ? 'working…' : 'approve'}
         </button>
         <button
           onClick={() => void dismiss()}
-          disabled={busy}
+          disabled={dismissBusy}
           className="rounded border border-neutral-300 px-2 py-1 text-xs dark:border-neutral-700"
         >
           dismiss

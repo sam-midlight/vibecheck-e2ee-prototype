@@ -11,7 +11,7 @@
  * (store a localStorage flag like `recovery_skip_<userId>` if you want).
  */
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { errorMessage } from '@/lib/errors';
 import {
   decryptDeviceDisplayName,
@@ -52,7 +52,7 @@ interface PickerEntry {
 interface Props {
   userId: string;
   umk: UserMasterKey;
-  onDone: (result: 'saved' | 'skipped') => void;
+  onDone: (result: 'saved' | 'skipped') => void | Promise<void>;
   /** If true, no "skip" button — used when rotating (must commit or cancel the rotate). */
   hideSkip?: boolean;
   /**
@@ -76,7 +76,8 @@ type Stage =
   | 'verify'
   | 'loading-picker'
   | 'device-picker'
-  | 'uploading'
+  | 'uploading-pre-commit'
+  | 'uploading-post-commit'
   | 'error';
 
 export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, device }: Props) {
@@ -87,6 +88,7 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
   // when we're rotating AND the user has 2+ active devices. The user must
   // confirm which devices to keep before the new SSK re-issues their certs.
   const [pickerEntries, setPickerEntries] = useState<PickerEntry[] | null>(null);
+  const cancelledRef = useRef(false);
 
   function handleStart() {
     setPhrase(generateRecoveryPhrase());
@@ -101,11 +103,13 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
    */
   async function handleVerified() {
     if (!phrase) return;
+    cancelledRef.current = false;
     setError(null);
     if (rotate && device) {
       setStage('loading-picker');
       try {
         const publishedOld = await fetchUserMasterKeyPub(userId);
+        if (cancelledRef.current) return;
         if (!publishedOld) throw new Error('no published UMK — nothing to rotate');
         let oldSskPub: Uint8Array | undefined;
         if (publishedOld.sskPub && publishedOld.sskCrossSignature) {
@@ -125,6 +129,7 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
           umk.ed25519PublicKey,
           oldSskPub,
         );
+        if (cancelledRef.current) return;
         // Fast-path: only the current device is active → nothing to pick.
         if (active.length <= 1) {
           await performCommit([]);
@@ -135,6 +140,7 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
         // only OUR row yields a plaintext name; peer rows render as
         // fingerprint + createdAt instead.
         const rows = await listDeviceRows(userId);
+        if (cancelledRef.current) return;
         const rowsById = new Map(rows.map((r) => [r.id, r]));
         const entries: PickerEntry[] = [];
         for (const pub of active) {
@@ -168,7 +174,7 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
 
   async function performCommit(devicesToRevoke: string[]) {
     if (!phrase) return;
-    setStage('uploading');
+    setStage('uploading-pre-commit');
     setError(null);
     try {
       // SSSS ordering (Matrix-style): escrow the new keys in the
@@ -215,6 +221,7 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
 
       // Step 3: COMMIT POINT — upload recovery blob.
       await putRecoveryBlob({ userId, ...encoded });
+      setStage('uploading-post-commit');
 
       if (rotate && rotated) {
         // Step 4: save to local IDB.
@@ -265,7 +272,7 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
           }
         }
       }
-      onDone('saved');
+      await onDone('saved');
     } catch (e) {
       setError(errorMessage(e));
       setStage('error');
@@ -293,7 +300,15 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
           />
         )}
         {stage === 'loading-picker' && (
-          <p className="text-sm">Loading devices…</p>
+          <div className="space-y-3">
+            <p className="text-sm">Loading devices…</p>
+            <button
+              onClick={() => { cancelledRef.current = true; onDone('skipped'); }}
+              className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
+            >
+              cancel
+            </button>
+          </div>
         )}
         {stage === 'device-picker' && pickerEntries && device && (
           <DevicePicker
@@ -303,8 +318,19 @@ export function RecoveryPhraseModal({ userId, umk, onDone, hideSkip, rotate, dev
             onConfirm={(toRevoke) => void performCommit(toRevoke)}
           />
         )}
-        {stage === 'uploading' && (
-          <p className="text-sm">Encrypting and uploading recovery blob…</p>
+        {stage === 'uploading-pre-commit' && (
+          <div className="space-y-3">
+            <p className="text-sm">Encrypting and uploading recovery blob…</p>
+            <button
+              onClick={() => onDone('skipped')}
+              className="rounded border border-neutral-300 px-3 py-1.5 text-xs dark:border-neutral-700"
+            >
+              cancel
+            </button>
+          </div>
+        )}
+        {stage === 'uploading-post-commit' && (
+          <p className="text-sm">Almost done…</p>
         )}
         {stage === 'error' && (
           <div className="space-y-3">

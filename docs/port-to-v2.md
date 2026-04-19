@@ -8,6 +8,33 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
+### 2026-04-19 — Fix: UX blockers in device approval, revocation, and recovery-phrase flows
+
+**No migrations required.** Pure React/UI changes; safe to apply to any existing deployment.
+
+**Five hard blockers closed:**
+
+1. **`RecoveryPhraseModal` — `loading-picker` stage had no escape.** When rotation found ≥2 active devices, the modal entered a "Loading devices…" state with no cancel button. A hanging Supabase call would trap the user in the full-screen modal indefinitely. Fixed by adding a `cancelledRef` (via `useRef`) that is checked after each `await` in `handleVerified`. Clicking cancel sets the ref and calls `onDone('skipped')`, causing any in-flight async to short-circuit on its next checkpoint.
+
+2. **`RecoveryPhraseModal` — `uploading` stage had no escape.** Argon2id wrapping + Supabase writes ran behind a single "Encrypting and uploading…" screen with no cancel. Split `'uploading'` into two sub-stages: `'uploading-pre-commit'` (before `putRecoveryBlob`) shows a cancel button; `'uploading-post-commit'` (after) shows "Almost done…" with no cancel — the blob is already written and cancelling would leave a half-committed rotation. The pre-commit cancel is safe: no data has been published yet.
+
+3. **`PendingApprovalBanner` — `approve()` network hang permanently disabled dismiss.** A single shared `busy` state gated both the approve and dismiss buttons, so a hanging `registerDevice` call left `dismiss` disabled with no escape short of a page refresh. Split into `approveBusy` and `dismissBusy` so the dismiss button stays live while approval is in-flight. If the user dismisses mid-approve, the approval row is deleted and the in-flight approve op eventually fails cleanly.
+
+4. **`PendingApprovalBanner` — `dismiss()` silently swallowed errors.** The catch block only called `console.error`; no error was surfaced to the user. Added `setError(errorMessage(err))` so a failed dismiss shows the same inline error `<p>` already used for approve failures.
+
+5. **`settings/page.tsx` — `onDone` async callbacks were not awaited.** Both `RecoveryPhraseModal.onDone` and `PromoteDeviceModal.onDone` were declared `async` in the settings page but called without `await` from inside the modals (`onDone('saved')` / `onDone('promoted')`). If the subsequent IDB reads (`getUserMasterKey` etc.) threw, the rejection was unhandled and the page's `umk`/`ssk`/`usk` state silently stayed stale — causing revoke buttons to vanish after a rotation, or `canRevoke` to stay false after a promote. Fixed by: (a) widening the `onDone` prop types to `void | Promise<void>`, (b) adding `await` at the call sites inside the modals (both already inside `try/catch`), (c) wrapping the settings-page callback bodies in `try/catch { setError(...) }` with the `setShowModal(false)` call placed before the `try` so the modal always closes even on failure.
+
+**V2 porting notes:**
+
+- No new files or contracts. All changes are scoped to the four files listed below.
+- If you copied `RecoveryPhraseModal` into V2 already: apply the `useRef` import, `cancelledRef`, stage-split, and abort-guard changes. The `Stage` union type change (`'uploading'` → `'uploading-pre-commit'` | `'uploading-post-commit'`) is a compile-time break — TypeScript will surface any switch/conditional that references the old `'uploading'` literal.
+- If you copied `PendingApprovalBanner` into V2 already: rename `busy`/`setBusy` to the two separate state pairs; update the three JSX `disabled` / label references accordingly.
+- If you copied the `onDone` pattern from settings into a consuming app: widen the prop type and add `await` + `try/catch` as described in blocker 5.
+
+**Files changed:** `src/app/settings/page.tsx`, `src/components/RecoveryPhraseModal.tsx`, `src/components/PendingApprovalBanner.tsx`, `src/components/PromoteDeviceModal.tsx`
+
+---
+
 ### 2026-04-19 — Refactor: backoff + mutex extracted; /status overhaul (26 checks)
 
 **No migrations required.** Pure JS/React changes; safe to apply to any existing deployment.
