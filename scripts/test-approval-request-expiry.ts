@@ -61,7 +61,13 @@ async function run() {
     );
 
     if (result === true) {
-      throw new Error('Vulnerability: verify_approval_code returned true for expired request');
+      throw new Error(
+        'verify_approval_code returned true for a row whose expires_at was 1s in the local past. ' +
+          'On first fail, check local clock vs Supabase clock — the test sets expires_at ' +
+          'from local Date.now(), so if your machine is >1s ahead of the DB the row still ' +
+          'looks fresh to Postgres and the RPC correctly returns true. ' +
+          'Resync (`w32tm /resync` on Windows) and re-run before treating this as a vulnerability.',
+      );
     }
 
     // -- Row should be deleted ------------------------------------------------
