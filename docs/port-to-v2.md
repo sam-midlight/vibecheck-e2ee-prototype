@@ -451,7 +451,7 @@ Copy these things verbatim:
 - `src/components/PinSetupModal.tsx` — shared mandatory-capable passphrase setup modal. Used by auth callback (enforced default) and settings (change passphrase).
 - `src/components/RecoveryPhraseModal.tsx` and `RecoveryPhraseEntry.tsx` — phrase setup/rotation and recovery UX. Both know about the UMK rotation cascade.
 - `src/components/PendingApprovalBanner.tsx` — A-side of device approval; uses UMK priv to sign issuance certs for B-side requests.
-- `src/components/AppShell.tsx` — wraps all authed pages with the post-mount UMK-vs-device-cert sanity check that boots orphaned sessions.
+- `src/components/AppShell.tsx` — wraps all authed pages with the post-mount UMK-vs-device-cert sanity check that boots orphaned sessions. **Also enforces the PIN-mandatory invariant**: if the cert chain is valid but no `wrappedIdentity` blob exists, the shell redirects to `/auth/callback` rather than rendering. Without this, a user who URL-bar-navigates to `/rooms` between bootstrap/recovery/approval and the PIN-setup modal lands in the app with plaintext keys in IDB and no passphrase ever set. The client-side step machine inside the callback page cannot prevent this on its own — the shell is the chokepoint every authed route passes through. Any consuming app must keep this check.
 
 **⚠ TEMP dev shortcut to revert before real-audience deploy:**
 - `src/app/api/dev/magic-link/route.ts` — unguarded endpoint that generates magic-link URLs server-side using the Supabase service-role key. Any caller can mint a link for any email. Delete the file AND revert `src/components/MagicLinkForm.tsx` to call `supabase.auth.signInWithOtp(...)` instead of the fetch.

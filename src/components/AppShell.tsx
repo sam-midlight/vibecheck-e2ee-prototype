@@ -125,6 +125,18 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
         await bootOut(data.user.id);
         return;
       }
+      // Chain is valid and plaintext is in IDB — but if no wrapped blob exists,
+      // the user is mid-bootstrap / mid-recovery / mid-approval and has not
+      // completed the mandatory PIN setup. Bounce back to /auth/callback so
+      // proceedOrRequirePin surfaces the require-pin-setup modal. Without this
+      // gate, typing /rooms in the URL bar during that window renders the app
+      // with plaintext keys and no passphrase ever set (the bypass the React
+      // step machine inside the callback page cannot prevent on its own).
+      const hasPin = await hasWrappedIdentity(data.user.id).catch(() => false);
+      if (!hasPin) {
+        router.replace('/auth/callback');
+        return;
+      }
       // Subscribe to sibling-tab identity changes. A rotation / revocation /
       // nuke in another tab leaves this tab's in-memory state stale; reload
       // is the cleanest recovery because it re-reads from IDB (which the
