@@ -346,6 +346,69 @@ const MUTATIONS: Mutation[] = [
     kills: ['test-cert-chain-verification.ts'],
     survives: ['test-usk-cross-sign.ts'],
   },
+
+  // ── M13 ────────────────────────────────────────────────────────────────────
+  {
+    id: 'M13',
+    description: 'AppShell mandatory-PIN guard removed entirely',
+    steps: [{
+      file: 'src/components/AppShell.tsx',
+      find:
+`      const hasPin = await hasWrappedIdentity(data.user.id).catch(() => false);
+      if (!hasPin) {
+        router.replace('/auth/callback');
+        return;
+      }`,
+      replace: `      /* M13: AppShell mandatory-PIN guard removed */`,
+    }],
+    kills: ['test-appshell-pin-gate.ts'],
+    survives: ['test-happy-path.ts'],
+  },
+
+  // ── M14 ────────────────────────────────────────────────────────────────────
+  {
+    id: 'M14',
+    description: 'AppShell renders before PIN guard (guard moved after setChecking)',
+    steps: [{
+      file: 'src/components/AppShell.tsx',
+      find:
+`      const hasPin = await hasWrappedIdentity(data.user.id).catch(() => false);
+      if (!hasPin) {
+        router.replace('/auth/callback');
+        return;
+      }`,
+      replace:
+`      setChecking(false); /* M14: renders before PIN guard — plaintext visible for one frame */
+      const hasPin = await hasWrappedIdentity(data.user.id).catch(() => false);
+      if (!hasPin) {
+        router.replace('/auth/callback');
+        return;
+      }`,
+    }],
+    kills: ['test-appshell-pin-gate.ts'],
+    survives: ['test-happy-path.ts'],
+  },
+
+  // ── M15 ────────────────────────────────────────────────────────────────────
+  {
+    id: 'M15',
+    description: 'AppShell PIN-guard redirect target changed to /rooms (bypass)',
+    steps: [{
+      file: 'src/components/AppShell.tsx',
+      find:
+`      if (!hasPin) {
+        router.replace('/auth/callback');
+        return;
+      }`,
+      replace:
+`      if (!hasPin) {
+        router.replace('/rooms'); /* M15: redirect target changed — bypass */
+        return;
+      }`,
+    }],
+    kills: ['test-appshell-pin-gate.ts'],
+    survives: ['test-happy-path.ts'],
+  },
 ];
 
 // ---------------------------------------------------------------------------

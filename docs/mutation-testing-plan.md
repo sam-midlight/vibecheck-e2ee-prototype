@@ -448,6 +448,88 @@ export async function verifyCrossSigningChain(params: {
 
 ---
 
+### M13 — AppShell mandatory-PIN guard removed
+
+**File:** `src/components/AppShell.tsx`
+
+**Find:**
+```tsx
+      const hasPin = await hasWrappedIdentity(data.user.id).catch(() => false);
+      if (!hasPin) {
+        router.replace('/auth/callback');
+        return;
+      }
+```
+
+**Replace:**
+```tsx
+      /* M13: AppShell mandatory-PIN guard removed */
+```
+
+**Must kill:**
+- `test-appshell-pin-gate.ts` — T67: structural assertion "`hasWrappedIdentity` called on success path" fails when the entire block is deleted.
+
+**Survives:** `test-happy-path.ts` (crypto-path tests don't depend on UI routing).
+
+---
+
+### M14 — AppShell renders before PIN guard
+
+**File:** `src/components/AppShell.tsx`
+
+**Find:**
+```tsx
+      const hasPin = await hasWrappedIdentity(data.user.id).catch(() => false);
+      if (!hasPin) {
+        router.replace('/auth/callback');
+        return;
+      }
+```
+
+**Replace:**
+```tsx
+      setChecking(false); /* M14: renders before PIN guard — plaintext visible for one frame */
+      const hasPin = await hasWrappedIdentity(data.user.id).catch(() => false);
+      if (!hasPin) {
+        router.replace('/auth/callback');
+        return;
+      }
+```
+
+**Must kill:**
+- `test-appshell-pin-gate.ts` — T67: the structural test's "success branch" slice ends at the first `setChecking(false)`; moving the guard after it places the call outside the slice, failing the "hasWrappedIdentity called on success path" assertion.
+
+**Survives:** `test-happy-path.ts`.
+
+---
+
+### M15 — AppShell PIN-guard redirect target changed
+
+**File:** `src/components/AppShell.tsx`
+
+**Find:**
+```tsx
+      if (!hasPin) {
+        router.replace('/auth/callback');
+        return;
+      }
+```
+
+**Replace:**
+```tsx
+      if (!hasPin) {
+        router.replace('/rooms'); /* M15: redirect target changed — bypass */
+        return;
+      }
+```
+
+**Must kill:**
+- `test-appshell-pin-gate.ts` — T67: assertion "router.replace('/auth/callback') called in success branch" fails when the target string is anything other than `/auth/callback`.
+
+**Survives:** `test-happy-path.ts`.
+
+---
+
 ## Coverage Summary
 
 | Mutation | Security property killed | Tests caught |
@@ -464,8 +546,11 @@ export async function verifyCrossSigningChain(params: {
 | M10 | Short PINs are rejected | T43 (BAD_INPUT assert) |
 | M11 | PIN lock is userId-bound (AD) | T43 (wrong-userId assert) |
 | M12 | MSK → SSK/USK cross-sig chain is verified | T44 (chain assert) |
+| M13 | AppShell enforces mandatory-PIN guard (guard removed) | T67 |
+| M14 | AppShell guard runs before `setChecking(false)` (guard moved after) | T67 |
+| M15 | AppShell PIN-guard redirect target is `/auth/callback` (target changed to `/rooms`) | T67 |
 
-**12 mutations covering 14 distinct tests.**
+**15 mutations total** — 12 cryptographic (M01–M12) plus 3 source-structural (M13–M15) covering the AppShell mandatory-PIN guard.
 
 ---
 

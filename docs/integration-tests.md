@@ -106,6 +106,16 @@ Each test is self-contained: it creates its own users, runs assertions, then del
 
 ---
 
+## Stage 5 — Source-structural Invariants (T67+)
+
+Tests in this stage assert properties over the source text itself, not runtime behaviour. They cover invariants that live in React/UI code where a full browser test (jsdom/Playwright) would be out of proportion with the regression shape. Each test is paired with mutations in `run-mutations.ts` that exercise the realistic regression cases.
+
+| # | File | What it covers |
+|---|------|----------------|
+| T67 | test-appshell-pin-gate.ts | `AppShell` enforces the mandatory-PIN invariant: after the chain check passes, `hasWrappedIdentity` must be called on the success path, the falsy result must redirect to `/auth/callback` and `return`, and the guard must precede `setChecking(false)`. Paired with M13 (guard removed), M14 (guard after setChecking), M15 (wrong redirect target). Runs offline — no Supabase creds needed. |
+
+---
+
 ## Notes
 
 **Why no Jest/Mocha?** These tests hit a live Supabase instance to exercise RLS policies, RPCs, and row-level constraints. A mock layer would miss the class of bugs these tests are designed to catch.
