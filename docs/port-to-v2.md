@@ -8,6 +8,36 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
+### 2026-04-19 — PERF: plaintext cache, ratchet cursor safety, exponential backoff
+
+**No migrations required.** Pure JS/React changes; safe to apply to any existing deployment.
+
+**Background — three architectural bottlenecks closed:**
+
+1. **O(n) full cache re-decode on every `loadAll`** — every triggered load (30 s poll, `visibilitychange`, metadata event, Megolm share event) re-ran `decodeAndVerify` across all 500 cached blobs regardless of whether they had already been decrypted. Added a module-level `plaintextCache: Map<string, DecodedBlob>` keyed by blob ID. `loadAll` checks the cache first; only new blobs or previously-failed ones (`missingKey: true`) go through crypto. Verified results are written back. `onDelete` evicts the entry. Reduces per-poll crypto work from O(cache_size) to O(new_or_failed_blobs).
+
+2. **IDB cursor advancement during batch re-decodes** — `resolveMegolmMessageKey` called `deriveMessageKeyAtIndexAndAdvance` unconditionally, writing the advanced cursor to IDB after every decode pass. On the next `loadAll` call, cached v4 messages with `messageIndex < new cursor` failed the IDB guard and fell through to a live `fetchMegolmShareForSession` server round trip — one per unique session per poll cycle. Fixed by adding a `readOnly` parameter to `resolveMegolmMessageKey` and `decodeAndVerify`. Batch re-decode paths (`loadAll` allCached loop, `loadEarlier`) pass `readOnly = true` and use `deriveMessageKeyAtIndex` (non-mutating). Cursor advancement via `deriveMessageKeyAtIndexAndAdvance` + `putInboundSession` is now strictly reserved for `ingestBlobRow` (the live realtime path).
+
+3. **Missing-key retry feedback loop** — when a realtime blob arrived with `missingKey: true`, `ingestBlobRow` armed a flat 1000 ms timer that fired `loadAll`. Each new message before the key arrived reset the timer, and once `loadAll` ran it posted key-forward requests and exited — but the next incoming blob restarted the cycle, keeping `loadAll` running back-to-back in active rooms. Replaced with exponential backoff: `min(500ms × 2^retryCount, 5000ms)`. Counter increments on each missing-key blob, resets to 0 on a successful decode in `ingestBlobRow` (non-missing wave) and when `subscribeMegolmShares` fires (key arrived). Once key-forward requests are posted, no further retries are scheduled from `loadAll` — the `subscribeMegolmShares` subscription is the authoritative trigger for re-decode after a key arrives.
+
+**Files changed:**
+
+- `src/app/rooms/[id]/page.tsx` — all three fixes above
+
+**Matrix alignment notes:**
+
+- `readOnly` decode matches libolm / vodozemac's distinction between "batch decrypt for history replay" (no state mutation) and "live decrypt" (advance ratchet state). Batch replay must not mutate state so that the live cursor remains correct and the same session can be re-decoded without server round trips.
+- `plaintextCache` is intentionally module-level (not `useRef`) so it survives room navigation within the same tab session. Orphaned entries for deleted blobs waste a bounded amount of memory (UUIDs not reused); `onDelete` evicts proactively. Plaintext is in JS heap only — not persisted to IDB or cache-store — preserving the ciphertext-only persistence invariant.
+- Exponential backoff with a 5 s cap and subscription-driven reset matches Signal's key-request retry semantics: don't spam the server, but recover promptly when the responder replies.
+
+**V2 porting notes:**
+
+- `plaintextCache` is module-level in `page.tsx`. If you split the room page into sub-modules, promote it to the module that owns `decodeAndVerify`.
+- Pass `readOnly = true` to any `decodeAndVerify` call that is re-processing previously-seen blobs. Pass `readOnly = false` (or omit, it's the default) only for fresh realtime blobs where ratchet advance is correct.
+- The `missingKeyRetryCountRef` resets are load-bearing: without the reset in `subscribeMegolmShares`, a room that receives one wave of missing-key blobs and then recovers will take up to 5 s to retry for the next unrelated missing-key event.
+
+---
+
 ### 2026-04-19 — PERF: loadAll serialization, O(1) ratchet cursor, stable Map prop, virtualised timeline
 
 **No migrations required.** Pure JS/React changes; safe to apply to any existing deployment.

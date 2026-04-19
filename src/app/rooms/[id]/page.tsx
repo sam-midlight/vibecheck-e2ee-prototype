@@ -195,6 +195,7 @@ function RoomInner({ roomId }: { roomId: string }) {
   const isLoadingRef = useRef(false);
   const pendingRef = useRef(false);
   const loadAllRef = useRef<(uid: string, dev: DeviceKeyBundle) => Promise<void>>(async () => {});
+  const missingKeyRetryCountRef = useRef(0);
 
   // Stable Map reference for BlobFeed — only a new object when the generation
   // set actually changes, not on every loadAll that recreates the Map.
@@ -375,9 +376,23 @@ function RoomInner({ roomId }: { roomId: string }) {
 
       // Re-decode everything in cache. Handles: missingKey re-try after
       // session hydration, generation changes, and first-load seeding.
+      // plaintextCache short-circuits crypto for blobs already verified,
+      // keeping repeated loadAll calls O(new/failed blobs) not O(cache_size).
+      // readOnly=true prevents the inbound Megolm cursor from advancing
+      // during batch re-decodes — cursor advancement is reserved for the
+      // live-ingest path in ingestBlobRow.
       const allCached = await getBlobCacheForRoom(roomId);
       const decoded: DecodedBlob[] = [];
-      for (const r of allCached) decoded.push(await decodeAndVerify(r, byGen, uid, dev));
+      for (const r of allCached) {
+        const hit = plaintextCache.get(r.id);
+        if (hit && hit.generation === r.generation) {
+          decoded.push(hit);
+          continue;
+        }
+        const result = await decodeAndVerify(r, byGen, uid, dev, true);
+        if (result.verified && !result.missingKey) plaintextCache.set(r.id, result);
+        decoded.push(result);
+      }
       setBlobs(decoded);
       let nickMap: NicknameMap = new Map();
       for (const b of decoded) nickMap = updateNicknamesFromBlob(nickMap, b);
@@ -498,7 +513,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         return;
       }
       const decoded: DecodedBlob[] = [];
-      for (const r of rows) decoded.push(await decodeAndVerify(r, roomKeysByGenRef.current, userId, device));
+      for (const r of rows) decoded.push(await decodeAndVerify(r, roomKeysByGenRef.current, userId, device, true));
       // Prepend to state — NOT written to cache (older than the cache window)
       setBlobs((prev) => {
         const combined = [...decoded, ...prev];
@@ -540,7 +555,13 @@ function RoomInner({ roomId }: { roomId: string }) {
     async (row: BlobRow) => {
       const byGen = roomKeysByGenRef.current;
       if (byGen.size === 0 || !device || !userId) return;
-      const decoded = await decodeAndVerify(row, byGen, userId, device);
+      // readOnly=false: this is a live realtime blob — advance the IDB cursor
+      // so subsequent decodes for this session start from the next index.
+      const decoded = await decodeAndVerify(row, byGen, userId, device, false);
+      if (decoded.verified && !decoded.missingKey) {
+        plaintextCache.set(decoded.id, decoded);
+        missingKeyRetryCountRef.current = 0;
+      }
       setBlobs((prev) => {
         if (prev.some((b) => b.id === decoded.id)) return prev;
         return [...prev, decoded];
@@ -548,7 +569,12 @@ function RoomInner({ roomId }: { roomId: string }) {
       setNicknames((prev) => updateNicknamesFromBlob(prev, decoded));
       if (decoded.missingKey) {
         if (missingKeyReloadRef.current) clearTimeout(missingKeyReloadRef.current);
-        missingKeyReloadRef.current = setTimeout(() => void loadAll(userId, device), 1000);
+        const delay = Math.min(500 * Math.pow(2, missingKeyRetryCountRef.current), 5000);
+        missingKeyRetryCountRef.current += 1;
+        missingKeyReloadRef.current = setTimeout(() => {
+          missingKeyReloadRef.current = null;
+          void loadAll(userId, device);
+        }, delay);
       }
       // Write to cache and advance cursor so next delta fetch is minimal.
       void putBlobRows(roomId, [row])
@@ -615,6 +641,9 @@ function RoomInner({ roomId }: { roomId: string }) {
   useEffect(() => {
     if (!device || !userId) return;
     return subscribeMegolmShares(device.deviceId, () => {
+      // Key share arrived — the backoff wave is over; reset so the next
+      // unrelated missing-key event starts from the minimum delay again.
+      missingKeyRetryCountRef.current = 0;
       void loadAll(userId, device);
     });
   }, [device, userId, loadAll]);
@@ -849,6 +878,7 @@ function RoomInner({ roomId }: { roomId: string }) {
             await deleteAttachment({ roomId, blobId }).catch(() => {});
           }
           await deleteBlob(blobId);
+          plaintextCache.delete(blobId);
           setBlobs((prev) => prev.filter((b) => b.id !== blobId));
           await removeBlobFromCache(roomId, blobId).catch(() => {});
         }}
@@ -982,6 +1012,14 @@ function DebugPanel({
  * user's UMK once per session; revoked/unverifiable devices are skipped.
  */
 const deviceKeyCache: Map<string, Uint8Array | null> = new Map();
+
+/**
+ * Module-level plaintext cache keyed by blob ID.
+ * Only verified, non-missingKey entries are stored. loadAll skips
+ * decodeAndVerify for blobs already present, reducing per-poll crypto
+ * work from O(cache_size) to O(new_or_previously_failed_blobs).
+ */
+const plaintextCache = new Map<string, DecodedBlob>();
 function cacheKey(userId: string, deviceId: string) {
   return `${userId}:${deviceId}`;
 }
@@ -1047,6 +1085,7 @@ async function resolveMegolmMessageKey(
   messageIndex: number,
   senderDeviceId: string,
   device: DeviceKeyBundle,
+  readOnly = false,
 ): Promise<Uint8Array | null> {
   if (!senderDeviceId) return null;
 
@@ -1054,6 +1093,12 @@ async function resolveMegolmMessageKey(
   try {
     const snapshot = await getInboundSession(sessionIdB64, senderDeviceId);
     if (snapshot && messageIndex >= snapshot.startIndex) {
+      if (readOnly) {
+        // Batch re-decode path — derive without advancing the cursor so
+        // subsequent loadAll calls can still hit this IDB entry.
+        const msgKey = await deriveMessageKeyAtIndex(snapshot, messageIndex);
+        return msgKey.key;
+      }
       const { messageKey, nextSnapshot } = await deriveMessageKeyAtIndexAndAdvance(snapshot, messageIndex);
       void putInboundSession(sessionIdB64, senderDeviceId, nextSnapshot).catch(() => {});
       return messageKey.key;
@@ -1076,8 +1121,13 @@ async function resolveMegolmMessageKey(
       device.x25519PublicKey,
       device.x25519PrivateKey,
     );
+    // Cache the original snapshot so the IDB fast path hits next time.
     await putInboundSession(sessionIdB64, senderDeviceId, snapshot);
     if (messageIndex >= snapshot.startIndex) {
+      if (readOnly) {
+        const msgKey = await deriveMessageKeyAtIndex(snapshot, messageIndex);
+        return msgKey.key;
+      }
       const { messageKey, nextSnapshot } = await deriveMessageKeyAtIndexAndAdvance(snapshot, messageIndex);
       void putInboundSession(sessionIdB64, senderDeviceId, nextSnapshot).catch(() => {});
       return messageKey.key;
@@ -1132,6 +1182,7 @@ async function decodeAndVerify(
   roomKeysByGen: Map<number, RoomKey>,
   viewerUserId: string,
   device?: DeviceKeyBundle | null,
+  readOnly = false,
 ): Promise<DecodedBlob> {
   void viewerUserId;
   try {
@@ -1146,7 +1197,7 @@ async function decodeAndVerify(
           roomKey: { key: new Uint8Array(0), generation: blob.generation }, // unused for v4
           resolveSenderDeviceEd25519Pub: resolveSenderDeviceEd,
           resolveMegolmKey: (sid, mi) =>
-            resolveMegolmMessageKey(sid, mi, row.sender_device_id ?? '', device),
+            resolveMegolmMessageKey(sid, mi, row.sender_device_id ?? '', device, readOnly),
         });
         return {
           id: row.id,
