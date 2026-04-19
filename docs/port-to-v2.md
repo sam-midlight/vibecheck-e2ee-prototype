@@ -139,6 +139,51 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 ---
 
+### 2026-04-20 — SECURITY: ghost call-member via start_call / rotate_call_key
+
+**Migration to apply:** `0041_call_rpc_ownership_check.sql`
+**Edge function to redeploy:** `supabase/functions/livekit-token/`
+
+**Root cause:** `start_call` and `rotate_call_key` both consumed `p_envelopes` and inserted `call_members` rows via `ON CONFLICT ... DO UPDATE SET left_at = NULL` without validating:
+
+1. that `target_device_id` is owned by `target_user_id` (same class of bug `0040` fixed for `kick_and_rotate`), and
+2. that `target_user_id` is a current-generation member of the call's room.
+
+The livekit-token edge function independently gated JWT minting on `(caller owns unrevoked device) AND (call_members row exists with left_at IS NULL)`, with no room-membership check. A malicious rotator — which can be any current-gen call participant, since rotator election is client-side deterministic — could include an attacker-controlled device owned by a non-room-member user in `p_envelopes`. The RPC seated the attacker in `call_members`; the attacker's user then hit livekit-token, received a valid 5-minute SFU JWT, joined the LiveKit room, and decrypted SFrame media via the `CallKey` sealed to their own x25519 pub in `call_key_envelopes`.
+
+**What changed:**
+
+- **Migration 0041** adds two per-envelope checks inside the loops of both `start_call` and `rotate_call_key`, immediately after the null/malformed-field check:
+  ```sql
+  -- Ownership: device belongs to stated user and is not revoked.
+  if not exists (
+    select 1 from devices
+    where id = v_target_device and user_id = v_target_user and revoked_at_ms is null
+  ) then
+    raise exception 'envelope: device % does not belong to user % or is revoked', ...
+  end if;
+
+  -- Room-membership: target must be current-gen member of this call's room.
+  if not is_room_member_at(v_room_id, v_target_user, room_current_generation(v_room_id)) then
+    raise exception 'envelope: user % is not a current-gen member of room %', ...
+  end if;
+  ```
+  `rotate_call_key` additionally fetches `room_id` in the existing `SELECT ... FOR UPDATE` on `calls` so the loop has `v_room_id` available. `start_call` uses `p_room_id`.
+
+- **New helper `is_current_gen_member_of_call(p_call_id uuid, p_user_id uuid) RETURNS boolean`** (security definer, stable, granted to `authenticated`). Exposed so the edge function can do a single RPC call to verify room membership without duplicating the join in TypeScript.
+
+- **Edge function `livekit-token`** gains a defense-in-depth gate after the existing `call_members` check: `supabase.rpc('is_current_gen_member_of_call', { p_call_id, p_user_id })` must return true, else 403. Catches (a) any legacy `call_members` row that predates the RPC fix, and (b) races where a user was seated then kicked from the room before calling the edge function.
+
+**Rotation-during-kick note:** if a target user is evicted between envelope construction and RPC execution, the room-member check fails and the whole RPC aborts. Client must rebuild `p_envelopes` from fresh state and retry. Do **not** swallow the exception — that would reopen the hole for any kicked-then-re-added race.
+
+**V2 port actions:**
+- Apply migration 0041. Pure `CREATE OR REPLACE FUNCTION` plus one new helper; no schema change, no data migration.
+- Redeploy the `livekit-token` edge function after applying 0041. The function depends on `is_current_gen_member_of_call` existing; deploying the new code against a DB without the helper returns 500 on every mint. Deploy order: migration first, then function.
+- If you have a custom call-RPC implementation, add the equivalent ownership + room-member checks inside the envelope loop. Any SECURITY DEFINER RPC that seats devices in `call_members` must independently verify both — the FK on `device_id` only checks existence, not ownership, and the FK on `user_id` does not bind to `room_members`.
+- Keep `verify_jwt: false` at the gateway (documented at line 426). The function still re-verifies via `supabase.auth.getUser()` inside.
+
+---
+
 ### 2026-04-19 — SECURITY: ghost-membership via mismatched device_id/user_id in kick_and_rotate
 
 **Migration to apply:** `0040_kick_rotate_device_ownership_check.sql`
@@ -512,7 +557,7 @@ The `/status` page is more valuable in V2 than it was here — it's your canary 
 
 Add one check per E2EE-touching feature you add (e.g. "File attachments roundtrip," "Typing event AEAD roundtrip"). The principle: any code path that moves a cipher through the server should have a green dot you can look at.
 
-**Current check index (26 checks as of 2026-04-19):**
+**Current check index (27 checks as of 2026-04-20):**
 
 | # | Name | What it proves |
 |---|---|---|
@@ -542,6 +587,7 @@ Add one check per E2EE-touching feature you add (e.g. "File attachments roundtri
 | 23 | Plaintext cache timing | Map.get cache hit completes in <1ms |
 | 24 | Missing key backoff sequence | `computeBackoffDelay` sequence [500, 1k, 2k, 4k, 5k]ms |
 | 25 | Mutex concurrency drop | `createLoadMutex` acquire/release full cycle |
+| 26 | start_call ownership gate | migration 0041: forged envelope naming a non-existent device is rejected, no ghost `call_members` row persists |
 
 ## 5. Layer VibeCheck domain on top of blobs
 

@@ -108,6 +108,7 @@ const CHECK_NAMES = [
   'Plaintext cache second-pass timing',
   'Missing key backoff sequence',
   'Mutex concurrency drop (at-most-one-running + one-queued)',
+  'start_call rejects forged envelope (0041 ownership gate)',
 ] as const;
 
 type CheckName = (typeof CHECK_NAMES)[number];
@@ -1101,6 +1102,67 @@ export default function StatusPage() {
         detail:
           `5 concurrent acquires → [${results.join(', ')}] ✓ · ` +
           `release → queued runs ✓ · drain → new acquire runs ✓`,
+      };
+    });
+
+    // -----------------------------------------------------------------------
+    // Check 26: start_call rejects forged envelope (0041 ownership gate)
+    //
+    // Regression harness for migration 0041. A malicious rotator could
+    // previously seat an attacker-controlled device in `call_members` by
+    // including it in `p_envelopes`; combined with the livekit-token edge
+    // function's missing room-member check, that was a path for a
+    // non-room-member to join an E2EE call.
+    //
+    // We exercise the per-envelope ownership check by calling start_call
+    // with a fabricated target_device_id that does not exist in `devices`.
+    // The RPC must raise an exception (check_violation) and roll back the
+    // entire transaction — no `calls` row, no `call_members` row, no
+    // `call_key_envelopes` row persists. If the RPC succeeds, the 0041
+    // gate has regressed.
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[26], async () => {
+      if (!ctx.roomId || !ctx.device) {
+        throw new Error('precondition: checks 1 + 5 must have passed');
+      }
+      const supabase = getSupabase();
+      const forgedCallId = crypto.randomUUID();
+      const forgedDeviceId = crypto.randomUUID(); // never exists in `devices`
+      const envelope = {
+        target_device_id: forgedDeviceId,
+        target_user_id: userId,
+        // Non-null opaque stand-ins; the RPC never gets far enough to use them.
+        ciphertext: 'AA',
+        signature: 'AA',
+      };
+
+      const { error } = await supabase.rpc('start_call', {
+        p_call_id: forgedCallId,
+        p_room_id: ctx.roomId,
+        p_signer_device_id: ctx.device.deviceId,
+        p_envelopes: [envelope],
+      });
+
+      if (!error) {
+        throw new Error(
+          'VULNERABILITY: start_call accepted a forged envelope naming a non-existent device',
+        );
+      }
+
+      // Expect the ownership-check exception raised inside migration 0041.
+      // Postgres surfaces `RAISE EXCEPTION` as an error whose message
+      // includes the text we wrote. If the message is anything else (e.g.
+      // caller-not-member, stale-generation) the preconditions shifted and
+      // we didn't actually test the ownership gate.
+      const msg = (error.message ?? '').toLowerCase();
+      if (!/envelope:\s+device\s+.+\s+does not belong to user/.test(msg)) {
+        throw new Error(
+          `start_call rejected, but not via the ownership gate: ${error.message}`,
+        );
+      }
+
+      return {
+        detail: 'start_call rejected forged non-existent device ✓',
       };
     });
 

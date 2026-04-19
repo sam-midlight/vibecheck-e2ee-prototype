@@ -193,6 +193,26 @@ Deno.serve(async (req: Request) => {
     );
   }
 
+  // Defense-in-depth: caller must be a current-generation member of the
+  // call's room. The RPC ownership check in migration 0041 is the primary
+  // gate; this catches any legacy call_members row that predates that
+  // migration and any race where a seated user was subsequently kicked
+  // from the room before requesting a token.
+  const { data: isRoomMember, error: roomErr } = await supabase.rpc(
+    'is_current_gen_member_of_call',
+    { p_call_id: callId, p_user_id: userId },
+  );
+  if (roomErr) {
+    return jsonResponse(500, { error: 'room membership lookup failed' }, origin);
+  }
+  if (!isRoomMember) {
+    return jsonResponse(
+      403,
+      { error: 'not a current-generation member of the call\'s room' },
+      origin,
+    );
+  }
+
   // Mint LiveKit JWT.
   const nowSec = Math.floor(Date.now() / 1000);
   const ttlSec = 5 * 60; // §7.1 of the design doc

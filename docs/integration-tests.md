@@ -93,7 +93,7 @@ Each test is self-contained: it creates its own users, runs assertions, then del
 
 ---
 
-## Stage 4 — Adversarial Scenarios (T61–T66)
+## Stage 4 — Adversarial Scenarios (T61–T66, T68)
 
 | # | File | What it covers |
 |---|------|----------------|
@@ -103,6 +103,7 @@ Each test is self-contained: it creates its own users, runs assertions, then del
 | T64 | test-stampede.ts | 15 concurrent Megolm triggers coalesced by LoadMutex into 2 batch calls; all 15 messages decrypted correctly; mutex unit semantics verified |
 | T65 | test-cross-tab-race.ts | BroadcastChannel routes identity-change events to matching userId, filters mismatches, stops after close; two concurrent "tab" LoadMutex instances each independently decrypt all 10 messages |
 | T66 | test-poison-pill.ts | 7 storage-corruption scenarios (zeroed key, empty key, half-length key, cursor past target, wrong session ID, tampered sealed bytes, zero-length resolved key) all throw DECRYPT_FAILED or BAD_GENERATION; no WASM panic |
+| T68 | test-call-rpc-ownership-gate.ts | Migration 0041 gates: `start_call` rejects envelope where `device_id` is not owned by stated `user_id` (23514); both RPCs reject envelopes naming a non-room-member (42501); legitimate self-envelope still accepted; no ghost `call_members` row persists and `calls.current_generation` stays at 1 after rejected `rotate_call_key` rolls back |
 
 ---
 
