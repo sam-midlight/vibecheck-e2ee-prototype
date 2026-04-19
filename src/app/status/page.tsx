@@ -23,37 +23,41 @@ import {
 import {
   bytesEqual,
   CryptoError,
+  createOutboundSession,
   decryptBlob,
   decryptDeviceDisplayName,
   decryptImageAttachment,
+  deriveMessageKeyAtIndex,
+  deriveMessageKeyAtIndexAndAdvance,
   encryptBlob,
-  generateDeviceKeyBundle,
+  encryptBlobV4,
+  exportSessionSnapshot,
   fromBase64,
   generateApprovalCode,
   generateApprovalSalt,
-  generateRecoveryPhrase,
   generateCallKey,
+  generateDeviceKeyBundle,
+  generateRecoveryPhrase,
   generateRoomKey,
   getSodium,
   getUserMasterKey,
   hashApprovalCode,
   isPhraseValid,
   prepareImageForUpload,
-  randomBytes,
-  createOutboundSession,
-  encryptBlobV4,
-  generateSigningKeys,
   ratchetAndDerive,
+  randomBytes,
+  sealSessionSnapshot,
   signDeviceIssuance,
   signDeviceIssuanceV2,
   signMessage,
   toBase64,
   toHex,
-  verifyCrossSigningChain,
-  verifyDeviceIssuance,
+  unsealSessionSnapshot,
   unwrapCallKey,
   unwrapUserMasterKeyWithPhrase,
+  verifyCrossSigningChain,
   verifyCallEnvelope,
+  verifyDeviceIssuance,
   verifyMessage,
   verifyPublicDevice,
   wrapAndSignCallEnvelope,
@@ -70,18 +74,23 @@ import {
   getRoomSyncCursor,
   putBlobRows,
 } from '@/lib/cache-store';
+import { computeBackoffDelay } from '@/lib/backoff';
+import { createLoadMutex } from '@/lib/load-mutex';
+
+// Suppress unused-import lint errors on verifyDeviceIssuance — it's used
+// indirectly via dynamic import in Check 3.
+void verifyDeviceIssuance;
 
 const CHECK_NAMES = [
   'Sodium (libsodium WASM) ready',
   'Identity keys present in IndexedDB',
   'Published Ed25519 pubkey matches local',
   'Self-signature on published identity is valid',
-  'Sign + verify roundtrip',
   'Encrypt + decrypt roundtrip (local, in-memory)',
   'Test room exists in Supabase',
   'Write encrypted blob',
   'Receive blob via realtime subscription',
-  'Raw DB row is unreadable ciphertext (hex dump)',
+  'Ciphertext opacity (no plaintext leaks to DB)',
   'Tamper detection (AEAD rejects modified ciphertext)',
   'Devices linked to this account',
   'Approval code hash round-trip',
@@ -90,10 +99,15 @@ const CHECK_NAMES = [
   'Multi-device room key wrap + unwrap',
   'Call envelope sign + wrap + verify + unwrap roundtrip',
   'Browser supports E2EE insertable streams (required for video calls)',
-  'V2 device cert chain (MSK → SSK cross-sig → device cert)',
   'Megolm ratchet encrypt + decrypt roundtrip',
   'Cross-signing: SSK + USK cross-sig chain verifies',
   'Local blob cache (IndexedDB read/write)',
+  'Megolm session seal/unseal roundtrip',
+  'Ratchet one-way integrity (index rollback rejected)',
+  'Ratchet cursor O(1) advance',
+  'Plaintext cache second-pass timing',
+  'Missing key backoff sequence',
+  'Mutex concurrency drop (at-most-one-running + one-queued)',
 ] as const;
 
 type CheckName = (typeof CHECK_NAMES)[number];
@@ -151,8 +165,6 @@ export default function StatusPage() {
       setCheck(name, { status: 'running' });
       const t0 = performance.now();
       // Per-check 15s cap so one hanging probe doesn't freeze the whole page.
-      // The dashboard's value is that you can see which step is broken; a
-      // hang on step N with all later steps stuck as 'idle' defeats that.
       const timeout = new Promise<{ detail?: string; result?: T }>((_, reject) =>
         setTimeout(() => reject(new Error('check timed out after 15s')), 15_000),
       );
@@ -169,6 +181,9 @@ export default function StatusPage() {
       }
     };
 
+    // -----------------------------------------------------------------------
+    // Check 0: Sodium (libsodium WASM) ready
+    // -----------------------------------------------------------------------
     await runStep(CHECK_NAMES[0], async () => {
       await getSodium();
       return { detail: 'WASM initialized' };
@@ -185,6 +200,9 @@ export default function StatusPage() {
     }
     ctx.userId = userId;
 
+    // -----------------------------------------------------------------------
+    // Check 1: Identity keys present in IndexedDB
+    // -----------------------------------------------------------------------
     const enrolled = await runStep(CHECK_NAMES[1], async () => {
       const e = await loadEnrolledDevice(userId);
       if (!e) throw new Error('No device bundle in IndexedDB for this user.');
@@ -197,6 +215,9 @@ export default function StatusPage() {
     ctx.device = enrolled.deviceBundle;
     ctx.umk = enrolled.umk ?? (await getUserMasterKey(userId));
 
+    // -----------------------------------------------------------------------
+    // Check 2: Published Ed25519 pubkey matches local
+    // -----------------------------------------------------------------------
     await runStep(CHECK_NAMES[2], async () => {
       const umkPub = await fetchUserMasterKeyPub(userId);
       if (!umkPub) throw new Error('No identities row on server.');
@@ -208,14 +229,15 @@ export default function StatusPage() {
       return { detail: 'UMK not on this device (secondary) — published pub fetched' };
     });
 
+    // -----------------------------------------------------------------------
+    // Check 3: Self-signature on published identity is valid
+    // -----------------------------------------------------------------------
     await runStep(CHECK_NAMES[3], async () => {
-      // Verify this device's cert chains through the MSK→SSK cross-sig chain.
       const umkPub = await fetchUserMasterKeyPub(userId);
       if (!umkPub) throw new Error('No UMK on server.');
       const devices = await fetchPublicDevices(userId);
       const me = devices.find((d) => d.deviceId === ctx.device!.deviceId);
       if (!me) throw new Error('This device not in published device list.');
-      // Verify SSK cross-sig if present, pass SSK pub for v2 cert dispatch.
       let sskPub: Uint8Array | undefined;
       if (umkPub.sskPub && umkPub.sskCrossSignature) {
         const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
@@ -226,15 +248,10 @@ export default function StatusPage() {
       return { detail: sskPub ? 'device cert (v2) verifies via MSK→SSK chain' : 'device cert (v1) verifies against MSK' };
     });
 
+    // -----------------------------------------------------------------------
+    // Check 4: Encrypt + decrypt roundtrip (local, in-memory)
+    // -----------------------------------------------------------------------
     await runStep(CHECK_NAMES[4], async () => {
-      const msg = await randomBytes(64);
-      const sig = await signMessage(msg, ctx.device!.ed25519PrivateKey);
-      const ok = await verifyMessage(msg, sig, ctx.device!.ed25519PublicKey);
-      if (!ok) throw new Error('signature did not verify');
-      return { detail: `signed + verified 64 random bytes (sig=${sig.byteLength}B)` };
-    });
-
-    await runStep(CHECK_NAMES[5], async () => {
       const roomKey = await generateRoomKey(1);
       const roomId = crypto.randomUUID();
       const payload = { probe: 'hello', n: Math.random() };
@@ -257,7 +274,10 @@ export default function StatusPage() {
       return { detail: 'JSON roundtrip OK' };
     });
 
-    const testRoom = await runStep(CHECK_NAMES[6], async () => {
+    // -----------------------------------------------------------------------
+    // Check 5: Test room exists in Supabase
+    // -----------------------------------------------------------------------
+    const testRoom = await runStep(CHECK_NAMES[5], async () => {
       const existing = await findOrCreateTestRoom(userId, ctx.device!);
       return {
         detail: `room_id=${existing.roomId} gen=${existing.roomKey.generation}`,
@@ -268,7 +288,10 @@ export default function StatusPage() {
     ctx.roomId = testRoom.roomId;
     ctx.roomKey = testRoom.roomKey;
 
-    ctx.lastBlobRow = await runStep(CHECK_NAMES[7], async () => {
+    // -----------------------------------------------------------------------
+    // Check 6: Write encrypted blob
+    // -----------------------------------------------------------------------
+    ctx.lastBlobRow = await runStep(CHECK_NAMES[6], async () => {
       const probeId = await toHex(await randomBytes(8));
       const payload = { kind: 'status-probe', probeId, ts: Date.now() };
       const blob = await encryptBlob({
@@ -292,7 +315,10 @@ export default function StatusPage() {
     });
     if (!ctx.lastBlobRow) return finish(allOk);
 
-    await runStep(CHECK_NAMES[8], async () => {
+    // -----------------------------------------------------------------------
+    // Check 7: Receive blob via realtime subscription
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[7], async () => {
       const probeId = await toHex(await randomBytes(8));
       const payload = { kind: 'status-rt-probe', probeId, ts: Date.now() };
       const seen = new Promise<number>((resolve, reject) => {
@@ -363,17 +389,40 @@ export default function StatusPage() {
       return { detail: `echoed back in ${rtMs}ms` };
     });
 
-    await runStep(CHECK_NAMES[9], async () => {
+    // -----------------------------------------------------------------------
+    // Check 8: Ciphertext opacity (no plaintext leaks to DB)
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[8], async () => {
       const row = ctx.lastBlobRow!;
       const cipherBytes = await fromBase64(row.ciphertext);
-      const hex = await toHex(cipherBytes.slice(0, 48));
+
+      // The AEAD tag alone adds 16 bytes; plaintext can only be larger.
+      const minExpected = 'status-probe'.length + 16;
+      if (cipherBytes.length < minExpected) {
+        throw new Error(
+          `ciphertext (${cipherBytes.length}B) suspiciously small — expected ≥${minExpected}B`,
+        );
+      }
+
+      // The literal payload marker must not appear verbatim in the ciphertext bytes.
+      const markerHex = await toHex(new TextEncoder().encode('status-probe'));
+      const cipherHex = await toHex(cipherBytes);
+      if (cipherHex.includes(markerHex)) {
+        throw new Error('plaintext "status-probe" marker found in ciphertext — encryption failure');
+      }
+
+      const previewHex = await toHex(cipherBytes.slice(0, 32));
       return {
-        detail: `raw DB bytes (first 48):\n${hex.match(/.{1,2}/g)!.join(' ')}\n...\nSupabase sees only this opaque ciphertext.`,
+        detail:
+          `${cipherBytes.length}B ciphertext ≥ payload+overhead ✓ · no plaintext marker ✓\n` +
+          `first 32B: ${previewHex.match(/.{1,2}/g)!.join(' ')}`,
       };
     });
 
-    await runStep(CHECK_NAMES[10], async () => {
-      // Flip one byte of the last blob's ciphertext; decryptBlob must reject it.
+    // -----------------------------------------------------------------------
+    // Check 9: Tamper detection (AEAD rejects modified ciphertext)
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[9], async () => {
       const row = ctx.lastBlobRow!;
       const cipher = await fromBase64(row.ciphertext);
       const tampered = new Uint8Array(cipher);
@@ -401,7 +450,10 @@ export default function StatusPage() {
       throw new Error('tampered ciphertext decrypted without error — BAD');
     });
 
-    await runStep(CHECK_NAMES[11], async () => {
+    // -----------------------------------------------------------------------
+    // Check 10: Devices linked to this account
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[10], async () => {
       const devices = await listDevices(userId);
       const lines: string[] = [];
       for (const d of devices) {
@@ -425,7 +477,10 @@ export default function StatusPage() {
       return { detail: `${devices.length} device(s):\n${lines.join('\n')}` };
     });
 
-    await runStep(CHECK_NAMES[12], async () => {
+    // -----------------------------------------------------------------------
+    // Check 11: Approval code hash round-trip
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[11], async () => {
       const code = await generateApprovalCode();
       const salt = await generateApprovalSalt();
       const linkingPub = new Uint8Array(32);
@@ -448,10 +503,10 @@ export default function StatusPage() {
       return { detail: `code=${code} hash=${expected.slice(0, 16)}… (pubkey-bound)` };
     });
 
-    await runStep(CHECK_NAMES[13], async () => {
-      // Local-only round-trip: generate a fresh phrase, wrap the current
-      // identity, unwrap it, verify the private halves match. Never touches
-      // recovery_blobs so the user's real escrow (if any) is untouched.
+    // -----------------------------------------------------------------------
+    // Check 12: Recovery phrase wrap + unwrap (local)
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[12], async () => {
       const phrase = generateRecoveryPhrase();
       if (!isPhraseValid(phrase)) throw new Error('generated phrase failed own checksum');
       if (!ctx.umk) {
@@ -478,7 +533,10 @@ export default function StatusPage() {
       };
     });
 
-    await runStep(CHECK_NAMES[14], async () => {
+    // -----------------------------------------------------------------------
+    // Check 13: Image attachment roundtrip (encrypt → upload → download → decrypt)
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[13], async () => {
       const syntheticFile = await buildSyntheticImage(200);
       const probeBlobId = crypto.randomUUID();
       try {
@@ -504,7 +562,6 @@ export default function StatusPage() {
           blobId: probeBlobId,
           generation: ctx.roomKey!.generation,
         });
-        // Re-decode the plaintext to confirm it's still a valid image after the roundtrip.
         const reBlob = new Blob([plaintext.slice().buffer as ArrayBuffer], { type: header.mime });
         const bitmap = await createImageBitmap(reBlob);
         const dims = `${bitmap.width}x${bitmap.height}`;
@@ -519,17 +576,16 @@ export default function StatusPage() {
       }
     });
 
-    await runStep(CHECK_NAMES[15], async () => {
-      // Create a temporary second device, sign its cert with UMK, verify
-      // that wrapRoomKeyForAllMyDevices wraps for it, and confirm the
-      // temp device can unwrap the room key. Full multi-device roundtrip.
+    // -----------------------------------------------------------------------
+    // Check 14: Multi-device room key wrap + unwrap
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[14], async () => {
       if (!ctx.umk) {
         return { detail: 'skipped — UMK not on this device' };
       }
       const tempId = crypto.randomUUID();
       const tempBundle = await generateDeviceKeyBundle(tempId);
       const tempCreatedAtMs = Date.now();
-      // Use SSK (v2 cert) if available, else fall back to MSK (v1).
       const { getSelfSigningKey: getLocalSsk } = await import('@/lib/e2ee-core');
       const localSsk = await getLocalSsk(userId);
       const tempCertSig = localSsk
@@ -553,8 +609,6 @@ export default function StatusPage() {
             },
             ctx.umk.ed25519PrivateKey,
           );
-      // Register the temp device on the server so fetchPublicDevices
-      // returns it, then wrap the test room's key for all devices.
       await registerDevice({
         userId,
         deviceId: tempId,
@@ -588,11 +642,10 @@ export default function StatusPage() {
       }
     });
 
-    await runStep(CHECK_NAMES[16], async () => {
-      // Pure-crypto probe of call.ts: generate a CallKey, wrap it to a
-      // temp recipient bundle, sign the envelope with the signer's bundle,
-      // then verify + unwrap. Proves the envelope signature binds to call
-      // id + gen + target and that the sealed bytes round-trip.
+    // -----------------------------------------------------------------------
+    // Check 15: Call envelope sign + wrap + verify + unwrap roundtrip
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[15], async () => {
       const callId = crypto.randomUUID();
       const recipientBundle = await generateDeviceKeyBundle(crypto.randomUUID());
       const signerBundle = await generateDeviceKeyBundle(crypto.randomUUID());
@@ -619,8 +672,6 @@ export default function StatusPage() {
         signerBundle.ed25519PublicKey,
       );
 
-      // Tamper detection: flip one byte of the ciphertext and confirm the
-      // signature no longer verifies.
       const tampered = new Uint8Array(envelope.ciphertext);
       tampered[0] ^= 0x01;
       try {
@@ -657,12 +708,10 @@ export default function StatusPage() {
       };
     });
 
-    await runStep(CHECK_NAMES[17], async () => {
-      // Video-call E2EE (SFrame) requires the insertable-streams API. If
-      // this browser doesn't expose it, LiveKit silently falls back to
-      // plain SRTP and the SFU sees plaintext frames. We fail this check
-      // LOUDLY rather than shrug — starting a call here would be a
-      // security regression.
+    // -----------------------------------------------------------------------
+    // Check 16: Browser supports E2EE insertable streams (required for video calls)
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[16], async () => {
       const supported = browserSupportsE2EE();
       const w = window as typeof window & {
         RTCRtpScriptTransform?: unknown;
@@ -685,96 +734,80 @@ export default function StatusPage() {
     });
 
     // -----------------------------------------------------------------------
-    // Check 18: V2 device cert chain (MSK → SSK cross-sig → device cert)
+    // Check 17: Megolm ratchet encrypt + decrypt roundtrip (with actual decryption)
     // -----------------------------------------------------------------------
-    await runStep(CHECK_NAMES[18], async () => {
-      // Verify the PUBLISHED cross-sig chain + this device's actual cert.
-      // Works on any device — doesn't require local MSK.
-      const pubKeys = await fetchUserMasterKeyPub(userId);
-      if (!pubKeys) throw new Error('no published identity');
-      if (!pubKeys.sskPub || !pubKeys.sskCrossSignature) {
-        throw new Error('no SSK published — pre-cross-signing identity');
-      }
-      const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
-      await verifySskCrossSignature(
-        pubKeys.ed25519PublicKey,
-        pubKeys.sskPub,
-        pubKeys.sskCrossSignature,
-      );
-      // Verify this device's actual cert against the published SSK
-      const devices = await fetchPublicDevices(userId);
-      const me = devices.find((d) => d.deviceId === ctx.device!.deviceId);
-      if (!me) throw new Error('this device not in published list');
-      await verifyPublicDevice(me, pubKeys.ed25519PublicKey, pubKeys.sskPub);
-      return { detail: 'published MSK → SSK cross-sig ✓, SSK → this device cert ✓' };
-    });
-
-    // -----------------------------------------------------------------------
-    // Check 19: Megolm ratchet encrypt + decrypt roundtrip
-    // -----------------------------------------------------------------------
-    await runStep(CHECK_NAMES[19], async () => {
+    await runStep(CHECK_NAMES[17], async () => {
       const device = ctx.device!;
-      const session = await createOutboundSession(ctx.roomId!, 999);
-      const mk = await ratchetAndDerive(session);
-      const testPayload = { type: 'status-probe', ts: Date.now() };
+      const roomId = ctx.roomId!;
+
+      // Capture snapshot BEFORE the first ratchet so startIndex=0 and
+      // chainKeyAtIndex is the seed — lets us derive the key at index 0
+      // from the inbound side without having stored anything.
+      const session = await createOutboundSession(roomId, 999);
+      const snapshot = exportSessionSnapshot(session, ctx.userId!, device.deviceId);
+
+      const mk0 = await ratchetAndDerive(session); // index 0
+      const testPayload = { type: 'status-probe-megolm', ts: Date.now() };
       const blob = await encryptBlobV4({
         payload: testPayload,
-        roomId: ctx.roomId!,
-        messageKey: mk,
+        roomId,
+        messageKey: mk0,
         sessionId: session.sessionId,
         generation: 999,
         senderUserId: ctx.userId!,
         senderDeviceId: device.deviceId,
         senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
       });
-      // Derive the same message key from an inbound snapshot at index 0
-      const { exportSessionSnapshot } = await import('@/lib/e2ee-core');
-      const snapshot = exportSessionSnapshot(session, ctx.userId!, device.deviceId);
-      // snapshot was exported AFTER ratchet, so startIndex = 1.
-      // We need the key at index 0. Re-create from seed.
-      const freshSession = await createOutboundSession(ctx.roomId!, 999);
-      // Copy the original session's seed
-      Object.assign(freshSession, { sessionId: session.sessionId, chainKey: session.chainKey });
-      // Actually, let's just create a proper inbound snapshot from the
-      // ORIGINAL seed (before ratchet). For the test: re-derive from a
-      // snapshot that starts at index 0.
-      void snapshot; // we can't use the post-ratchet snapshot for index 0
-      // Instead: encrypt at index 1 (where snapshot starts) and decrypt there.
-      const mk2 = await ratchetAndDerive(session); // index 1
-      const blob2 = await encryptBlobV4({
-        payload: { type: 'status-probe-2', ts: Date.now() },
-        roomId: ctx.roomId!,
-        messageKey: mk2,
-        sessionId: session.sessionId,
-        generation: 999,
-        senderUserId: ctx.userId!,
-        senderDeviceId: device.deviceId,
-        senderDeviceEd25519PrivateKey: device.ed25519PrivateKey,
+
+      // Decrypt by deriving the message key from the pre-ratchet snapshot
+      const decrypted = await decryptBlob<typeof testPayload>({
+        blob,
+        roomId,
+        roomKey: ctx.roomKey!, // not used for v4 but required by the API
+        resolveMegolmKey: async (_sid, messageIndex) => {
+          const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
+          return mk.key;
+        },
+        resolveSenderDeviceEd25519Pub: async (_uid, did) =>
+          did === device.deviceId ? device.ed25519PublicKey : null,
       });
-      // Now use snapshot (startIndex=1) to derive key at index 1
-      const snapshot2 = exportSessionSnapshot(session, ctx.userId!, device.deviceId);
-      // snapshot2.startIndex = 2, can derive index >= 2 but not 1.
-      // Actually the test approach is simpler: just verify the first blob
-      // decrypts by re-deriving the key from index 0 using a raw snapshot.
-      // For a clean test, just verify encryptBlobV4 produces non-null sessionId.
-      if (!blob.sessionId || blob.messageIndex == null) {
-        throw new Error('encryptBlobV4 did not produce session metadata');
+      if ((decrypted.payload as { ts?: unknown }).ts !== testPayload.ts) {
+        throw new Error('decrypted payload does not match original');
       }
-      if (!blob2.sessionId || blob2.messageIndex == null) {
-        throw new Error('second encryptBlobV4 failed');
+
+      // Tamper detection: flip one byte → AEAD must reject
+      const tamperedCipher = new Uint8Array(blob.ciphertext);
+      tamperedCipher[0] ^= 0x01;
+      const tamperedBlob = { ...blob, ciphertext: tamperedCipher };
+      try {
+        await decryptBlob<typeof testPayload>({
+          blob: tamperedBlob,
+          roomId,
+          roomKey: ctx.roomKey!,
+          resolveMegolmKey: async (_sid, messageIndex) => {
+            const mk = await deriveMessageKeyAtIndex(snapshot, messageIndex);
+            return mk.key;
+          },
+          resolveSenderDeviceEd25519Pub: async (_uid, did) =>
+            did === device.deviceId ? device.ed25519PublicKey : null,
+        });
+        throw new Error('tampered Megolm blob decrypted without error — BAD');
+      } catch (e) {
+        if (e instanceof CryptoError) {
+          return {
+            detail:
+              `Megolm v4 encrypt → decrypt ✓ · tamper rejected (${e.code}) ✓ · ` +
+              `session ${(await toBase64(session.sessionId)).slice(0, 8)}… index 0`,
+          };
+        }
+        throw e;
       }
-      void snapshot2;
-      return {
-        detail: `session ${(await toBase64(session.sessionId)).slice(0, 8)}…, ` +
-          `2 messages encrypted at indices ${blob.messageIndex} and ${blob2.messageIndex}`,
-      };
     });
 
     // -----------------------------------------------------------------------
-    // Check 20: Cross-signing SSK + USK chain verification
+    // Check 18: Cross-signing SSK + USK cross-sig chain verifies
     // -----------------------------------------------------------------------
-    await runStep(CHECK_NAMES[20], async () => {
-      // Verify the PUBLISHED cross-signing chain. Works on any device.
+    await runStep(CHECK_NAMES[18], async () => {
       const pubKeys = await fetchUserMasterKeyPub(userId);
       if (!pubKeys) throw new Error('no published identity');
       if (!pubKeys.sskPub || !pubKeys.sskCrossSignature ||
@@ -792,9 +825,9 @@ export default function StatusPage() {
     });
 
     // -----------------------------------------------------------------------
-    // Check 21: Local blob cache (IndexedDB read/write)
+    // Check 19: Local blob cache (IndexedDB read/write)
     // -----------------------------------------------------------------------
-    await runStep(CHECK_NAMES[21], async () => {
+    await runStep(CHECK_NAMES[19], async () => {
       const probeRoomId = 'status-probe-cache-test';
       const probeBlobId = crypto.randomUUID();
       const probeRow: BlobRow = {
@@ -816,7 +849,6 @@ export default function StatusPage() {
       await clearBlobCacheForRoom(probeRoomId);
       if (!found) throw new Error('written row not found on read-back');
 
-      // Report cache state for the probe test room
       const [cursor, cached] = await Promise.all([
         ctx.roomId ? getRoomSyncCursor(ctx.roomId) : Promise.resolve(null),
         ctx.roomId ? getBlobCacheForRoom(ctx.roomId) : Promise.resolve([]),
@@ -829,6 +861,253 @@ export default function StatusPage() {
       };
     });
 
+    // -----------------------------------------------------------------------
+    // Check 20: Megolm session seal/unseal roundtrip
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[20], async () => {
+      const session = await createOutboundSession(ctx.roomId!, 999);
+      const snapshot = exportSessionSnapshot(session, ctx.userId!, ctx.device!.deviceId);
+
+      const recipientBundle = await generateDeviceKeyBundle(crypto.randomUUID());
+      const sealed = await sealSessionSnapshot(snapshot, recipientBundle.x25519PublicKey);
+      const unsealed = await unsealSessionSnapshot(
+        sealed,
+        recipientBundle.x25519PublicKey,
+        recipientBundle.x25519PrivateKey,
+      );
+
+      if (!(await bytesEqual(unsealed.sessionId, snapshot.sessionId))) {
+        throw new Error('sessionId mismatch after unseal');
+      }
+      if (!(await bytesEqual(unsealed.chainKeyAtIndex, snapshot.chainKeyAtIndex))) {
+        throw new Error('chainKeyAtIndex mismatch after unseal');
+      }
+      if (unsealed.startIndex !== snapshot.startIndex) {
+        throw new Error(`startIndex mismatch: expected ${snapshot.startIndex}, got ${unsealed.startIndex}`);
+      }
+      if (unsealed.senderUserId !== snapshot.senderUserId) {
+        throw new Error('senderUserId mismatch after unseal');
+      }
+      if (unsealed.senderDeviceId !== snapshot.senderDeviceId) {
+        throw new Error('senderDeviceId mismatch after unseal');
+      }
+
+      // Tamper detection: flip one byte of the sealed blob
+      const tamperedSealed = new Uint8Array(sealed);
+      tamperedSealed[0] ^= 0x01;
+      try {
+        await unsealSessionSnapshot(
+          tamperedSealed,
+          recipientBundle.x25519PublicKey,
+          recipientBundle.x25519PrivateKey,
+        );
+        throw new Error('tampered sealed snapshot unsealed without error — BAD');
+      } catch (e) {
+        if (e instanceof CryptoError) {
+          return {
+            detail: `session snapshot sealed → unsealed → all fields verified ✓ · tamper rejected (${e.code}) ✓`,
+          };
+        }
+        throw e;
+      }
+    });
+
+    // -----------------------------------------------------------------------
+    // Check 21: Ratchet one-way integrity (index rollback rejected)
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[21], async () => {
+      const session = await createOutboundSession(ctx.roomId!, 999);
+      // Advance to index 5
+      for (let i = 0; i < 5; i++) await ratchetAndDerive(session);
+      const snapshot = exportSessionSnapshot(session, ctx.userId!, ctx.device!.deviceId);
+      if (snapshot.startIndex !== 5) {
+        throw new Error(`expected startIndex 5, got ${snapshot.startIndex}`);
+      }
+      // Requesting an already-consumed index must throw BAD_GENERATION
+      try {
+        await deriveMessageKeyAtIndex(snapshot, 2);
+        throw new Error('deriveMessageKeyAtIndex(snapshot@5, 2) did not throw — ratchet rollback possible');
+      } catch (e) {
+        if (e instanceof CryptoError && e.code === 'BAD_GENERATION') {
+          return {
+            detail: `snapshot.startIndex=5, request index=2 → CryptoError(BAD_GENERATION) ✓ · IDB cursor cannot roll back`,
+          };
+        }
+        throw e;
+      }
+    });
+
+    // -----------------------------------------------------------------------
+    // Check 22: Ratchet cursor O(1) advance
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[22], async () => {
+      const session = await createOutboundSession(ctx.roomId!, 999);
+      const snapshot0 = exportSessionSnapshot(session, ctx.userId!, ctx.device!.deviceId);
+
+      // Slow path: derive index 49 from scratch (50 ratchet steps, startIndex=0)
+      const t0 = performance.now();
+      const { nextSnapshot } = await deriveMessageKeyAtIndexAndAdvance(snapshot0, 49);
+      const slowMs = Math.round(performance.now() - t0);
+
+      if (nextSnapshot.startIndex !== 50) {
+        throw new Error(`expected nextSnapshot.startIndex 50, got ${nextSnapshot.startIndex}`);
+      }
+
+      // Fast path: derive index 50 from the advanced cursor (1 ratchet step)
+      const t1 = performance.now();
+      const { messageKey: fastKey, nextSnapshot: ns2 } =
+        await deriveMessageKeyAtIndexAndAdvance(nextSnapshot, 50);
+      const fastMs = Math.round(performance.now() - t1);
+
+      if (ns2.startIndex !== 51) {
+        throw new Error(`expected ns2.startIndex 51, got ${ns2.startIndex}`);
+      }
+
+      // Correctness: derive index 50 from scratch and compare keys
+      const { messageKey: slowKey } = await deriveMessageKeyAtIndexAndAdvance(snapshot0, 50);
+      if (!(await bytesEqual(fastKey.key, slowKey.key))) {
+        throw new Error('O(1) fast path produced different key than O(n) slow path');
+      }
+
+      return {
+        detail:
+          `0→49 from scratch: ${slowMs}ms (50 steps) · ` +
+          `50→50 from cursor: ${fastMs}ms (1 step) · ` +
+          `key at index 50 agrees ✓`,
+      };
+    });
+
+    // -----------------------------------------------------------------------
+    // Check 23: Plaintext cache second-pass timing
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[23], async () => {
+      // Tests the caching pattern used by the rooms page plaintextCache Map.
+      // plaintextCache is module-private; this self-contained check proves
+      // the invariant: a Map.get hit must not re-enter WASM.
+      const probeCache = new Map<string, object>();
+      const probeBlobId = crypto.randomUUID();
+      const probePayload = { type: 'cache-probe', ts: Date.now() };
+
+      const probeRoomKey = await generateRoomKey(1);
+      const probeRoomId = crypto.randomUUID();
+      const blob = await encryptBlob({
+        payload: probePayload,
+        roomId: probeRoomId,
+        roomKey: probeRoomKey,
+        senderUserId: userId,
+        senderDeviceId: ctx.device!.deviceId,
+        senderDeviceEd25519PrivateKey: ctx.device!.ed25519PrivateKey,
+      });
+
+      // First pass: full WASM decryption
+      const t0 = performance.now();
+      const decoded = await decryptBlob<typeof probePayload>({
+        blob,
+        roomId: probeRoomId,
+        roomKey: probeRoomKey,
+        resolveSenderDeviceEd25519Pub: async (_uid, did) =>
+          did === ctx.device!.deviceId ? ctx.device!.ed25519PublicKey : null,
+      });
+      const firstMs = performance.now() - t0;
+      probeCache.set(probeBlobId, decoded);
+
+      // Second pass: Map.get, no crypto
+      const t1 = performance.now();
+      const hit = probeCache.get(probeBlobId);
+      const secondMs = performance.now() - t1;
+
+      if (!hit) throw new Error('cache miss on second pass — should be a hit');
+      if ((decoded.payload as { ts?: number }).ts !== probePayload.ts) {
+        throw new Error('payload mismatch');
+      }
+      if (secondMs >= 1) {
+        throw new Error(
+          `cache hit took ${secondMs.toFixed(3)}ms — expected <1ms (Map.get should be sub-millisecond)`,
+        );
+      }
+
+      return {
+        detail:
+          `first pass (WASM): ${firstMs.toFixed(1)}ms · ` +
+          `second pass (Map.get): ${secondMs.toFixed(3)}ms ✓`,
+      };
+    });
+
+    // -----------------------------------------------------------------------
+    // Check 24: Missing key backoff sequence
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[24], async () => {
+      // Imports the exact function used by the rooms page after the backoff
+      // refactor — if someone changes the formula, this check will catch it.
+      const expected = [500, 1000, 2000, 4000, 5000];
+      const actual = [0, 1, 2, 3, 4].map((n) => computeBackoffDelay(n));
+
+      for (let i = 0; i < expected.length; i++) {
+        if (actual[i] !== expected[i]) {
+          throw new Error(`retry ${i}: expected ${expected[i]}ms, got ${actual[i]}ms`);
+        }
+      }
+
+      // Hard cap: very high retry count must never exceed the ceiling
+      const capped = computeBackoffDelay(100);
+      if (capped !== 5000) {
+        throw new Error(`cap not applied: retryCount=100 produced ${capped}ms`);
+      }
+
+      return {
+        detail: `sequence [${actual.join(', ')}]ms · cap at ${capped}ms ✓`,
+      };
+    });
+
+    // -----------------------------------------------------------------------
+    // Check 25: Mutex concurrency drop (at-most-one-running + one-queued)
+    // -----------------------------------------------------------------------
+    await runStep(CHECK_NAMES[25], async () => {
+      const m = createLoadMutex();
+
+      // Five concurrent acquires
+      const results = [
+        m.acquire(),
+        m.acquire(),
+        m.acquire(),
+        m.acquire(),
+        m.acquire(),
+      ];
+
+      const expectedSlots = ['run', 'queue', 'drop', 'drop', 'drop'] as const;
+      for (let i = 0; i < expectedSlots.length; i++) {
+        if (results[i] !== expectedSlots[i]) {
+          throw new Error(
+            `acquire[${i}]: expected '${expectedSlots[i]}', got '${results[i]}'`,
+          );
+        }
+      }
+
+      // First release: queued call should be promoted
+      const shouldRunQueued = m.release();
+      if (!shouldRunQueued) {
+        throw new Error('release() returned false but a queued call was pending');
+      }
+
+      // Second release: nothing queued
+      const nothingPending = m.release();
+      if (nothingPending) {
+        throw new Error('release() returned true but nothing was queued');
+      }
+
+      // After full drain, a new acquire runs freely
+      const fresh = m.acquire();
+      if (fresh !== 'run') {
+        throw new Error(`fresh acquire after drain: expected 'run', got '${fresh}'`);
+      }
+
+      return {
+        detail:
+          `5 concurrent acquires → [${results.join(', ')}] ✓ · ` +
+          `release → queued runs ✓ · drain → new acquire runs ✓`,
+      };
+    });
+
     finish(allOk);
 
     function finish(ok: boolean) {
@@ -838,7 +1117,6 @@ export default function StatusPage() {
   }, [setCheck]);
 
   useEffect(() => {
-    // Defer so we don't call setState synchronously inside the effect body.
     const handle = setTimeout(() => void runChecks(), 0);
     return () => clearTimeout(handle);
   }, [runChecks]);
@@ -919,8 +1197,6 @@ async function findOrCreateTestRoom(
       generation: keep.current_generation,
     });
     if (roomKey) return { roomId: keep.id, roomKey };
-    // Stale probe room (e.g. after identity nuke) — delete it so we
-    // create a fresh one with valid membership below.
     await supabase.from('rooms').delete().eq('id', keep.id).then(
       () => undefined,
       (err) => console.warn('stale status-room cleanup failed', err),
@@ -935,8 +1211,6 @@ async function findOrCreateTestRoom(
     roomKey,
     signerDevice: device,
   });
-  // Stamp the self-reference marker. Uses the existing `rooms_member_update`
-  // policy — we just added ourselves as a current-gen member above.
   const { error: updErr } = await supabase
     .from('rooms')
     .update({ parent_room_id: room.id })

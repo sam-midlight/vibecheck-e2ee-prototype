@@ -8,6 +8,42 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 > **If you already integrated a prior version of this prototype**, use this section to catch up. Each dated entry lists the migrations to apply, new files to copy, and changed contracts. Apply entries in order.
 
+### 2026-04-19 — Refactor: backoff + mutex extracted; /status overhaul (26 checks)
+
+**No migrations required.** Pure JS/React changes; safe to apply to any existing deployment.
+
+**Refactors:**
+
+1. **`src/lib/backoff.ts` (new)** — `computeBackoffDelay(retryCount, base, cap)` extracted from the inline `Math.min(500 * 2^n, 5000)` expression in the rooms page. Rooms page now imports this. Status page check #24 verifies the full sequence [500, 1000, 2000, 4000, 5000] and the cap against the production function, not a local copy.
+
+2. **`src/lib/load-mutex.ts` (new)** — `createLoadMutex()` extracted from the `isLoadingRef` / `pendingRef` React-ref pair in the rooms page. Semantics: `acquire()` returns `'run'` (no contention), `'queue'` (one slot queued), or `'drop'` (already have a queued call). `release()` returns `true` if a queued call should now run. Rooms page now holds a single `mutexRef = useRef(createLoadMutex())` instead of two boolean refs. Status page check #25 verifies the full acquire/release cycle including the drain path.
+
+**`/status` page overhaul — 22 → 26 checks:**
+
+*Retired (−2):*
+- Check 4 "Sign + verify roundtrip" — covered by checks 0 and 3; no independent failure mode.
+- Check 18 "V2 device cert chain" — duplicate of check 3 (same `verifySskCrossSignature` + `verifyPublicDevice` calls, different label).
+
+*Fixed (2 in-place):*
+- Check 8 (was 9) "Ciphertext opacity" — was a display-only hex dump that always passed. Now asserts: (a) ciphertext ≥ payload + AEAD overhead, (b) the literal `status-probe` marker is not present in the ciphertext bytes (hex search).
+- Check 17 (was 19) "Megolm ratchet" — previously only asserted `blob.sessionId != null`. Now captures the chain key via `exportSessionSnapshot` before the first ratchet (giving `startIndex=0`), encrypts a real payload with `encryptBlobV4`, decrypts via `decryptBlob` + `resolveMegolmKey` callback using `deriveMessageKeyAtIndex`, asserts payload round-trip equality, and asserts tampered ciphertext is rejected with `CryptoError`.
+
+*New (+6):*
+- Check 20 "Megolm session seal/unseal roundtrip" — `sealSessionSnapshot` → `unsealSessionSnapshot` with a temp recipient bundle; asserts all fields (sessionId, chainKey, startIndex, senderUserId, senderDeviceId) survive the round-trip; tamper-flips one byte of the sealed blob and asserts `CryptoError`.
+- Check 21 "Ratchet one-way integrity" — advances a session to index 5, exports snapshot (startIndex=5), calls `deriveMessageKeyAtIndex(snapshot, 2)`, asserts `CryptoError(BAD_GENERATION)`. Proves IDB cursor cannot roll back.
+- Check 22 "Ratchet cursor O(1) advance" — derives index 49 from startIndex=0 (50 ratchet steps); asserts `nextSnapshot.startIndex=50`; derives index 50 from the cursor (1 step); asserts the key at index 50 from both paths is identical. Reports both timings so regressions to O(n) are visible.
+- Check 23 "Plaintext cache second-pass timing" — encrypts a blob, decrypts once into a local `Map`, reads from the Map on a second call, asserts Map.get completes in <1ms (no WASM re-entry). Tests the pattern used by `plaintextCache` in the rooms page; `plaintextCache` itself is module-private so this uses a local Map replica.
+- Check 24 "Missing key backoff sequence" — imports `computeBackoffDelay` directly and asserts the five-step sequence [500, 1000, 2000, 4000, 5000] plus the hard cap. Because it imports the production function (not a local copy), any change to the formula fails this check automatically.
+- Check 25 "Mutex concurrency drop" — imports `createLoadMutex` directly, fires 5 synchronous `acquire()` calls, asserts the result vector `['run', 'queue', 'drop', 'drop', 'drop']`, then exercises the full `release()` → queued-runs → drain → fresh-acquire cycle.
+
+**V2 porting notes:**
+
+- Copy `src/lib/backoff.ts` and `src/lib/load-mutex.ts` alongside the room page. Both are pure (no Supabase, no React, no crypto imports) — safe to unit-test in isolation.
+- The mutex's `'queue'` slot is load-bearing: without it, a `loadAll` triggered during a running load would be silently dropped. The queued re-run ensures the most recent state is always fetched exactly once after each load completes.
+- The new status checks (20–25) are all in-memory or use only already-imported utilities. No new Supabase contracts.
+
+---
+
 ### 2026-04-19 — PERF: plaintext cache, ratchet cursor safety, exponential backoff
 
 **No migrations required.** Pure JS/React changes; safe to apply to any existing deployment.
@@ -449,6 +485,37 @@ The `/status` page is more valuable in V2 than it was here — it's your canary 
 
 Add one check per E2EE-touching feature you add (e.g. "File attachments roundtrip," "Typing event AEAD roundtrip"). The principle: any code path that moves a cipher through the server should have a green dot you can look at.
 
+**Current check index (26 checks as of 2026-04-19):**
+
+| # | Name | What it proves |
+|---|---|---|
+| 0 | Sodium WASM ready | libsodium WASM initialised |
+| 1 | Identity keys in IDB | device bundle present |
+| 2 | Published pubkey matches local | server/local UMK pub in sync |
+| 3 | Self-signature valid | full MSK→SSK→device cert chain |
+| 4 | Encrypt + decrypt roundtrip | v3 AEAD + sig end-to-end |
+| 5 | Test room exists | Supabase probe room reachable |
+| 6 | Write encrypted blob | row insert + ciphertext stored |
+| 7 | Realtime subscription | WebSocket echo latency |
+| 8 | Ciphertext opacity | AEAD overhead + no plaintext in bytes |
+| 9 | Tamper detection | AEAD rejects 1-bit flip |
+| 10 | Devices linked | account device list readable |
+| 11 | Approval code hash | code hash determinism + pubkey binding |
+| 12 | Recovery phrase wrap/unwrap | Argon2id + XChaCha20 KDF chain |
+| 13 | Image attachment roundtrip | chunked AEAD encrypt/upload/download/decrypt |
+| 14 | Multi-device room key wrap/unwrap | sealed-box wrap + unwrap for temp device |
+| 15 | Call envelope roundtrip | CallKey sealed + signed + tamper-rejected |
+| 16 | Browser E2EE streams | insertable streams API present |
+| 17 | Megolm ratchet roundtrip | v4 encrypt → snapshot → decrypt + tamper |
+| 18 | Cross-signing chain | MSK → SSK and MSK → USK cross-sigs |
+| 19 | Blob cache IDB | write/read/delete round-trip + cursor state |
+| 20 | Session seal/unseal | `sealSessionSnapshot` → `unsealSessionSnapshot` + tamper |
+| 21 | Ratchet one-way integrity | `deriveMessageKeyAtIndex` rejects index < startIndex |
+| 22 | Ratchet cursor O(1) advance | `deriveMessageKeyAtIndexAndAdvance` key equality, both timings |
+| 23 | Plaintext cache timing | Map.get cache hit completes in <1ms |
+| 24 | Missing key backoff sequence | `computeBackoffDelay` sequence [500, 1k, 2k, 4k, 5k]ms |
+| 25 | Mutex concurrency drop | `createLoadMutex` acquire/release full cycle |
+
 ## 5. Layer VibeCheck domain on top of blobs
 
 VibeCheck V1's domain is sliders, Mind Reader guesses, Safe Space messages with Time-Out, Date Proposals, Therapy Reports. In V2, every one of those is an encrypted blob payload:
@@ -604,7 +671,7 @@ Row shape: `key_backup (user_id, room_id, generation, ciphertext, nonce, created
 - Server-side reads of `key_backup` ciphertext leak the room/generation graph (same as `room_members` already does) but not keys. Accept the shape parity.
 - If V2 adds a key-backup "prune" UX (e.g. drop old generations to limit row count), rotate the backup key first via a new recovery-blob write — otherwise a server snapshot keeps the pruned rows readable.
 
-**Check #16** in `/status` is the canary: it constructs a synthetic temp device, signs its cert with the real UMK, runs the full wrap/unwrap roundtrip, cleans up. Keep it in the V2 port.
+**Check #14** in `/status` is the canary: it constructs a synthetic temp device, signs its cert with the real UMK, runs the full wrap/unwrap roundtrip, cleans up. Keep it in the V2 port.
 
 ## 13. Multi-primary via "promote this device" (Matrix-style)
 

@@ -80,6 +80,8 @@ import {
   type RoomRow,
 } from '@/lib/supabase/queries';
 import { loadEnrolledDevice, sendInviteToAllDevices } from '@/lib/bootstrap';
+import { computeBackoffDelay } from '@/lib/backoff';
+import { createLoadMutex } from '@/lib/load-mutex';
 
 interface DecodedBlob {
   id: string;
@@ -192,8 +194,7 @@ function RoomInner({ roomId }: { roomId: string }) {
   const [devMode] = useDevMode();
   const roomKeyRef = useRef<RoomKey | null>(null);
   const roomKeysByGenRef = useRef<Map<number, RoomKey>>(new Map());
-  const isLoadingRef = useRef(false);
-  const pendingRef = useRef(false);
+  const mutexRef = useRef(createLoadMutex());
   const loadAllRef = useRef<(uid: string, dev: DeviceKeyBundle) => Promise<void>>(async () => {});
   const missingKeyRetryCountRef = useRef(0);
 
@@ -207,8 +208,7 @@ function RoomInner({ roomId }: { roomId: string }) {
 
   const loadAll = useCallback(
     async (uid: string, dev: DeviceKeyBundle) => {
-      if (isLoadingRef.current) { pendingRef.current = true; return; }
-      isLoadingRef.current = true;
+      const slot = mutexRef.current.acquire(); if (slot !== 'run') return;
       try {
       const supabase = getSupabase();
 
@@ -466,11 +466,7 @@ function RoomInner({ roomId }: { roomId: string }) {
         blobErrors,
       });
     } finally {
-      isLoadingRef.current = false;
-      if (pendingRef.current) {
-        pendingRef.current = false;
-        void loadAllRef.current(uid, dev);
-      }
+      if (mutexRef.current.release()) void loadAllRef.current(uid, dev);
     }
     },
     [roomId],
@@ -569,7 +565,7 @@ function RoomInner({ roomId }: { roomId: string }) {
       setNicknames((prev) => updateNicknamesFromBlob(prev, decoded));
       if (decoded.missingKey) {
         if (missingKeyReloadRef.current) clearTimeout(missingKeyReloadRef.current);
-        const delay = Math.min(500 * Math.pow(2, missingKeyRetryCountRef.current), 5000);
+        const delay = computeBackoffDelay(missingKeyRetryCountRef.current);
         missingKeyRetryCountRef.current += 1;
         missingKeyReloadRef.current = setTimeout(() => {
           missingKeyReloadRef.current = null;
