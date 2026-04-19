@@ -139,6 +139,50 @@ Checklist to move from "prototype verified" to "V2 app building on the proven E2
 
 ---
 
+### 2026-04-20 — SECURITY: Megolm 200-cap bypass via direct UPDATE on `megolm_sessions.message_count`
+
+**Migration to apply:** `0042_megolm_counter_monotonic.sql`
+
+**Root cause:** `megolm_sessions_update` in migration 0027 is `USING (sender_user_id = auth.uid())` with no `WITH CHECK` and no column scope, so a sender can `UPDATE megolm_sessions SET message_count = 0 WHERE session_id = <theirs>` at any time. The `check_session_message_cap` trigger in 0029 (BEFORE INSERT on `blobs`) reads `message_count` fresh at each blob insert, so a client that resets the counter between sends defeats the cap indefinitely — the exact threat 0029 exists to catch.
+
+The client-side cap in `e2ee-core/megolm.ts` (`MEGOLM_HARD_CAP = 200` in `ratchetAndDerive`) is advisory: a patched/hostile client skips it and the server is the only remaining enforcement point.
+
+**Impact:** defeats the "bounded compromise exposure" property Megolm rotation is meant to provide. If a chain key at index N later leaks, rotation caps the attacker's decryption window; without the cap, the window is unbounded for any session the misbehaving sender keeps alive.
+
+**What changed:**
+
+- **Migration 0042** adds a BEFORE UPDATE trigger on `megolm_sessions`:
+  ```sql
+  create or replace function guard_megolm_session_counter()
+  returns trigger language plpgsql set search_path = public as $$
+  begin
+    if new.message_count < old.message_count
+       and new.session_id is not distinct from old.session_id then
+      raise exception
+        'megolm message_count is monotonic for a given session_id (old=%, new=%)',
+        old.message_count, new.message_count
+        using errcode = 'check_violation';
+    end if;
+    return new;
+  end; $$;
+
+  create trigger megolm_sessions_counter_guard
+    before update on megolm_sessions
+    for each row execute function guard_megolm_session_counter();
+  ```
+  Legitimate session rotation always changes `session_id` (fresh 32 random bytes from `createOutboundSession`), so the retry upsert in `insertMegolmSession` (queries.ts:946-956) still resets `message_count` cleanly via the new-session path. The only rejected shape is "same session_id, lower counter" — the bypass. The AFTER-INSERT increment trigger from 0029 only ever does `message_count + 1`, so it satisfies the guard unconditionally.
+
+**Why a trigger rather than tightening the UPDATE policy:** dropping client UPDATE on `megolm_sessions` would break the legitimate upsert-on-conflict retry, which genuinely needs to rewrite `session_id` + `message_count`. A column-whitelist policy is possible but requires splitting the upsert into INSERT-or-update-only-session-id paths. The trigger is the smallest change that closes the hole without touching the client. V2 may still tighten the UPDATE policy as belt-and-braces; the trigger remains correct.
+
+**V2 port actions:**
+- Apply migration 0042. No schema change, no data migration — pure function + trigger.
+- No client change required. `insertMegolmSession`'s upsert path already uses fresh `session_id` values on every call from `bootstrap.ts:1042`.
+- If you redesign `megolm_sessions` (e.g. make `session_id` the PK so rotation is always INSERT-not-UPDATE), drop this trigger and use plain column-level constraints. The monotonicity guarantee is the invariant, not the trigger specifically.
+
+**Test:** `scripts/test-megolm-counter-monotonic.ts` — asserts (a) counter-stomp on same `session_id` is rejected with `check_violation`, (b) legit rotation with new `session_id` + `message_count: 0` succeeds, and (c) the AFTER-INSERT increment trigger still fires.
+
+---
+
 ### 2026-04-20 — SECURITY: ghost call-member via start_call / rotate_call_key
 
 **Migration to apply:** `0041_call_rpc_ownership_check.sql`
@@ -442,7 +486,7 @@ Copy these things verbatim:
 - `supabase/migrations/0029_auto_rotation_enforcement.sql` — **server-side Megolm safety net.** Two `SECURITY DEFINER SET search_path = public` triggers on `blobs`:
   - `AFTER INSERT → increment_session_message_count()` bumps `megolm_sessions.message_count` (needs DEFINER to bypass the session's UPDATE RLS).
   - `BEFORE INSERT → check_session_message_cap()` rejects any INSERT whose session has `message_count >= 200` with a `check_violation`.
-  The client is authoritative — `shouldRotateSession` rotates at 100 messages / 7 days. The 200-msg server cap is defense-in-depth against a misbehaving client running a chain key indefinitely; the 100→200 gap accommodates rotation races. **V2 must keep both triggers;** raising or removing the cap breaks forward-secrecy-within-a-generation.
+  The client is authoritative — `shouldRotateSession` rotates at 100 messages / 7 days. The 200-msg server cap is defense-in-depth against a misbehaving client running a chain key indefinitely; the 100→200 gap accommodates rotation races. **V2 must keep both triggers;** raising or removing the cap breaks forward-secrecy-within-a-generation. **The 200-cap alone is not self-enforcing** — 0027's UPDATE RLS is open enough that a sender can reset `message_count` on their own row; migration 0042 below is what closes that bypass and turns the cap into a real guarantee.
 
 - `supabase/migrations/0030_sas_verification.sql` — two tables for emoji-based identity verification (Matrix MSC1267-adapted):
   - `cross_user_signatures (signer_user_id, signed_user_id, signature, signed_at)` — **persistent** USK attestation that "I (signer) verified this user's (signed) MSK is authentic." PK `(signer_user_id, signed_user_id)`. Public SELECT (attestations are public trust statements, same model as PGP keysignings); INSERT + DELETE gated to `signer_user_id = auth.uid()`. Drives the verified-badge UX and escalates key-change alerts — if a verified contact's MSK drifts, that's a security event, not a routine re-enrollment.

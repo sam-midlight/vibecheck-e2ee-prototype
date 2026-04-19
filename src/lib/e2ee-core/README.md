@@ -185,7 +185,7 @@ await verifySessionShare({ sessionId: incoming.sessionId, recipientDeviceId: myD
 const messageKey = await deriveMessageKeyAtIndex(incoming, blob.messageIndex!);
 ```
 
-**Server-side rotation safety net:** migration 0029 installs a trigger that rejects INSERTs into `blobs` whose session has ≥200 messages. The client is authoritative for rotation at 100 — the 100→200 gap accommodates rotation races. Do NOT bypass this by writing directly to the `blobs` table via service-role.
+**Server-side rotation safety net:** migration 0029 installs a BEFORE-INSERT trigger on `blobs` that rejects inserts whose session has ≥200 messages, and migration 0042 installs a BEFORE-UPDATE trigger on `megolm_sessions` that rejects `message_count` decreases unless `session_id` also changes (otherwise the sender could reset their own counter and loop the cap). The client is authoritative for rotation at 100 — the 100→200 gap accommodates rotation races. Do NOT bypass either layer by writing directly via service-role.
 
 ## SAS verification
 

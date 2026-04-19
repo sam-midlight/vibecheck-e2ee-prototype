@@ -79,6 +79,7 @@ Per-sender-per-room ratchets with forward secrecy within a generation. These tes
 | test-session-auto-rotation.ts | `shouldRotateSession` returns false at message index 99, true at 100 (the configured threshold). |
 | test-age-based-rotation.ts | Age-based rotation triggers independently: a fresh session at index 0 does not rotate, but one 8 days old at index 0 does. |
 | test-megolm-hard-cap.ts | `ratchetAndDerive` throws BAD_INPUT at index 200; index 199 still succeeds (cap is exclusive). |
+| test-megolm-counter-monotonic.ts | Migration 0042 BEFORE-UPDATE trigger: counter-stomp (`UPDATE message_count = 0` with same `session_id`) rejected with `check_violation`; legitimate rotation (new `session_id` + reset) allowed; 0029's AFTER-INSERT increment still fires on blob insert. Closes the direct-UPDATE bypass of the 200-cap. |
 | test-megolm-snapshot-fastpath.ts | A cached snapshot at index 5 can fast-forward-derive to index 12 (matches the from-zero derivation); advancing cursor to 13 blocks re-deriving 12. |
 | test-megolm-share-late-joiner.ts | Bob joining at index 5 receives a snapshot sealed for him; he derives index 5+; cannot go before 5; a non-recipient (Carol) can't unseal. |
 | test-megolm-index-gap.ts | Skipped indices (3, 4) don't break forward derivation — index 5 still derives; after advancing cursor to 6, 4 is unreachable. |

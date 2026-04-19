@@ -28,7 +28,7 @@ Each user has **five distinct key types**. Mixing them up is the most common way
 
 **Backward compat:** `UserMasterKey` is a type alias for `MasterSigningKey`. v1 device certs (signed by MSK directly) still verify via fallback. `identities.ed25519_pub` is unchanged (= MSK pub = old UMK pub). No TOFU break.
 
-**Megolm ratchet:** Room messages use per-sender Megolm sessions (v4 blob envelope) with HMAC-SHA256 chain keys. Forward secrecy within a generation. Sessions auto-rotate at 100 messages or 7 days. Server hard-caps at 200 messages. Pre-Megolm rooms transition lazily on next generation bump.
+**Megolm ratchet:** Room messages use per-sender Megolm sessions (v4 blob envelope) with HMAC-SHA256 chain keys. Forward secrecy within a generation. Sessions auto-rotate at 100 messages or 7 days. Server hard-caps at 200 messages (migration 0029 BEFORE-INSERT trigger) and counter is monotonic per `session_id` (migration 0042 BEFORE-UPDATE trigger, closes the direct-UPDATE bypass). Pre-Megolm rooms transition lazily on next generation bump.
 
 **SAS verification:** Interactive emoji-based identity verification between two users. 7 emoji from ephemeral ECDH + HKDF. On success, USK cross-signs peer's MSK pub. Verified contacts get escalated key-change alerts.
 

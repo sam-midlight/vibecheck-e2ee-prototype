@@ -67,10 +67,14 @@ export const DEFAULT_AUTO_ROTATION: AutoRotationConfig = {
 };
 
 /**
- * Hard cap matching the server-side trigger in migration 0029. Client rotates
- * at 100; the 100→200 gap accommodates rotation races. Hitting 200 client-side
- * means rotation orchestration is broken — refuse rather than hand the server
- * a row it will reject anyway.
+ * Hard cap matching the server-side triggers in migrations 0029 + 0042.
+ * 0029 rejects blob inserts when `megolm_sessions.message_count >= 200`;
+ * 0042 prevents a hostile client from UPDATEing its own counter back to 0
+ * to bypass 0029 (the bypass is only allowed when `session_id` also changes,
+ * i.e. a genuine rotation). Client rotates at 100; the 100→200 gap
+ * accommodates rotation races. Hitting 200 client-side means rotation
+ * orchestration is broken — refuse rather than hand the server a row it
+ * will reject anyway.
  */
 export const MEGOLM_HARD_CAP = 200;
 
