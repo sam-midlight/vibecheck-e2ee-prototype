@@ -130,6 +130,10 @@ export interface RoomInviteRow {
   expires_at_ms: number;
   /** NOT NULL since 0016. */
   inviter_signature: string;
+  /** Sealed under the current-gen room key. Nullable for legacy invites (pre-0043). */
+  room_name_ciphertext?: string | null;
+  /** Nonce pair for room_name_ciphertext. Nullable for legacy invites (pre-0043). */
+  room_name_nonce?: string | null;
 }
 
 export interface BlobRow {

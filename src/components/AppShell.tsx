@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { getSupabase } from '@/lib/supabase/client';
 import {
@@ -22,7 +22,9 @@ import { subscribeIdentityChanges } from '@/lib/tab-sync';
 import { useDevMode } from '@/lib/use-dev-mode';
 import { IncomingCallToast } from './IncomingCallToast';
 import { KeyChangeBanner } from './KeyChangeBanner';
+import { Loading } from './OrganicLoader';
 import { PendingApprovalBanner } from './PendingApprovalBanner';
+import { ThemeToggle } from './design/ThemeToggle';
 
 interface AppShellProps {
   children: React.ReactNode;
@@ -169,29 +171,49 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
   }
 
   if (checking) {
-    return <main className="p-8 text-sm text-neutral-500">loading…</main>;
+    return (
+      <main className="p-8">
+        <Loading />
+      </main>
+    );
   }
 
   return (
     <div className="flex min-h-full flex-col">
-      <header className="flex items-center justify-between border-b border-neutral-200 px-6 py-3 text-sm dark:border-neutral-800">
-        <nav className="flex gap-4">
-          <Link href="/" className="font-semibold">e2ee-prototype</Link>
+      <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-white/40 bg-white/50 px-4 py-3 text-sm backdrop-blur-md sm:px-6 dark:border-white/10 dark:bg-neutral-950/50">
+        {/* Desktop nav — full list. Hidden on narrow screens; replaced
+            by the hamburger on the right. */}
+        <nav className="hidden items-center gap-4 md:flex">
+          <Link href="/" className="font-semibold">VibeCheck 2.0</Link>
           {email && (
             <>
               <Link href="/rooms" className="text-neutral-600 hover:underline dark:text-neutral-400">rooms</Link>
-              {devMode && <Link href="/status" className="text-neutral-600 hover:underline dark:text-neutral-400">status</Link>}
+              <Link href="/invites" className="text-neutral-600 hover:underline dark:text-neutral-400">invites</Link>
+              {devMode && (
+                <Link href="/status" className="text-neutral-600 hover:underline dark:text-neutral-400">status</Link>
+              )}
               <Link href="/settings" className="text-neutral-600 hover:underline dark:text-neutral-400">settings</Link>
             </>
           )}
+          <Link href="/about" className="text-neutral-600 hover:underline dark:text-neutral-400">about</Link>
         </nav>
-        <div className="flex items-center gap-3">
+
+        {/* Mobile: logo only on the left. Everything else collapses into
+            the hamburger on the right. */}
+        <Link href="/" className="font-semibold md:hidden">VibeCheck 2.0</Link>
+
+        {/* Desktop right-side: theme toggle + email + id + sign-out */}
+        <div className="hidden items-center gap-3 md:flex">
+          <ThemeToggle compact />
           {email ? (
             <>
-              <span className="text-neutral-500">{email}</span>
+              <div className="flex min-w-0 flex-col items-end leading-tight">
+                <span className="truncate text-xs text-neutral-500">{email}</span>
+                {userId && <UserIdChip userId={userId} />}
+              </div>
               <button
                 onClick={handleSignOut}
-                className="rounded border border-neutral-300 px-2 py-1 text-xs hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-900"
+                className="rounded-full border border-white/50 bg-white/50 px-3 py-1 text-xs backdrop-blur-md transition-all hover:bg-white/80 hover:shadow-sm active:scale-[0.98] dark:border-white/10 dark:bg-neutral-900/50 dark:hover:bg-neutral-900/80"
               >
                 sign out
               </button>
@@ -200,10 +222,19 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
             <span className="text-neutral-500">not signed in</span>
           )}
         </div>
+
+        {/* Mobile hamburger — collapses rooms/status/settings PLUS the
+            user-identity block + sign-out into one menu. */}
+        <MobileNavMenu
+          email={email}
+          userId={userId}
+          devMode={devMode}
+          onSignOut={handleSignOut}
+        />
       </header>
       <main className="flex-1 p-6">
         {email && (
-          <div className="mb-4 space-y-2">
+          <div className="mx-auto mb-4 max-w-5xl space-y-2">
             <PendingApprovalBanner />
             <KeyChangeBanner />
           </div>
@@ -212,5 +243,181 @@ export function AppShell({ children, requireAuth = false }: AppShellProps) {
       </main>
       {userId && <IncomingCallToast userId={userId} />}
     </div>
+  );
+}
+
+/**
+ * Hamburger menu shown only below the `md:` breakpoint. Collapses the
+ * whole global nav (rooms / status / settings) plus the user identity
+ * block + sign-out into one dropdown so the iPhone header is just
+ * `logo · ⋯`.
+ */
+function MobileNavMenu({
+  email,
+  userId,
+  devMode,
+  onSignOut,
+}: {
+  email: string | null;
+  userId: string | null;
+  devMode: boolean;
+  onSignOut: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onPointer(e: PointerEvent) {
+      const el = wrapRef.current;
+      if (el && !el.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setOpen(false);
+    }
+    document.addEventListener('pointerdown', onPointer);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  return (
+    <div ref={wrapRef} className="relative md:hidden">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-label="menu"
+        aria-expanded={open}
+        className="relative flex h-9 w-9 items-center justify-center rounded-full border border-white/50 bg-white/60 text-neutral-700 shadow-sm backdrop-blur-md transition-all hover:bg-white/80 active:scale-[0.96] dark:border-white/10 dark:bg-neutral-900/60 dark:text-neutral-300"
+      >
+        <span aria-hidden className="text-base leading-none">⋯</span>
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 top-full z-50 mt-2 flex w-64 flex-col overflow-hidden rounded-2xl border border-white/60 bg-white/95 shadow-2xl backdrop-blur-md dark:border-white/10 dark:bg-neutral-900/95"
+        >
+          {email ? (
+            <>
+              <div className="border-b border-neutral-200/60 px-4 py-3 dark:border-neutral-700/60">
+                <p className="truncate text-[11px] text-neutral-500">{email}</p>
+                {userId && (
+                  <div className="mt-1">
+                    <UserIdChip userId={userId} />
+                  </div>
+                )}
+              </div>
+              <Link
+                href="/rooms"
+                onClick={() => setOpen(false)}
+                className="flex items-center justify-between px-4 py-2.5 font-display italic text-sm text-neutral-800 hover:bg-neutral-100/60 dark:text-neutral-200 dark:hover:bg-neutral-800/60"
+              >
+                <span>Rooms</span>
+                <span aria-hidden>🏠</span>
+              </Link>
+              <Link
+                href="/invites"
+                onClick={() => setOpen(false)}
+                className="flex items-center justify-between px-4 py-2.5 font-display italic text-sm text-neutral-800 hover:bg-neutral-100/60 dark:text-neutral-200 dark:hover:bg-neutral-800/60"
+              >
+                <span>Invites</span>
+                <span aria-hidden>💌</span>
+              </Link>
+              {devMode && (
+                <Link
+                  href="/status"
+                  onClick={() => setOpen(false)}
+                  className="flex items-center justify-between px-4 py-2.5 font-display italic text-sm text-neutral-800 hover:bg-neutral-100/60 dark:text-neutral-200 dark:hover:bg-neutral-800/60"
+                >
+                  <span>Status</span>
+                  <span aria-hidden>🔌</span>
+                </Link>
+              )}
+              <Link
+                href="/settings"
+                onClick={() => setOpen(false)}
+                className="flex items-center justify-between px-4 py-2.5 font-display italic text-sm text-neutral-800 hover:bg-neutral-100/60 dark:text-neutral-200 dark:hover:bg-neutral-800/60"
+              >
+                <span>Settings</span>
+                <span aria-hidden>⚙️</span>
+              </Link>
+              <Link
+                href="/about"
+                onClick={() => setOpen(false)}
+                className="flex items-center justify-between px-4 py-2.5 font-display italic text-sm text-neutral-800 hover:bg-neutral-100/60 dark:text-neutral-200 dark:hover:bg-neutral-800/60"
+              >
+                <span>About</span>
+                <span aria-hidden>ℹ️</span>
+              </Link>
+              <div className="flex items-center justify-between border-t border-neutral-200/60 px-4 py-2.5 dark:border-neutral-700/60">
+                <span className="font-display italic text-sm text-neutral-800 dark:text-neutral-200">
+                  Theme
+                </span>
+                <ThemeToggle />
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpen(false);
+                  onSignOut();
+                }}
+                className="border-t border-neutral-200/60 px-4 py-2.5 text-left font-display italic text-sm text-red-700 hover:bg-red-50/80 dark:border-neutral-700/60 dark:text-red-300 dark:hover:bg-red-950/40"
+              >
+                Sign out
+              </button>
+            </>
+          ) : (
+            <>
+              <Link
+                href="/about"
+                onClick={() => setOpen(false)}
+                className="flex items-center justify-between px-4 py-2.5 font-display italic text-sm text-neutral-800 hover:bg-neutral-100/60 dark:text-neutral-200 dark:hover:bg-neutral-800/60"
+              >
+                <span>About</span>
+                <span aria-hidden>ℹ️</span>
+              </Link>
+              <p className="px-4 py-3 text-sm text-neutral-500">not signed in</p>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Subtle user-id chip. Copies the full UUID to the clipboard on click so
+ * users can hand it to a partner without hunting through settings.
+ */
+function UserIdChip({ userId }: { userId: string }) {
+  const [copied, setCopied] = useState(false);
+  const short = userId.slice(0, 8);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(userId);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    } catch {
+      // clipboard may be blocked — fail silently, the visible id still helps.
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => void copy()}
+      title={`Your user id · click to copy\n${userId}`}
+      aria-label={`Your user id ${userId}, click to copy`}
+      className="group flex items-center gap-1 rounded-full border border-white/40 bg-white/30 px-2 py-0.5 font-mono text-[10px] text-neutral-400 transition-all hover:bg-white/60 hover:text-neutral-700 active:scale-[0.97] dark:border-white/10 dark:bg-neutral-900/30 dark:hover:bg-neutral-900/60 dark:hover:text-neutral-300"
+    >
+      <span className="opacity-70 transition-opacity group-hover:opacity-100">id</span>
+      <span className="tabular-nums">{short}…</span>
+      <span aria-hidden className="text-[9px] opacity-0 transition-opacity group-hover:opacity-100">
+        {copied ? '✓' : '⧉'}
+      </span>
+    </button>
   );
 }

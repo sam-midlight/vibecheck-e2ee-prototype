@@ -45,59 +45,70 @@ export function PinSetupModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
       <form
         onSubmit={submit}
-        className="w-full max-w-sm space-y-3 rounded bg-white p-4 text-sm dark:bg-neutral-900"
+        className="w-full max-w-md space-y-4 rounded-3xl border border-white/60 bg-white/95 p-6 text-sm shadow-2xl backdrop-blur-md dark:border-white/10 dark:bg-neutral-900/95"
       >
-        <h3 className="text-base font-semibold">
-          {heading ?? 'Set a device passphrase'}
-        </h3>
-        <p className="text-xs text-neutral-600 dark:text-neutral-400">
-          {blurb ??
-            'Used to unlock your identity on this device. Argon2id-based — brute-force is slow but not impossible for short PINs; pick 8+ characters if you can. If you forget it and don\u2019t have a recovery phrase, this device is unrecoverable.'}
-        </p>
-        {mandatory && (
-          <p className="text-xs text-neutral-500 dark:text-neutral-500">
-            One-time setup — required so your keys can&apos;t be read at rest. You can change this passphrase later in Settings.
+        <div>
+          <h3 className="font-display italic text-2xl text-neutral-900 dark:text-neutral-50">
+            {heading ?? 'Set a device passphrase'}
+          </h3>
+          <p className="mt-2 text-sm leading-relaxed text-neutral-700 dark:text-neutral-300">
+            {blurb ??
+              'Used to unlock your identity on this device. Argon2id-based — brute-force is slow but not impossible for short PINs; pick 8+ characters if you can. If you forget it and don\u2019t have a recovery phrase, this device is unrecoverable.'}
           </p>
-        )}
-        <div>
-          <label className="text-xs text-neutral-500">passphrase</label>
-          <input
-            type="password"
-            autoFocus
-            value={passphrase}
-            onChange={(e) => setPassphrase(e.target.value)}
-            className="mt-1 block w-full rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700 dark:bg-neutral-900"
-          />
+          {mandatory && (
+            <p className="mt-2 text-xs leading-relaxed text-amber-700 dark:text-amber-300">
+              One-time setup — required so your keys can&apos;t be read at rest. You can change this passphrase later in Settings.
+            </p>
+          )}
         </div>
-        <div>
-          <label className="text-xs text-neutral-500">confirm</label>
-          <input
-            type="password"
-            value={confirmPassphrase}
-            onChange={(e) => setConfirmPassphrase(e.target.value)}
-            className="mt-1 block w-full rounded border border-neutral-300 px-2 py-1 dark:border-neutral-700 dark:bg-neutral-900"
-          />
+
+        <div className="space-y-3">
+          <label className="block">
+            <span className="text-[11px] font-medium uppercase tracking-[0.18em] text-neutral-700 dark:text-neutral-300">
+              Passphrase
+            </span>
+            <input
+              type="password"
+              autoFocus
+              value={passphrase}
+              onChange={(e) => setPassphrase(e.target.value)}
+              className="mt-1.5 block w-full rounded-xl border border-neutral-300 bg-white/95 px-3 py-2 text-sm text-neutral-900 outline-none transition-colors focus:border-amber-300 focus:ring-2 focus:ring-amber-300/40 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[11px] font-medium uppercase tracking-[0.18em] text-neutral-700 dark:text-neutral-300">
+              Confirm
+            </span>
+            <input
+              type="password"
+              value={confirmPassphrase}
+              onChange={(e) => setConfirmPassphrase(e.target.value)}
+              className="mt-1.5 block w-full rounded-xl border border-neutral-300 bg-white/95 px-3 py-2 text-sm text-neutral-900 outline-none transition-colors focus:border-amber-300 focus:ring-2 focus:ring-amber-300/40 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
+            />
+          </label>
         </div>
-        {err && <p className="text-xs text-red-600">{err}</p>}
-        <div className="flex gap-2">
+
+        {err && <p className="text-xs text-red-600 dark:text-red-400">{err}</p>}
+
+        <div className="flex gap-2 pt-1">
           <button
             type="submit"
             disabled={busy}
-            className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+            className="rounded-full bg-gradient-to-br from-amber-200 via-amber-300 to-amber-400 px-5 py-2 font-display italic text-sm text-amber-950 shadow-[0_8px_20px_-4px_rgba(217,119,6,0.5),inset_0_2px_3px_rgba(255,255,255,0.55),inset_0_-3px_6px_rgba(146,64,14,0.25)] ring-1 ring-amber-200/60 transition-all hover:scale-[1.04] active:scale-[1.06] disabled:opacity-50"
           >
-            {busy ? 'saving…' : 'save'}
+            {busy ? 'saving…' : 'Save passphrase'}
           </button>
           {!mandatory && onCancel && (
             <button
               type="button"
               onClick={onCancel}
               disabled={busy}
-              className="rounded border border-neutral-300 px-3 py-1.5 text-xs disabled:opacity-50 dark:border-neutral-700"
+              className="rounded-full border border-neutral-300 bg-white/80 px-4 py-2 font-display italic text-sm text-neutral-800 transition-all hover:scale-[1.04] hover:bg-white active:scale-[1.02] disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-900/60 dark:text-neutral-200"
             >
-              cancel
+              Cancel
             </button>
           )}
         </div>

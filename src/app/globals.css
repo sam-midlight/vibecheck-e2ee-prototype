@@ -1,26 +1,160 @@
 @import "tailwindcss";
 
+/*
+ * Warm Obsidian / Ember at Dusk palette. Tokens defined in
+ * src/lib/design/tokens.ts for JS; CSS vars mirror them so Tailwind
+ * utilities and legacy bg-white/dark-mode selectors render in the
+ * new warm palette without a per-surface sweep.
+ */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #F2EBDF; /* warm parchment */
+  --foreground: #1F1A16; /* near-black, warm */
+  --ember:      #D4572A;
+  --amber:      #E8A04B;
+  --brass:      #9A7A3E;
+  --ink-dim:    #6B5D51;
+  --ink-faint:  #A99A8A;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  /* Body / UI — Geist */
+  --font-sans: var(--font-sans);
+  /* Display — Instrument Serif (editorial italic for room names etc.) */
+  --font-display: var(--font-display);
+  /* Data / small-caps — JetBrains Mono */
+  --font-mono: var(--font-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+/*
+ * Obsidian mode (Safe Space). Applied via <html data-theme="obsidian">
+ * by the Safe Space toggle — entire UI flips to the dusk/night palette.
+ */
+html[data-theme="obsidian"] {
+  --background: #0F0C0A;
+  --foreground: #EDE3D3;
+  --ember:      #E8A04B;
+  --amber:      #F0C07A;
+  --brass:      #A8B5C4; /* moon */
+  --ink-dim:    #8A7E70;
+  --ink-faint:  #574E44;
+}
+
+/*
+ * Base page: a warm parchment gradient sits behind the <LavaLamp />
+ * canvas (mounted as fixed inset-0 z-0 in layout.tsx). The lava blobs
+ * drift above this gradient and below every app surface.
+ */
+body {
+  background:
+    radial-gradient(ellipse 70% 60% at 18% 0%, rgba(255, 200, 150, 0.28), transparent 60%),
+    radial-gradient(ellipse 70% 55% at 82% 8%, rgba(255, 170, 120, 0.22), transparent 60%),
+    radial-gradient(ellipse 95% 60% at 50% 100%, rgba(212, 87, 42, 0.18), transparent 70%),
+    linear-gradient(180deg, #F6EFE3 0%, #EEDFCB 100%);
+  background-attachment: fixed;
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, -apple-system, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html[data-theme="obsidian"] body {
+  background:
+    radial-gradient(ellipse 70% 55% at 18% 0%, rgba(212, 87, 42, 0.22), transparent 60%),
+    radial-gradient(ellipse 70% 55% at 82% 8%, rgba(168, 181, 196, 0.18), transparent 60%),
+    radial-gradient(ellipse 95% 55% at 50% 100%, rgba(232, 160, 75, 0.18), transparent 70%),
+    linear-gradient(180deg, #14110E 0%, #0A0807 100%);
+  background-attachment: fixed;
+}
+
+/* Respect prefers-reduced-motion: kill every CSS-driven continuous loop
+   (starfield twinkle, starfield drift, pulse, and any other long-running
+   animation) so vestibular-sensitive users aren't dragged around by the
+   ambient motion. Framer Motion components use the useReducedMotion hook
+   (see motionPrefs.ts) to opt out on the JS side — this block catches the
+   CSS-only ones. `transform: none` keeps static positioning without
+   disabling hover/active affordances entirely. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    animation-delay: 0s !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* Vibe slider — high-visibility track + glowing thumb so the control
+   stays legible against the lava-lamp background in both light and
+   dark mode. The browser default `accent-color` styling left the
+   thumb almost invisible against obsidian + ember blobs. */
+.vibe-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.vibe-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(125, 168, 201, 0.25), rgba(125, 168, 201, 0.55));
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+.vibe-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(125, 168, 201, 0.25), rgba(125, 168, 201, 0.55));
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+
+html[data-theme="obsidian"] .vibe-slider::-webkit-slider-runnable-track,
+html[data-theme="obsidian"] .vibe-slider::-moz-range-track {
+  background: linear-gradient(90deg, rgba(232, 160, 75, 0.30), rgba(212, 87, 42, 0.55));
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+/* Per-user thumb colour: parent sets `--slider-hue: #rrggbb`; the thumb
+   gradient + glow read from it. Falls back to the warm rose default
+   when no var is set (e.g. unthemed contexts). */
+.vibe-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  margin-top: -8px;
+  background: radial-gradient(circle at 32% 28%, #ffffff 0%, var(--slider-hue, #ff8fa3) 55%, var(--slider-hue, #d4572a) 100%);
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  box-shadow:
+    0 0 14px var(--slider-hue, rgba(255, 143, 163, 0.85)),
+    0 4px 10px -2px var(--slider-hue, rgba(212, 87, 42, 0.55)),
+    inset 0 1px 1px rgba(255, 255, 255, 0.6);
+  transition: transform 120ms ease;
+}
+.vibe-slider::-webkit-slider-thumb:hover { transform: scale(1.1); }
+.vibe-slider::-webkit-slider-thumb:active { transform: scale(1.15); }
+
+.vibe-slider::-moz-range-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 32% 28%, #ffffff 0%, var(--slider-hue, #ff8fa3) 55%, var(--slider-hue, #d4572a) 100%);
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  box-shadow:
+    0 0 14px var(--slider-hue, rgba(255, 143, 163, 0.85)),
+    0 4px 10px -2px var(--slider-hue, rgba(212, 87, 42, 0.55)),
+    inset 0 1px 1px rgba(255, 255, 255, 0.6);
+  transition: transform 120ms ease;
+}
+.vibe-slider::-moz-range-thumb:hover { transform: scale(1.1); }
+.vibe-slider::-moz-range-thumb:active { transform: scale(1.15); }
+
+.vibe-slider:focus-visible::-webkit-slider-thumb,
+.vibe-slider:focus-visible::-moz-range-thumb {
+  outline: 3px solid rgba(125, 168, 201, 0.85);
+  outline-offset: 2px;
 }

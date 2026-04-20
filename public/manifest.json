@@ -1,0 +1,19 @@
+{
+  "name": "VibeCheck 2.0",
+  "short_name": "VibeCheck",
+  "description": "A private, end-to-end-encrypted space for just the two of you.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#faf5ff",
+  "theme_color": "#faf5ff",
+  "categories": ["lifestyle", "social"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
