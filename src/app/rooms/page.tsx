@@ -88,7 +88,7 @@ function RoomsInner() {
       if (!data.user) return;
       const dev = await loadEnrolledDevice(data.user.id);
       if (!dev) {
-        router.replace('/auth/bootstrap');
+        router.replace('/auth/callback');
         return;
       }
       setUserId(data.user.id);

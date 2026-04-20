@@ -9,7 +9,7 @@
  *
  * Bails out to /rooms if the user already belongs to any room (so
  * /onboarding is never a nag for returning users). Bails to / if not
- * authenticated, and to /auth/bootstrap if device keys are missing.
+ * authenticated, and to /auth/callback if device keys are missing.
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -78,7 +78,7 @@ function OnboardingInner() {
 
         const id = await loadEnrolledDevice(data.user.id);
         if (!id) {
-          router.replace('/auth/bootstrap');
+          router.replace('/auth/callback');
           return;
         }
         setDevice(id);
