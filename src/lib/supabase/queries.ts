@@ -2073,6 +2073,32 @@ export async function acceptTos(userId: string, version: string): Promise<void> 
   if (error) throw error;
 }
 
+/**
+ * Incremental blob fetch. Returns blobs strictly after `afterCreatedAt`,
+ * oldest-first, capped at `limit`. Used by the room cache to pull only
+ * the delta since the last persisted watermark.
+ */
+export async function listBlobsSince(
+  roomId: string,
+  afterCreatedAt: string,
+  limit = 500,
+): Promise<BlobRow[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('blobs')
+    .select('*')
+    .eq('room_id', roomId)
+    .gt('created_at', afterCreatedAt)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+  if (error) throw error;
+  return (data ?? []) as BlobRow[];
+}
+
+/** Convenience aliases used by RoomProvider + domain layer. */
+export { renameRoom as updateRoomName };
+export { subscribeRoomMetadata as subscribeRoom };
+
 export async function nukeIdentityServer(userId: string): Promise<void> {
   const supabase = getSupabase();
   // Single SECURITY DEFINER RPC that handles all FK-ordered deletes
