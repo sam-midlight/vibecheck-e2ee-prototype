@@ -1,86 +1,109 @@
-# vibecheck-e2ee-prototype
+# vibecheck-e2ee
 
-A standalone prototype proving a **zero-knowledge, per-device E2EE foundation** for a real-time rooms/messaging app. Next.js 16 + Supabase + `libsodium-wrappers-sumo`. The `src/lib/e2ee-core/` module + `src/lib/bootstrap.ts` + all migrations are intentionally designed to be **lifted wholesale into a consuming app**.
+A standalone real-time rooms/messaging + video-calling app built on a **zero-knowledge, per-device E2EE foundation**. Next.js 16 + Supabase + `libsodium-wrappers-sumo` + LiveKit. The crypto core (`src/lib/e2ee-core/`), LiveKit adapter (`src/lib/livekit/`), bootstrap glue (`src/lib/bootstrap.ts`), and migrations are designed to be **lifted wholesale into any downstream E2EE app** — Matrix-aligned cross-signing and per-sender Megolm ratchet on a Supabase backend, ready to reuse.
 
 - **Agent onboarding (read first if you're an AI):** `AGENTS.md`
 - **e2ee-core API reference:** `src/lib/e2ee-core/README.md`
-- **Port into a consuming app:** `docs/port-to-v2.md`
 
 ---
 
-## Architecture at a glance (v3 per-device identities)
+## Architecture at a glance
 
 ```
 ┌──────────────────────────── User account ────────────────────────────┐
 │                                                                      │
-│  User Master Key (UMK) — Ed25519 only                                │
-│  ├── Signs: device issuance certs, device revocation certs           │
-│  ├── Does NOT encrypt messages, does NOT wrap room keys              │
-│  ├── Private half: lives on primary device + (encrypted) in          │
+│  MasterSigningKey (MSK) — Ed25519                                    │
+│  ├── Signs: SSK + USK cross-signatures                               │
+│  ├── Never signs device certs directly                               │
+│  ├── Private half: lives on original primary + (encrypted) in        │
 │  │   recovery_blobs; NEVER transmitted in usable form                │
 │  └── Wrapped by: 24-word BIP-39 phrase (Argon2id) + Passphrase lock  │
 │                                                                      │
+│  SelfSigningKey (SSK) + UserSigningKey (USK) — Ed25519 each          │
+│  ├── SSK signs device issuance + revocation certs                    │
+│  ├── USK signs other users' MSK pubs after SAS verification          │
+│  └── Both sealed to each co-primary device via crypto_box_seal       │
+│                                                                      │
 │  N Device Key Bundles (one per device)                               │
-│  ├── Ed25519 — signs blobs, signs membership ops                     │
-│  ├── X25519  — receives sealed room-key wraps                        │
+│  ├── Ed25519 — signs blobs, membership ops, Megolm session shares    │
+│  ├── X25519  — receives sealed room-key wraps + Megolm snapshots     │
 │  ├── Private halves: generated locally; NEVER leave the device       │
-│  └── Trust chain: devices.issuance_signature verifies against UMK    │
+│  └── Trust chain: device cert ← SSK ← MSK cross-sig ← MSK            │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 
 Per-room, per-generation:
-  • Room symmetric key (32 bytes, XChaCha20-Poly1305)
+  • Room symmetric key (32 bytes, XChaCha20-Poly1305) — used for
+    attachments, sealed room names, bootstrap wrapping
   • Wrapped per-DEVICE via crypto_box_seal to each device.x25519_pub
   • Rotation: admin creates new gen, re-wraps for every current member's
-    devices, atomic via kick_and_rotate RPC (also purges < new_gen - 9)
-  • Also uploaded to key_backup encrypted under a user-scoped backup key
-    (escrowed in the v3 recovery blob; sealed to new devices on approval)
+    devices, atomic via kick_and_rotate RPC (purges rows < new_gen - 9)
+  • Also uploaded to key_backup encrypted under a per-user backup key
+    (escrowed in the recovery blob; sealed to new devices on approval)
+
+Per-sender, per-(room, generation):
+  • Megolm outbound session with HMAC-SHA256 chain key
+  • Ratchets forward on every message
+  • Auto-rotates at 100 msgs / 7 days; server hard-cap 200 msgs
+  • Snapshot sealed per-recipient-device via crypto_box_seal
 ```
 
-### Blob wire format (v3)
+### Blob wire format
 
 ```
 blobs row:
-  { sender_id, sender_device_id, generation, nonce, ciphertext }
+  { sender_id, sender_device_id, generation, nonce, ciphertext,
+    session_id?, message_index? }
 
-AEAD plaintext (JSON envelope):
-  { v: 3, s: sender_user_id, sd: sender_device_id, sig: <base64>, p: <payload> }
-  • sig = sign(domain || room_id || gen || nonce || sha256(payload),
-              sender_device_ed_priv)
-  • Verifier: fetch devices row by (sender_id, sender_device_id),
-              verify issuance cert against user's UMK, then check sig.
+AEAD plaintext (JSON envelope, v4 — Megolm):
+  { v: 4, s: sender_user_id, sd: sender_device_id, sid: session_id,
+    mi: message_index, sig: <base64>, p: <payload> }
+  • sig = sign(domain || room_id || session_id || message_index
+              || nonce || payloadBytes, sender_device_ed_priv)
+  • Verifier: resolve device via {sender_id, sender_device_id},
+    chain-verify cert (SSK → MSK), derive message_key from inbound
+    Megolm snapshot at index, AEAD-decrypt, verify sig.
+
+AEAD AD:
+  • v4 = room_id(16) || session_id(32) || message_index(4 BE).
+    Binding to (room, session, index) means replay fails.
+  • v3 = room_id(16) || generation(4 BE). Binding to (room, gen)
+    means replay across rooms / generations fails.
 ```
 
-## Trust model (what we defend against)
+## Trust model
 
 | Attacker | Outcome |
 |---|---|
 | Supabase operator (curious) | Sees routing metadata (who posted to which room when). Cannot decrypt; cannot forge writes that verify. |
-| Supabase operator (row-mutating, `service_role` leak, SQL injection) | Cannot add a "ghost device" to an account — missing UMK signature fails every client's `verifyPublicDevice`. Cannot impersonate an inviter — signed envelope fails on accept. |
-| Compromised secondary device | Attacker has THAT device's bundle only. Cannot sign device certs (no UMK). Next UMK rotation evicts them; explicit revocation evicts them instantly. |
-| Compromised primary device (UMK priv exfiltrated) | Full account takeover until user rotates UMK. Mitigation: Settings → "Rotate & generate new phrase" signs a fresh UMK + new phrase + cascades room-key rotation on every admin-owned room. |
-| Attacker with mailbox, no phrase | Signs in, hits device-linking-chooser, needs either a 6-digit code from an existing device OR the phrase. Cannot enroll unilaterally. |
+| Supabase operator (row-mutating, service_role leak, SQL injection) | Cannot add a "ghost device" — missing SSK signature (chained to MSK) fails every client's `verifyPublicDevice`. Cannot impersonate an inviter — signed envelope fails on accept. Cannot bypass Megolm 200-cap or rewind a session counter — BEFORE-INSERT / BEFORE-UPDATE triggers reject. |
+| Compromised secondary device | Attacker has THAT device's bundle + SSK + USK. Cannot sign cross-sigs (no MSK). Next MSK rotation with device-trust picker evicts them; explicit revocation evicts them instantly. |
+| Compromised primary device (MSK priv exfiltrated) | Full account takeover until user rotates MSK. Mitigation: Settings → "Rotate & generate new phrase" signs a fresh MSK + SSK + USK + new phrase, optionally revokes ghost devices via the picker, and cascades room-key rotation on every admin-owned room. |
+| Attacker with mailbox, no phrase | Signs in, hits device-linking-chooser, needs either a 6-digit approval code from an existing device OR the phrase. Cannot enroll unilaterally. |
 | Attacker with mailbox + phrase | Account compromise. Phrase is a standalone credential by design — store it offline. |
-| Removed group member | Row deleted at kick time; they're excluded from new gen immediately. Cached past-gen keys stay decryptable on their device (no server-side revocation of what they already saw) but `< new_gen - 9` wraps are server-purged so fresh sessions can't rebuild them. |
-| Stolen unlocked device (no passphrase set) | Full access to this device's room memberships. **But passphrase lock is enforced as default since Point 19 fix** — any newly-enrolled device must set one before reaching `/rooms`. |
+| Removed group member | Row deleted at kick time; excluded from new gen immediately. Cached past-gen keys stay decryptable on their device. `< new_gen - 9` wraps are server-purged so fresh sessions can't rebuild them. |
+| Stolen unlocked device (no passphrase set) | Full access to this device's room memberships. Mitigation: passphrase lock is enforced as default — any newly-enrolled device must set one before reaching `/rooms`. |
 | Stolen locked device | Argon2id (opslimit 3 / memlimit 256 MiB) protects the wrapped bundle. Attacker must brute-force the passphrase offline. |
-| Server-side abuse scanning / CSAM detection | Impossible by design. Images are client-re-encoded (EXIF stripped), AEAD-encrypted under room key + bound to `{room_id, blob_id, generation}`, stored as opaque bytes. Policy decision — accept before shipping to a general audience. |
+| Server-side abuse scanning / CSAM detection | Impossible by design. Images are client-re-encoded (EXIF stripped), AEAD-encrypted under room key bound to `{room_id, blob_id, generation}`, stored as opaque bytes. |
+| Unverified contact MSK swap | TOFU alerts the user on MSK change. SAS-verified contacts get an escalated alert because their USK-cross-signature breaks. |
 
 ## Core design choices
 
-- **Signal/Matrix-style per-device identity**, not Bitwarden-style single-root-key. A device compromise scopes to that one device; the UMK stays on one (or zero) device at a time.
+- **Matrix-aligned cross-signing** (MSK / SSK / USK) with per-device key bundles. Device compromise scopes to one device + SSK/USK; MSK stays cold.
+- **Per-sender Megolm ratchet** for forward secrecy within a generation. Compromise of `message_key[N]` does not reveal `message_key[<N]`.
 - **`libsodium-wrappers-sumo`** — Argon2id + `crypto_box_seal` + XChaCha20-Poly1305 in one audited library.
-- **XChaCha20-Poly1305 AEAD for all ciphertexts** — random 24-byte nonce is safe without state.
-- **Sealed-box wrapping** (`crypto_box_seal`) for room keys — anonymous sender, keyed only by recipient device's X25519 pubkey. Correct semantics for "post this key for a specific device."
-- **Per-generation shared room key** (not per-message ratcheting) — O(1) send, O(N·devices) re-wrap on membership change. 10-generation retention window for "read history on fresh sessions" UX, paired with aggressive server-side purge of older wraps.
+- **XChaCha20-Poly1305 AEAD** — random 24-byte nonce is safe without state.
+- **Sealed-box wrapping** (`crypto_box_seal`) for room keys + Megolm snapshots + SSK+USK + backup key.
+- **Per-generation shared room key** with 10-generation retention + aggressive server-side purge of older wraps.
 - **Atomic `kick_and_rotate` RPC** — evictee delete + new-gen wraps + gen bump + stale-invite purge + FS purge in one SECURITY DEFINER transaction. Conditional `current_generation = old_gen` guard rejects concurrent rotations.
-- **Blob sigs inside AEAD** — the outer `blobs.signature` column is null on new rows; the Ed25519 signature rides inside the encrypted envelope. Server no longer stores a per-sender fingerprint linkable across blobs.
-- **Transcript-bound 6-digit approval code** — `hash = SHA-256(domain || salt || code || linking_pubkey || link_nonce)` + server-side `verify_approval_code` RPC with 5-attempt limit and 2-minute TTL. Not a PAKE (deferred), but closes the active row-swap attack.
-- **Mandatory PIN-lock** — first sign-in / first unlock / first enrollment all pass through `require-pin-setup`. Identity is Argon2id-wrapped in IndexedDB; plaintext-in-IDB is no longer the default posture.
-- **Crash-safe UMK rotation (SSSS ordering)** — the new recovery blob is persisted BEFORE the new UMK pub is published. A browser crash mid-rotation leaves the user recoverable via phrase instead of locked out. Follows Matrix's Secure Secret Storage pattern (`generateRotatedUmk` → `commitRotatedUmk` split in `bootstrap.ts`).
-- **UMK rotation cascades to room rotation** — rotating the master key also re-keys every room the user admins, so ghost devices can't retain room access.
-- **Server-side room-key backup (Matrix-style)** — an opt-in per-user backup key (escrowed inside the v3 recovery blob; sealed to new devices via `devices.backup_key_wrap`) encrypts every room key into `key_backup`. New devices restore full history without the sender having to be online.
-- **Implicit auth flow, not PKCE** — `src/lib/supabase/client.ts` uses `flowType: 'implicit'`. Email magic link comes back in URL hash rather than needing a verifier stored in the requesting browser. Lets users request in Browser B and open the email in Browser A. If porting to SSR-first, switch back to `pkce` with `@supabase/ssr` cookie storage.
+- **Transcript-bound 6-digit approval code** — `hash = SHA-256(domain || salt || code || linking_pubkey || link_nonce)` + server-side `verify_approval_code` RPC with 5-attempt limit and 2-minute TTL.
+- **Mandatory PIN-lock** — first sign-in / first unlock / first enrollment all pass through `require-pin-setup`. Identity is Argon2id-wrapped in IndexedDB.
+- **Crash-safe MSK rotation** — new recovery blob persists BEFORE the new MSK pub is published. A browser crash mid-rotation leaves the user recoverable via phrase instead of locked out.
+- **MSK rotation cascades to room rotation** and offers a **device-trust picker** to revoke ghost devices atomically with cert reissuance.
+- **Server-side room-key backup (Matrix-style)** — per-user backup key (escrowed in the recovery blob; sealed to new devices via `devices.backup_key_wrap`) encrypts every room key + Megolm snapshot into `key_backup`. New devices restore full history.
+- **SAS emoji verification** — 7 emoji from ephemeral ECDH + HKDF; on success, USK cross-signs peer's MSK pub in `cross_user_signatures`.
+- **Implicit auth flow, not PKCE** — `src/lib/supabase/client.ts` uses `flowType: 'implicit'`. Magic link comes back in URL hash rather than needing a verifier stored in the requesting browser. Users can request in Browser B and open the email in Browser A.
+- **E2EE video calls via LiveKit SFrame** — `CallKey` primitive wraps per-device; LiveKit SFU sees only opaque SFrame-encrypted media.
 
 ## Project layout
 
@@ -90,59 +113,47 @@ src/
 │   ├── page.tsx                          Landing + magic-link form
 │   ├── auth/callback/page.tsx            Identity bootstrap, approval,
 │   │                                     recovery, unlock, enforce-PIN gate
-│   ├── api/dev/magic-link/route.ts       ⚠ TEMP dev shortcut — revert
-│   │                                     before real-audience deploy
+│   ├── api/dev/magic-link/route.ts       ⚠ TEMP dev shortcut
 │   ├── rooms/page.tsx                    Rooms list + create + invite
 │   ├── rooms/[id]/page.tsx               Room detail, messages, rotate,
 │   │                                     in-room invite, nicknames
+│   ├── rooms/[id]/call/                  E2EE video call (LiveKit SFrame)
 │   ├── settings/page.tsx                 Safety number, recovery phrase,
-│   │                                     device list + revoke, PIN-lock
-│   └── status/page.tsx                   Green-dot diagnostic dashboard
+│   │                                     device list + revoke, PIN-lock,
+│   │                                     SAS verification launch
+│   └── status/page.tsx                   Diagnostic dashboard
 ├── components/                           AppShell, PinSetupModal,
 │                                         RecoveryPhraseModal, ...
 ├── lib/
 │   ├── e2ee-core/                        ★ Pure crypto — copy verbatim
-│   │   ├── device.ts                     UMK + DeviceKeyBundle + certs
+│   │   ├── device.ts                     MSK + DeviceKeyBundle + certs
+│   │   ├── cross-signing.ts              SSK + USK + cross-sig chain
+│   │   ├── sas.ts                        SAS emoji verification
+│   │   ├── megolm.ts                     Per-sender ratchet
 │   │   ├── membership.ts                 Invite + wrap signatures
-│   │   ├── blob.ts                       v3 envelope (sig inside AEAD)
+│   │   ├── blob.ts                       v4 Megolm / v3 flat-key envelope
 │   │   ├── room.ts                       Keygen, wrap, unwrap, rotate
 │   │   ├── pin-lock.ts                   Argon2id-wrapped device state
-│   │   ├── recovery.ts                   BIP-39 phrase wraps UMK priv
+│   │   ├── recovery.ts                   BIP-39 phrase wraps MSK priv
 │   │   ├── attachment.ts                 Image re-encode + AEAD
 │   │   ├── approval.ts                   6-digit code hash
-│   │   ├── linking.ts                    (legacy — kept for back-compat)
-│   │   ├── storage.ts                    IndexedDB for device/umk/wrapped
-│   │   ├── tofu.ts                       Key-change detection
+│   │   ├── linking.ts                    QR handoff
+│   │   ├── call.ts                       CallKey primitive (LiveKit E2EE)
+│   │   ├── storage.ts                    IndexedDB for device/MSK/SSK/USK/...
+│   │   ├── tofu.ts                       MSK-pub change detection
 │   │   ├── identity.ts                   Sign/verify primitives
 │   │   └── sodium.ts                     Lazy libsodium init + encoders
-│   ├── bootstrap.ts                      ★ App-glue helpers: bootstrapNewUser,
-│   │                                     enrollDeviceWithUmk, rotateUserMasterKey,
-│   │                                     rotateAllRoomsIAdmin, loadEnrolledDevice
+│   ├── livekit/                          ★ LiveKit SFU adapter (video)
+│   ├── bootstrap.ts                      ★ App-glue helpers
+│   ├── cache-store.ts                    Ciphertext blob cache + cursor
+│   ├── tab-sync.ts                       BroadcastChannel identity signal
 │   └── supabase/                         Client + typed queries
 supabase/
-└── migrations/
-    0001_init                           core schema + RLS + realtime
-    0002_device_approval_and_recovery   device_approval_requests, recovery_blobs
-    0003_room_name                      encrypted room display names
-    0004_room_delete                    rooms_creator_delete policy
-    0005_tighten_handoff_rls            handoffs_owner_all
-    0006_attachments_bucket             room-attachments bucket + RLS
-    0007_pair_cap_and_admin_delete      pair=2 trigger + admin-only kick
-    0008_backport_live_helpers          is_room_member_at + my_room_ids +
-                                        room_current_generation (SECURITY DEFINER)
-    0009_atomic_kick_and_rotate         kick_and_rotate RPC, same-gen RLS
-    0010_approval_attempt_limiter       verify_approval_code RPC
-    0011_signed_membership              inviter_signature + wrap_signature
-    0012_identity_epoch                 auto-bump trigger on UMK change
-    0013_auto_rotate_and_purge          last_rotated_at + FS purge
-    0014_blob_signature_nullable        sig moves inside AEAD
-    0015_per_device_identities          ★ STRUCTURAL PIVOT — UMK + device keys
-    0016_display_name_and_not_null      sealed-to-self display_name + NOT NULL
-    0017_public_read_devices            devices SELECT = authenticated
-    0018_purge_stale_invites_on_rotate  kick_and_rotate also wipes stale invites
-    0019_retain_10_generations          FS window 2 → 10 gens
-    0020_nullable_linking_pubkey        drops NOT NULL on legacy v1/v2 column
-    0022_key_backup                     key_backup table + devices.backup_key_wrap
+├── migrations/                           Linear SQL schema
+└── functions/
+    └── livekit-token/                    Deno edge fn — 5-min JWTs
+public/
+└── livekit-e2ee-worker.mjs               Prebuilt LiveKit E2EE worker
 ```
 
 ## Getting started
@@ -156,11 +167,12 @@ npm run dev                   # http://localhost:3000
 ### Supabase setup (one-time)
 
 1. Create a project at [supabase.com](https://supabase.com).
-2. Settings → API → copy URL + anon key to `.env.local`. (For dev magic-link shortcut, also copy `service_role` to `SUPABASE_SERVICE_ROLE_KEY` — server-only env var, never bundle to browser.)
+2. Settings → API → copy URL + anon key to `.env.local`. For the dev magic-link shortcut, also copy `service_role` to `SUPABASE_SERVICE_ROLE_KEY` — server-only env var, never bundle to browser.
 3. Auth → Providers → enable Email.
 4. Auth → URL Configuration → add `http://localhost:3000/auth/callback` to redirect allow-list.
-5. SQL Editor → paste each file in `supabase/migrations/` in order and run. (Or use the Supabase CLI's `db push`.)
-6. Database → Replication → ensure Realtime is on for `blobs`, `room_invites`, `device_approval_requests`. (`room_members` is intentionally NOT published — migration 0009 removed it.)
+5. SQL Editor → apply each file in `supabase/migrations/` in order. (Or use `supabase db push`.)
+6. Database → Replication → migrations auto-add these tables to `supabase_realtime`: `blobs`, `room_invites`, `device_link_handoffs`, `device_approval_requests`, `rooms`, `calls`, `sas_verification_sessions`, `cross_user_signatures`, `key_forward_requests`, `megolm_session_shares`. Intentionally NOT published (scoped per-device / too chatty): `room_members`, `call_members`, `call_key_envelopes` — clients fetch these lazily on a generation-bump signal.
+7. For video calls, deploy `supabase/functions/livekit-token/` and configure LiveKit host/API-key secrets.
 
 ### Verification walkthrough
 
@@ -170,26 +182,23 @@ npm run dev                   # http://localhost:3000
 4. User B: Rooms → accept invite (safety-number shown at accept time).
 5. Both users → open the room. Send a message. Realtime delivery.
 6. Supabase Table Editor → `blobs` → ciphertext is opaque base64.
-7. Settings → "Your safety number" matches between the two browsers (read it out to confirm).
-8. Kick a member → `rooms.current_generation` bumps.
+7. Settings → "Your safety number" matches between the two browsers.
+8. Settings → verify contact via SAS emoji flow.
+9. Kick a member → `rooms.current_generation` bumps.
 
-## Deploying to Vercel (test/preview only today — see warning below)
+## Deploying to Vercel (test/preview only today)
 
 1. Push to GitHub.
 2. Import on Vercel; set env vars.
 3. Deploy. Add the `*.vercel.app/auth/callback` URL to Supabase redirect allow-list.
 
-**⚠ Temporary state:** `src/app/api/dev/magic-link/route.ts` is an unguarded server endpoint that generates magic links for any email via service-role key. Intentional for today's friends-testing sessions. **Before any real-audience deploy**: delete that file and revert `src/components/MagicLinkForm.tsx` to `supabase.auth.signInWithOtp` (see `docs/port-to-v2.md` for exact steps).
+**⚠ `src/app/api/dev/magic-link/route.ts` is an unguarded server endpoint** that generates magic links for any email via service-role key. Intentional for today's friends-testing. **Before any real-audience deploy**: delete that file and revert `src/components/MagicLinkForm.tsx` to `supabase.auth.signInWithOtp`.
 
-## Known limitations / future upgrades
-
-See `docs/port-to-v2.md` for the full deferred list. Highlights:
+## Known limitations
 
 - **No PAKE** for device approval — transcript-bound hash closes the active attack; CPace/OPAQUE is the textbook fix.
-- **No full Sealed Sender** — signature lives inside AEAD but `sender_id` column is still visible to the server. Full hide needs an Edge Function insert path.
-- **No Megolm-style intra-generation ratchet** — gen-granular FS via rotation + 10-gen retention covers most of the same surface for small/medium groups.
+- **No full Sealed Sender** — signature lives inside AEAD but `sender_id` column is still visible to the server.
 - **No traffic padding** — ciphertext length reflects plaintext length.
 - **No WebCrypto non-extractable keys** — byte-oriented libsodium is the bottleneck.
-- **No "confirm trusted devices" picker during UMK rotation** — today's rotation re-signs every active device. A proper rotation UX asks the user to tick off ghost devices first.
-- **No Key Transparency log** — TOFU is the anchor; a KT log would let clients auto-audit.
+- **No Key Transparency log** — TOFU + SAS is the anchor; a KT log would let clients auto-audit.
 - **Single-device crypto ops (web only)** — for native mobile, mirror the primitives against the platform's preferred library.
