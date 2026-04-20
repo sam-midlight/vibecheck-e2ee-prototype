@@ -587,22 +587,30 @@ export async function rotateUserMasterKey(
 }
 
 /**
- * Rotate one room's symmetric key — a "refresh only" variant of
- * kick_and_rotate (no evictees, all current members retained). Each
- * current member's active devices all get freshly-wrapped new-gen keys.
- * Used by `rotateAllRoomsIAdmin` to cascade a UMK rotation into every
- * room the user administrates.
+ * Rotate one room's symmetric key with an optional evictee set. Every
+ * non-evicted current member's active devices get freshly-wrapped new-gen
+ * keys. Evictees' `room_members` rows are atomically removed server-side
+ * by the `kick_and_rotate` RPC.
  *
- * Caller must be the room's `created_by` and hold the local device bundle
- * (signs the new membership wraps) + have a current-gen `room_members`
- * row (to unwrap the existing room key for re-encrypting the room name).
+ * Caller must hold the local device bundle (signs the new membership
+ * wraps) + have a current-gen `room_members` row (to unwrap the existing
+ * room key for re-encrypting the room name). Server RPC authorizes the
+ * caller as (a) the room creator, or (b) a self-leaver when
+ * `evicteeUserIds == [callerUserId]`.
+ *
+ * Self-leavers are automatically excluded from the keeper/target set so
+ * we don't try to wrap a new-gen key for a device that's being removed.
  */
-async function rotateOneRoomAsAdmin(params: {
+async function rotateRoomMembership(params: {
   userId: string;
   device: DeviceKeyBundle;
   room: RoomRow;
+  /** user_ids to evict in the same atomic step. Empty for a pure rotate. */
+  evicteeUserIds?: string[];
 }): Promise<void> {
   const { device, room } = params;
+  const evictees = params.evicteeUserIds ?? [];
+  const evicteeSet = new Set(evictees);
 
   const roomKey = await verifyAndUnwrapMyRoomKey({
     roomId: room.id,
@@ -658,7 +666,13 @@ async function rotateOneRoomAsAdmin(params: {
     }
   }
 
-  const keeperUserIds = Array.from(new Set(verifiedCurrentMembers.map((m) => m.user_id)));
+  const keeperUserIds = Array.from(
+    new Set(
+      verifiedCurrentMembers
+        .map((m) => m.user_id)
+        .filter((uid) => !evicteeSet.has(uid)),
+    ),
+  );
 
   type Target = { userId: string; device: PublicDevice };
   const targets: Target[] = [];
@@ -723,7 +737,7 @@ async function rotateOneRoomAsAdmin(params: {
 
   await kickAndRotate({
     roomId: room.id,
-    evicteeUserIds: [],
+    evicteeUserIds: evictees,
     oldGeneration: roomKey.generation,
     newGeneration: next.generation,
     wraps: targets.map((t, i) => ({
@@ -735,6 +749,45 @@ async function rotateOneRoomAsAdmin(params: {
     signerDeviceId: device.deviceId,
     nameCiphertext: newNameCiphertext,
     nameNonce: newNameNonce,
+  });
+}
+
+/**
+ * Rotate one room's symmetric key — a "refresh only" wrapper around
+ * `rotateRoomMembership` used by `rotateAllRoomsIAdmin` to cascade a UMK
+ * rotation into every room the user administrates.
+ */
+async function rotateOneRoomAsAdmin(params: {
+  userId: string;
+  device: DeviceKeyBundle;
+  room: RoomRow;
+}): Promise<void> {
+  await rotateRoomMembership({ ...params, evicteeUserIds: [] });
+}
+
+/**
+ * Self-leave a multi-member room while preserving forward secrecy for
+ * the remaining members. Bumps the generation, re-wraps the new room
+ * key for every keeper's active devices (excluding self), and atomically
+ * removes the leaver's row server-side via `kick_and_rotate`. The
+ * leaver's device keeps its old-gen key (past cached messages remain
+ * readable), but cannot decrypt any message sent at the new generation.
+ *
+ * Must not be called when the caller is the sole remaining current-gen
+ * member — use `deleteRoom` for that. Callers should branch on the
+ * sole-member check before invoking this helper.
+ */
+export async function selfLeaveRoom(params: {
+  roomId: string;
+  userId: string;
+  device: DeviceKeyBundle;
+  room: RoomRow;
+}): Promise<void> {
+  await rotateRoomMembership({
+    userId: params.userId,
+    device: params.device,
+    room: params.room,
+    evicteeUserIds: [params.userId],
   });
 }
 

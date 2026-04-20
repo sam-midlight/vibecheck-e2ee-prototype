@@ -522,6 +522,28 @@ export async function listRoomMembers(roomId: string): Promise<RoomMemberRow[]> 
   return (data ?? []) as RoomMemberRow[];
 }
 
+/**
+ * Bulk member fetch by room ids — one query for all rooms, grouped by
+ * `room_id`. Used by the rooms list and invite flow to compute roster
+ * previews without N+1 round trips.
+ */
+export async function listRoomMembersByRoom(
+  roomIds: string[],
+): Promise<Record<string, RoomMemberRow[]>> {
+  if (roomIds.length === 0) return {};
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('room_members')
+    .select('*')
+    .in('room_id', roomIds);
+  if (error) throw error;
+  const grouped: Record<string, RoomMemberRow[]> = {};
+  for (const row of (data ?? []) as RoomMemberRow[]) {
+    (grouped[row.room_id] ??= []).push(row);
+  }
+  return grouped;
+}
+
 /** Fetch THIS device's wrapped room key for a specific generation. */
 export async function getMyWrappedRoomKey(params: {
   roomId: string;
