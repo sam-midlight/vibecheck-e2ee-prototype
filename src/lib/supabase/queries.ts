@@ -2117,6 +2117,31 @@ export async function listBlobsSince(
   return (data ?? []) as BlobRow[];
 }
 
+/**
+ * Broad "any room I can see changed" subscription — watches UPDATE on the
+ * `rooms` table without a room-id filter. Rooms-landing uses this to
+ * refresh the list when a room is renamed / rotated / left elsewhere,
+ * where per-room subscribeRoomMetadata would miss rooms that weren't
+ * mounted yet. RLS gates the firehose to rooms the caller can read.
+ */
+export function subscribeRoomMemberships(
+  _userId: string,
+  onChange: () => void,
+): () => void {
+  const supabase = getSupabase();
+  const channel = supabase
+    .channel(`memberships:any:${crypto.randomUUID()}`)
+    .on(
+      'postgres_changes',
+      { event: 'UPDATE', schema: 'public', table: 'rooms' },
+      () => onChange(),
+    )
+    .subscribe();
+  return () => {
+    void supabase.removeChannel(channel);
+  };
+}
+
 /** Convenience aliases used by RoomProvider + domain layer. */
 export { renameRoom as updateRoomName };
 export { subscribeRoomMetadata as subscribeRoom };

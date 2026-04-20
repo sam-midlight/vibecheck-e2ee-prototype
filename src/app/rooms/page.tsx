@@ -1,43 +1,44 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { AppShell } from '@/components/AppShell';
-import { errorMessage } from '@/lib/errors';
+import { KeyChangeBanner } from '@/components/KeyChangeBanner';
 import { getSupabase } from '@/lib/supabase/client';
 import {
-  CryptoError,
-  decryptRoomName,
-  encryptRoomName,
   fromBase64,
   generateRoomKey,
-  observeContact,
   unwrapRoomKey,
-  verifyInviteEnvelope,
-  type DeviceKeyBundle,
-  type PublicDevice,
 } from '@/lib/e2ee-core';
+import {
+  loadEnrolledDevice,
+  selfLeaveRoom,
+  sendInviteToAllDevices,
+  wrapRoomKeyForAllMyDevices,
+  type EnrolledDevice,
+} from '@/lib/bootstrap';
 import {
   createRoom,
   deleteInvite,
-  deleteInvitesForUserInRoom,
+  deleteRoom,
   fetchPublicDevices,
-  fetchUserMasterKeyPub,
+  getMyWrappedRoomKey,
   listMyInvites,
   listMyRooms,
-  renameRoom,
+  listRoomMembersByRoom,
   subscribeInvites,
+  subscribeRoomMemberships,
   type RoomInviteRow,
+  type RoomMemberRow,
   type RoomRow,
 } from '@/lib/supabase/queries';
-import { loadEnrolledDevice, sendInviteToAllDevices, verifyAndUnwrapMyRoomKey, wrapRoomKeyForAllMyDevices } from '@/lib/bootstrap';
-import { verifyPublicDevice as verifyPublicDeviceChain } from '@/lib/e2ee-core';
-
-function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.byteLength !== b.byteLength) return false;
-  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
+import { appendEventToRoom, renameRoom } from '@/lib/domain/appendToRoom';
+import { describeError } from '@/lib/domain/errors';
+import { resolveRoomName } from '@/lib/domain/roomName';
+import { useNicknames } from '@/lib/domain/nicknames';
+import { Loading } from '@/components/OrganicLoader';
 
 export default function RoomsPage() {
   return (
@@ -48,50 +49,18 @@ export default function RoomsPage() {
 }
 
 function RoomsInner() {
+  const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
-  const [device, setDevice] = useState<DeviceKeyBundle | null>(null);
+  const [device, setDevice] = useState<EnrolledDevice | null>(null);
   const [rooms, setRooms] = useState<RoomRow[]>([]);
   const [invites, setInvites] = useState<RoomInviteRow[]>([]);
-  const [names, setNames] = useState<Map<string, string>>(new Map());
-  const [search, setSearch] = useState('');
+  const [roomNames, setRoomNames] = useState<Record<string, string>>({});
+  const [membersByRoom, setMembersByRoom] = useState<
+    Record<string, RoomMemberRow[]>
+  >({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!userId || !device || rooms.length === 0) return;
-    let cancelled = false;
-    (async () => {
-      const pairs = await Promise.all(
-        rooms.map(async (r): Promise<[string, string] | null> => {
-          if (!r.name_ciphertext || !r.name_nonce) return null;
-          try {
-            const roomKey = await verifyAndUnwrapMyRoomKey({
-              roomId: r.id,
-              userId: userId!,
-              device,
-              generation: r.current_generation,
-            });
-            if (!roomKey) return null;
-            const name = await decryptRoomName({
-              ciphertext: await fromBase64(r.name_ciphertext),
-              nonce: await fromBase64(r.name_nonce),
-              roomId: r.id,
-              roomKey,
-            });
-            return name ? [r.id, name] : null;
-          } catch (e) {
-            console.error('room-name decrypt failed', r.id, errorMessage(e));
-            return null;
-          }
-        }),
-      );
-      if (cancelled) return;
-      setNames(new Map(pairs.filter((p): p is [string, string] => p !== null)));
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [userId, device, rooms]);
+  const { nicknames, setNickname } = useNicknames();
 
   const reload = useCallback(
     async (uid: string) => {
@@ -99,8 +68,14 @@ function RoomsInner() {
         const [r, i] = await Promise.all([listMyRooms(uid), listMyInvites(uid)]);
         setRooms(r);
         setInvites(i);
+        if (r.length > 0) {
+          const byRoom = await listRoomMembersByRoom(r.map((x) => x.id));
+          setMembersByRoom(byRoom);
+        } else {
+          setMembersByRoom({});
+        }
       } catch (e) {
-        setError(errorMessage(e));
+        setError(describeError(e));
       }
     },
     [],
@@ -111,15 +86,20 @@ function RoomsInner() {
       const supabase = getSupabase();
       const { data } = await supabase.auth.getUser();
       if (!data.user) return;
+      const dev = await loadEnrolledDevice(data.user.id);
+      if (!dev) {
+        router.replace('/auth/bootstrap');
+        return;
+      }
       setUserId(data.user.id);
-      const enrolled = await loadEnrolledDevice(data.user.id);
-      setDevice(enrolled?.deviceBundle ?? null);
+      setDevice(dev);
       await reload(data.user.id);
       setLoading(false);
     })();
-  }, [reload]);
+  }, [reload, router]);
 
-  // Realtime: when someone invites me, pop the new invite into the list.
+  // Realtime: when someone invites me, pop the new invite into the list
+  // without waiting for a manual refresh.
   useEffect(() => {
     if (!userId) return;
     const unsub = subscribeInvites(userId, (row) => {
@@ -131,159 +111,146 @@ function RoomsInner() {
     return unsub;
   }, [userId]);
 
-  // Poll every 30s for new rooms + name changes from other devices.
-  // room_members is not in the realtime publication (0009 removed it for
-  // metadata reasons), so polling is the cross-device sync mechanism.
+  // Realtime: when I'm newly added to a room (via Quick Add from a creator,
+  // or by accepting an invite in another tab), refresh the room list so the
+  // room appears without requiring a page reload.
   useEffect(() => {
     if (!userId) return;
-    const interval = setInterval(() => void reload(userId), 30_000);
-    return () => clearInterval(interval);
-  }, [userId, reload]);
+    const unsub = subscribeRoomMemberships(userId, () => {
+      void reload(userId);
+    });
+    return unsub;
+  }, [userId]);
 
-  // Re-sync when tab becomes visible (catches missed realtime events while hidden).
+  // Resolve custom room names by pulling the latest `room_rename` event from
+  // each room's encrypted stream. Runs in parallel; names pop in as they
+  // resolve without blocking the rest of the list.
   useEffect(() => {
-    if (!userId) return;
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') void reload(userId);
+    if (!userId || !device || rooms.length === 0) return;
+    let cancelled = false;
+    for (const room of rooms) {
+      void resolveRoomName({
+        roomId: room.id,
+        userId,
+        device,
+        currentGeneration: room.current_generation,
+      }).then((name) => {
+        if (cancelled || !name) return;
+        setRoomNames((prev) => ({ ...prev, [room.id]: name }));
+      });
+    }
+    return () => {
+      cancelled = true;
     };
-    document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [userId, reload]);
+  }, [userId, device, rooms]);
 
   if (loading || !userId) {
-    return <p className="text-sm text-neutral-500">loading…</p>;
+    return <Loading />;
   }
 
   return (
-    <div className="mx-auto max-w-2xl space-y-6">
-      <section className="rounded border border-neutral-200 p-4 dark:border-neutral-800">
-        <h2 className="text-sm font-semibold">Your user ID</h2>
-        <p className="mt-1 text-xs text-neutral-500">
-          Share this with someone to let them invite you. It&apos;s your Supabase
-          user ID.
+    <div className="mx-auto max-w-2xl space-y-8 pb-16">
+      <KeyChangeBanner />
+
+      {/* Hero */}
+      <section className="pt-6 text-center">
+        <p className="text-xs uppercase tracking-[0.2em] text-neutral-500">
+          Your spaces
         </p>
-        <div className="mt-2 flex items-center gap-2">
-          <code className="flex-1 break-all rounded bg-neutral-100 p-2 font-mono text-xs dark:bg-neutral-900">
+        <h1 className="mt-3 font-display italic text-3xl tracking-tight sm:text-4xl">
+          {rooms.length === 0
+            ? 'Let\u2019s set up your first room.'
+            : rooms.length === 1
+              ? 'One quiet space, waiting.'
+              : `${rooms.length} rooms — pick one to step into.`}
+        </h1>
+        <p className="mx-auto mt-3 max-w-md text-sm text-neutral-600 dark:text-neutral-400">
+          Rooms are private, encrypted, and named only on your device. Invite
+          someone by sharing your ID; accept their invite here.
+        </p>
+      </section>
+
+      {/* Your user ID */}
+      <section className="rounded-2xl border border-white/60 bg-white/60 p-5 shadow-lg backdrop-blur-md dark:border-white/10 dark:bg-neutral-900/50">
+        <h2 className="text-[10px] uppercase tracking-[0.2em] text-neutral-500">
+          Your user ID
+        </h2>
+        <p className="mt-2 text-xs text-neutral-500">
+          Share this with your partner so they can invite you to a room.
+        </p>
+        <div className="mt-3 flex items-center gap-2">
+          <code className="flex-1 break-all rounded-xl border border-white/60 bg-white/70 p-2.5 font-mono text-xs backdrop-blur-md dark:border-white/10 dark:bg-neutral-900/60">
             {userId}
           </code>
           <button
             onClick={() => void navigator.clipboard.writeText(userId)}
-            className="rounded border border-neutral-300 px-2 py-1 text-xs transition-transform duration-150 hover:bg-neutral-100 active:scale-95 dark:border-neutral-700 dark:hover:bg-neutral-800"
+            className="rounded-full border border-white/50 bg-white/60 px-3 py-1.5 text-xs text-neutral-700 shadow-sm backdrop-blur-md transition-all hover:bg-white/80 hover:shadow-md active:scale-[0.98] dark:border-white/10 dark:bg-neutral-900/60 dark:text-neutral-300"
           >
             copy
           </button>
         </div>
       </section>
 
-      {device && (() => {
-        // With per-device invites, multiple rows exist per invite (one per
-        // invitee device). Only show the one addressed to THIS device.
-        const myInvites = invites.filter(
-          (i) => i.invited_device_id === device.deviceId,
-        );
-        if (myInvites.length === 0) return null;
-        return (
-          <section className="space-y-2">
-            <h2 className="text-base font-semibold">Pending invites</h2>
-            {myInvites.map((invite) => (
+      {invites.length > 0 && device && (
+        <section>
+          <h2 className="text-[10px] uppercase tracking-[0.2em] text-neutral-500">
+            Pending invites
+          </h2>
+          <div className="mt-3 space-y-2">
+            {invites.map((invite) => (
               <InviteCard
                 key={invite.id}
                 invite={invite}
                 userId={userId}
                 device={device}
-                roomCount={rooms.length}
                 onDone={() => void reload(userId)}
               />
             ))}
-          </section>
-        );
-      })()}
+          </div>
+        </section>
+      )}
 
       <section>
         <div className="flex items-center justify-between">
-          <h2 className="text-base font-semibold">Your rooms</h2>
-          <span className="text-xs text-neutral-500">{rooms.length}/100</span>
+          <h2 className="text-[10px] uppercase tracking-[0.2em] text-neutral-500">
+            Your rooms
+          </h2>
         </div>
-
-        {rooms.length >= 90 && (
-          <div className={`mt-2 rounded border px-3 py-2 text-xs ${
-            rooms.length >= 100
-              ? 'border-red-300 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200'
-              : 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200'
-          }`}>
-            {rooms.length >= 100
-              ? 'Room limit reached. Leave a room before creating or joining a new one.'
-              : `You're in ${rooms.length}/100 rooms. Approaching the limit.`}
-          </div>
-        )}
-
-        {rooms.length > 0 && (
-          <input
-            type="search"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            onKeyDown={(e) => e.key === 'Escape' && setSearch('')}
-            placeholder="search rooms…"
-            className="mt-2 block w-full rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-900"
-          />
-        )}
-
         {rooms.length === 0 && (
-          <p className="mt-2 text-sm text-neutral-500">No rooms yet. Create one below.</p>
+          <p className="mt-3 text-sm text-neutral-500">
+            No rooms yet. Create one below, or accept an invite from your
+            partner.
+          </p>
         )}
-
-        {(() => {
-          const q = search.trim().toLowerCase();
-          const visible = q
-            ? rooms.filter((r) => {
-                const name = names.get(r.id) ?? '';
-                return name.toLowerCase().includes(q) || r.id.toLowerCase().includes(q);
-              })
-            : rooms;
-          return (
-            <ul className="mt-2 space-y-2">
-              {visible.map((room) => {
-                const name = names.get(room.id);
-                return (
-                  <li
-                    key={room.id}
-                    className="flex items-center justify-between rounded border border-neutral-200 px-3 py-2 text-sm dark:border-neutral-800"
-                  >
-                    <div className="min-w-0">
-                      {name ? (
-                        <span className="font-medium">{name}</span>
-                      ) : (
-                        <span className="font-mono text-xs text-neutral-500">
-                          {room.id.slice(0, 8)}
-                        </span>
-                      )}
-                      <span className="ml-2 rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] uppercase dark:bg-neutral-900">
-                        {room.kind}
-                      </span>
-                      <span className="ml-2 text-xs text-neutral-500">
-                        gen {room.current_generation}
-                      </span>
-                      {room.parent_room_id && (
-                        <span className="ml-2 text-xs text-neutral-500">
-                          ↳ child of {room.parent_room_id.slice(0, 8)}
-                        </span>
-                      )}
-                    </div>
-                    <Link
-                      href={`/rooms/${room.id}`}
-                      className="ml-2 rounded bg-neutral-900 px-2 py-1 text-xs text-white transition-transform duration-150 hover:bg-neutral-700 active:scale-95 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
-                    >
-                      open →
-                    </Link>
-                  </li>
-                );
-              })}
-              {q && visible.length === 0 && (
-                <li className="py-2 text-sm text-neutral-500">No rooms match &ldquo;{search}&rdquo;</li>
-              )}
-            </ul>
-          );
-        })()}
+        <ul className="mt-2 space-y-2">
+          {rooms.map((room) => {
+            const customName = roomNames[room.id];
+            const currentGenMembers = (membersByRoom[room.id] ?? []).filter(
+              (m) => m.generation === room.current_generation,
+            );
+            const currentGenPartners = currentGenMembers
+              .filter((m) => m.user_id !== userId)
+              .map((m) => m.user_id);
+            const isSoleMember = currentGenMembers.length === 1;
+            return (
+              <RoomCard
+                key={room.id}
+                room={room}
+                customName={customName}
+                partnerIds={currentGenPartners}
+                isSoleMember={isSoleMember}
+                nicknames={nicknames}
+                onSetNickname={setNickname}
+                userId={userId}
+                device={device}
+                onRenamed={(newName) =>
+                  setRoomNames((prev) => ({ ...prev, [room.id]: newName }))
+                }
+                onRemoved={() => void reload(userId)}
+              />
+            );
+          })}
+        </ul>
       </section>
 
       {device && (
@@ -299,7 +266,7 @@ function RoomsInner() {
               userId={userId}
               device={device}
               rooms={rooms}
-              names={names}
+              roomNames={roomNames}
               onInvited={() => void reload(userId)}
             />
           )}
@@ -311,147 +278,564 @@ function RoomsInner() {
   );
 }
 
+/**
+ * "You & X, Y" row under the room title. Each partner is a clickable chip;
+ * clicking opens an inline editor to set/update a local nickname for them.
+ */
+function RoomOccupants({
+  partnerIds,
+  nicknames,
+  onSetNickname,
+}: {
+  partnerIds: string[];
+  nicknames: Record<string, string>;
+  onSetNickname: (userId: string, name: string) => void;
+}) {
+  return (
+    <div className="mt-0.5 flex flex-wrap items-center gap-1 text-xs text-neutral-600 dark:text-neutral-400">
+      <span>You</span>
+      {partnerIds.length === 0 ? (
+        <span className="text-neutral-500">· no partner yet</span>
+      ) : (
+        partnerIds.map((uid, i) => (
+          <span key={uid} className="flex items-center gap-1">
+            {i === 0 ? <span>&amp;</span> : <span>,</span>}
+            <PartnerChip
+              userId={uid}
+              nickname={nicknames[uid]}
+              onSetNickname={onSetNickname}
+            />
+          </span>
+        ))
+      )}
+    </div>
+  );
+}
+
+function PartnerChip({
+  userId,
+  nickname,
+  onSetNickname,
+}: {
+  userId: string;
+  nickname: string | undefined;
+  onSetNickname: (userId: string, name: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(nickname ?? '');
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!editing) setDraft(nickname ?? '');
+  }, [editing, nickname]);
+
+  function save() {
+    onSetNickname(userId, draft);
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          save();
+        }}
+        className="inline-flex items-center gap-1"
+      >
+        <input
+          ref={inputRef}
+          autoFocus
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') setEditing(false);
+          }}
+          onBlur={save}
+          maxLength={60}
+          placeholder="nickname"
+          className="w-28 rounded-full border border-white/60 bg-white/80 px-2 py-0.5 text-xs outline-none focus:ring-2 focus:ring-neutral-900/10 dark:border-white/10 dark:bg-neutral-900/70 dark:focus:ring-white/20"
+          aria-label={`nickname for ${userId.slice(0, 8)}`}
+        />
+      </form>
+    );
+  }
+
+  const label = nickname?.trim() || `${userId.slice(0, 8)}…`;
+  return (
+    <button
+      type="button"
+      onClick={() => setEditing(true)}
+      title={nickname ? `click to edit nickname · ${userId}` : `click to add a local nickname · ${userId}`}
+      className={`rounded-full px-2 py-0.5 text-xs transition-colors hover:bg-white/60 dark:hover:bg-white/10 ${
+        nickname
+          ? 'font-medium text-neutral-900 dark:text-neutral-100'
+          : 'text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function RoomCard({
+  room,
+  customName,
+  partnerIds,
+  isSoleMember,
+  nicknames,
+  onSetNickname,
+  userId,
+  device,
+  onRenamed,
+  onRemoved,
+}: {
+  room: RoomRow;
+  customName: string | undefined;
+  partnerIds: string[];
+  isSoleMember: boolean;
+  nicknames: Record<string, string>;
+  onSetNickname: (userId: string, name: string) => void;
+  userId: string;
+  device: EnrolledDevice | null;
+  onRenamed: (newName: string) => void;
+  onRemoved: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(customName ?? '');
+  const [savingRename, setSavingRename] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [confirm, setConfirm] = useState<null | 'leave' | 'delete'>(null);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const menuRef = useRef<HTMLDivElement>(null);
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    function onClick(e: MouseEvent) {
+      if (!menuRef.current) return;
+      if (!menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    }
+    window.addEventListener('mousedown', onClick);
+    return () => window.removeEventListener('mousedown', onClick);
+  }, [menuOpen]);
+
+  function startEditing() {
+    if (!device) return;
+    setDraft(customName ?? '');
+    setRenameError(null);
+    setEditing(true);
+    queueMicrotask(() => renameInputRef.current?.select());
+  }
+
+  function cancelEditing() {
+    setEditing(false);
+    setRenameError(null);
+    setDraft(customName ?? '');
+  }
+
+  async function saveRename() {
+    if (!device) return;
+    const name = draft.trim().slice(0, 100);
+    if (name === (customName ?? '')) {
+      cancelEditing();
+      return;
+    }
+    setSavingRename(true);
+    setRenameError(null);
+    try {
+      await renameRoom({
+        roomId: room.id,
+        generation: room.current_generation,
+        userId,
+        device,
+        name,
+      });
+      onRenamed(name);
+      setEditing(false);
+    } catch (e) {
+      setRenameError(describeError(e));
+    } finally {
+      setSavingRename(false);
+    }
+  }
+
+  async function confirmLeave() {
+    if (!device) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      // Sole current-gen member? No one's left to rotate the key for, so
+      // just drop the room. Multi-member? Route through selfLeaveRoom so
+      // kick_and_rotate bumps the generation and the leaver can't decrypt
+      // anything posted after their exit.
+      if (isSoleMember) {
+        await deleteRoom(room.id);
+      } else {
+        await selfLeaveRoom({
+          roomId: room.id,
+          userId,
+          device: device.deviceBundle,
+          room,
+        });
+      }
+      setConfirm(null);
+      onRemoved();
+    } catch (e) {
+      setActionError(describeError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmDelete() {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await deleteRoom(room.id);
+      setConfirm(null);
+      onRemoved();
+    } catch (e) {
+      setActionError(describeError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const displayName = customName ?? `Room ${room.id.slice(0, 8)}`;
+
+  return (
+    <li className="rounded-2xl border border-white/50 bg-white/60 px-4 py-3 text-sm shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-neutral-900/50">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          {editing ? (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void saveRename();
+              }}
+              className="flex flex-wrap items-center gap-2"
+            >
+              <input
+                ref={renameInputRef}
+                autoFocus
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') cancelEditing();
+                }}
+                maxLength={100}
+                placeholder={`Room ${room.id.slice(0, 8)}`}
+                disabled={savingRename}
+                aria-label="room name"
+                className="min-w-0 flex-1 rounded-lg border border-white/60 bg-white/80 px-2.5 py-1 text-sm font-medium text-neutral-900 shadow-sm outline-none focus:border-white/90 focus:ring-2 focus:ring-neutral-900/10 dark:border-white/10 dark:bg-neutral-900/70 dark:text-neutral-100 dark:focus:ring-white/20"
+              />
+              <button
+                type="submit"
+                disabled={savingRename}
+                className="rounded-full bg-neutral-900 px-3 py-1 text-[11px] font-medium text-white shadow-sm transition-all hover:shadow-md active:scale-[0.98] disabled:opacity-50 dark:bg-white dark:text-neutral-900"
+              >
+                {savingRename ? 'saving…' : 'save'}
+              </button>
+              <button
+                type="button"
+                onClick={cancelEditing}
+                disabled={savingRename}
+                className="rounded-full border border-white/60 bg-white/60 px-3 py-1 text-[11px] text-neutral-700 transition-all hover:bg-white/80 active:scale-[0.98] disabled:opacity-50 dark:border-white/10 dark:bg-neutral-900/60 dark:text-neutral-300"
+              >
+                cancel
+              </button>
+              {renameError && (
+                <p className="w-full text-[11px] text-red-600">{renameError}</p>
+              )}
+            </form>
+          ) : (
+            <div className="flex min-w-0 items-center gap-1.5">
+              <div className="truncate font-medium text-neutral-900 dark:text-neutral-100">
+                {displayName}
+              </div>
+              {device && (
+                <button
+                  type="button"
+                  onClick={startEditing}
+                  aria-label="rename room"
+                  title="rename room"
+                  className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full text-[11px] text-neutral-500 transition-colors hover:bg-white/80 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-900/80 dark:hover:text-neutral-100"
+                >
+                  ✎
+                </button>
+              )}
+            </div>
+          )}
+          {!editing && (
+            <>
+              <RoomOccupants
+                partnerIds={partnerIds}
+                nicknames={nicknames}
+                onSetNickname={onSetNickname}
+              />
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-neutral-500">
+                <code className="font-mono">{room.id.slice(0, 8)}</code>
+                <span className="rounded-full bg-neutral-900/5 px-1.5 py-0.5 uppercase dark:bg-white/5">
+                  {room.kind}
+                </span>
+                <span>gen {room.current_generation}</span>
+                {room.parent_room_id && (
+                  <span>↳ child of {room.parent_room_id.slice(0, 8)}</span>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+        {!editing && (
+          <div className="flex flex-shrink-0 items-center gap-2">
+            <Link
+              href={`/rooms/${room.id}`}
+              className="rounded-full bg-neutral-900 px-3 py-1.5 text-xs text-white shadow-sm transition-all hover:shadow-md active:scale-[0.98] dark:bg-white dark:text-neutral-900"
+            >
+              open →
+            </Link>
+            <div ref={menuRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setMenuOpen((o) => !o)}
+                aria-label="room actions"
+                aria-haspopup="menu"
+                aria-expanded={menuOpen}
+                className="flex h-7 w-7 items-center justify-center rounded-full border border-white/50 bg-white/60 text-neutral-600 shadow-sm backdrop-blur-md transition-all hover:bg-white/80 hover:text-neutral-900 active:scale-[0.96] dark:border-white/10 dark:bg-neutral-900/60 dark:text-neutral-400 dark:hover:bg-neutral-900/80 dark:hover:text-neutral-100"
+              >
+                ⋯
+              </button>
+              {menuOpen && (
+                <div
+                  role="menu"
+                  className="absolute right-0 z-10 mt-1 w-44 rounded-xl border border-white/60 bg-white/90 p-1 text-xs shadow-lg backdrop-blur-md dark:border-white/10 dark:bg-neutral-900/90"
+                >
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      startEditing();
+                    }}
+                    className="block w-full rounded-lg px-3 py-1.5 text-left text-neutral-800 transition-colors hover:bg-neutral-900/5 dark:text-neutral-200 dark:hover:bg-white/10"
+                  >
+                    Rename room
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      setActionError(null);
+                      setConfirm(isSoleMember ? 'delete' : 'leave');
+                    }}
+                    className={`block w-full rounded-lg px-3 py-1.5 text-left font-medium transition-colors ${
+                      isSoleMember
+                        ? 'text-red-700 hover:bg-red-500/10 dark:text-red-400'
+                        : 'text-amber-700 hover:bg-amber-500/10 dark:text-amber-400'
+                    }`}
+                  >
+                    {isSoleMember ? 'Delete room…' : 'Leave room…'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {confirm === 'leave' && (
+        <ConfirmModal
+          tone="amber"
+          title="Leave this room?"
+          body={
+            <>
+              <p>
+                You&apos;ll stop receiving new messages and lose access to
+                everything encrypted for you in this room.
+              </p>
+              <p className="mt-2">
+                Your partner can re-invite you later. If they do, you&apos;ll
+                start fresh — you won&apos;t regain access to past encrypted
+                messages unless you still have old keys.
+              </p>
+            </>
+          }
+          confirmLabel="Leave room"
+          busy={busy}
+          error={actionError}
+          onConfirm={() => void confirmLeave()}
+          onCancel={() => {
+            setConfirm(null);
+            setActionError(null);
+          }}
+        />
+      )}
+
+      {confirm === 'delete' && (
+        <ConfirmModal
+          tone="red"
+          title="Delete this room?"
+          body={
+            <>
+              <p className="font-medium">
+                This will permanently delete this room and all encrypted
+                history. This cannot be undone.
+              </p>
+              <p className="mt-2">
+                Everyone&apos;s memberships, pending invites, and every
+                encrypted message in this room will be destroyed.
+              </p>
+            </>
+          }
+          confirmLabel="Delete room forever"
+          busy={busy}
+          error={actionError}
+          onConfirm={() => void confirmDelete()}
+          onCancel={() => {
+            setConfirm(null);
+            setActionError(null);
+          }}
+        />
+      )}
+    </li>
+  );
+}
+
+function ConfirmModal({
+  tone,
+  title,
+  body,
+  confirmLabel,
+  busy,
+  error,
+  onConfirm,
+  onCancel,
+}: {
+  tone: 'amber' | 'red';
+  title: string;
+  body: React.ReactNode;
+  confirmLabel: string;
+  busy: boolean;
+  error: string | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const toneClasses =
+    tone === 'red'
+      ? {
+          border: 'border-red-400/70 dark:border-red-700',
+          bg: 'bg-red-50/80 dark:bg-red-950/60',
+          title: 'text-red-900 dark:text-red-100',
+          button: 'bg-red-700 hover:bg-red-800 text-white',
+        }
+      : {
+          border: 'border-amber-300/70 dark:border-amber-700',
+          bg: 'bg-amber-50/80 dark:bg-amber-950/50',
+          title: 'text-amber-900 dark:text-amber-100',
+          button:
+            'bg-amber-700 hover:bg-amber-800 text-white dark:bg-amber-200 dark:text-amber-950 dark:hover:bg-amber-100',
+        };
+
+  // Render into document.body so the modal isn't trapped inside the stacking
+  // context created by ancestor backdrop-blur / transform / filter styles
+  // (those turn `position: fixed` into a card-relative anchor instead of
+  // viewport-relative, which put the confirm button behind neighboring cards).
+  if (typeof document === 'undefined') return null;
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-neutral-950/40 p-4 backdrop-blur-sm"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !busy) onCancel();
+      }}
+    >
+      <div
+        className={`w-full max-w-md rounded-2xl border-2 ${toneClasses.border} ${toneClasses.bg} p-5 text-sm shadow-2xl backdrop-blur-md`}
+      >
+        <h3 className={`text-base font-semibold ${toneClasses.title}`}>
+          {title}
+        </h3>
+        <div className="mt-3 text-neutral-700 dark:text-neutral-300">
+          {body}
+        </div>
+        {error && (
+          <p className="mt-3 rounded-lg border border-red-300/60 bg-red-50/70 p-2 text-xs text-red-800 dark:border-red-800/60 dark:bg-red-950/60 dark:text-red-200">
+            {error}
+          </p>
+        )}
+        <div className="mt-5 flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="rounded-full border border-white/60 bg-white/70 px-4 py-1.5 text-xs font-medium text-neutral-700 backdrop-blur-md transition-all hover:bg-white/90 hover:shadow-sm active:scale-[0.98] disabled:opacity-50 dark:border-white/10 dark:bg-neutral-900/60 dark:text-neutral-300"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={busy}
+            className={`rounded-full px-4 py-1.5 text-xs font-medium shadow-sm transition-all hover:shadow-md active:scale-[0.98] disabled:opacity-50 ${toneClasses.button}`}
+          >
+            {busy ? 'working…' : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 function InviteCard({
   invite,
   userId,
   device,
-  roomCount,
   onDone,
 }: {
   invite: RoomInviteRow;
   userId: string;
-  device: DeviceKeyBundle;
-  roomCount: number;
+  device: EnrolledDevice;
   onDone: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function accept() {
-    if (roomCount >= 100) {
-      setError('Room limit reached — leave a room before accepting this invite.');
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
-      // Fetch inviter's UMK pub and device list; find the signing device
-      // and verify its cert.
-      const inviterUmk = await fetchUserMasterKeyPub(invite.created_by);
-      if (!inviterUmk) throw new Error('inviter has no published UMK');
-      let inviterSskPub: Uint8Array | undefined;
-      if (inviterUmk.sskPub && inviterUmk.sskCrossSignature) {
-        try {
-          const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
-          await verifySskCrossSignature(inviterUmk.ed25519PublicKey, inviterUmk.sskPub, inviterUmk.sskCrossSignature);
-          inviterSskPub = inviterUmk.sskPub;
-        } catch { /* fall back */ }
-      }
-      const inviterDevices = await fetchPublicDevices(invite.created_by);
-      const inviterDev = inviterDevices.find(
-        (d) => d.deviceId === invite.inviter_device_id,
-      );
-      if (!inviterDev) {
-        throw new Error('inviter device not found in published device list');
-      }
-      try {
-        await verifyPublicDeviceChain(inviterDev, inviterUmk.ed25519PublicKey, inviterSskPub);
-      } catch {
+      // The invite row is sealed to a specific device's x25519_pub. Confirm
+      // the row is addressed to THIS device before unwrapping.
+      if (invite.invited_device_id && invite.invited_device_id !== device.deviceBundle.deviceId) {
         throw new Error(
-          'inviter device cert did not verify — refusing',
+          'this invite was issued to a different device on your account — accept it from that device, or ask the inviter to re-send',
         );
       }
-
-      const tofuContact = {
-        ed25519PublicKey: inviterUmk.ed25519PublicKey,
-        x25519PublicKey: inviterDev.x25519PublicKey,
-        selfSignature: new Uint8Array(0),
-      };
-      const tofu = await observeContact(invite.created_by, tofuContact);
-      if (tofu.status === 'changed') {
-        throw new Error(
-          'inviter\'s UMK has changed — acknowledge the key change banner before accepting',
-        );
-      }
-
-      const invitedEd = await fromBase64(invite.invited_ed25519_pub);
-      const invitedX = await fromBase64(invite.invited_x25519_pub);
       const wrappedBytes = await fromBase64(invite.wrapped_room_key);
-      const envSig = await fromBase64(invite.inviter_signature);
-      if (
-        !bytesEq(invitedEd, device.ed25519PublicKey) ||
-        !bytesEq(invitedX, device.x25519PublicKey)
-      ) {
-        throw new Error(
-          'invite pubkeys don\'t match this device — refusing',
-        );
-      }
-
-      try {
-        await verifyInviteEnvelope(
-          {
-            roomId: invite.room_id,
-            generation: invite.generation,
-            invitedUserId: userId,
-            invitedDeviceId: device.deviceId,
-            invitedDeviceEd25519PublicKey: invitedEd,
-            invitedDeviceX25519PublicKey: invitedX,
-            wrappedRoomKey: wrappedBytes,
-            inviterUserId: invite.created_by,
-            inviterDeviceId: invite.inviter_device_id,
-            expiresAtMs: invite.expires_at_ms,
-          },
-          envSig,
-          inviterDev.ed25519PublicKey,
-        );
-      } catch (err) {
-        if (err instanceof CryptoError && err.code === 'SIGNATURE_INVALID') {
-          throw new Error(
-            'invite signature did not verify — refusing (possible server tampering)',
-          );
-        }
-        throw err;
-      }
-
-      // Unwrap the room key using this device's X25519 keypair, then
-      // wrap for ALL of our active devices so every device can read
-      // this room immediately — not just the one that accepted.
       const roomKey = await unwrapRoomKey(
         { wrapped: wrappedBytes, generation: invite.generation },
-        device.x25519PublicKey,
-        device.x25519PrivateKey,
+        device.deviceBundle.x25519PublicKey,
+        device.deviceBundle.x25519PrivateKey,
       );
+      // Wrap the room key for every active device on my account so I can
+      // open this room from any of them.
       await wrapRoomKeyForAllMyDevices({
         roomId: invite.room_id,
         userId,
-        roomKey,
-        signerDevice: device,
+        roomKey: { key: roomKey.key, generation: invite.generation },
+        signerDevice: device.deviceBundle,
       });
-      // Re-share any Megolm sessions this device holds to all our other
-      // devices so they can decrypt recent messages in this room.
-      try {
-        const { reshareSessionsToDevice } = await import('@/lib/bootstrap');
-        const { fetchAndVerifyDevices } = await import('@/lib/bootstrap');
-        const { devices: myDevices } = await fetchAndVerifyDevices(userId);
-        for (const d of myDevices) {
-          if (d.deviceId === device.deviceId) continue;
-          await reshareSessionsToDevice({
-            roomId: invite.room_id,
-            userId,
-            signerDevice: device,
-            targetDeviceId: d.deviceId,
-            targetX25519Pub: d.x25519PublicKey,
-          });
-        }
-      } catch (err) {
-        console.warn('Megolm session re-share on accept failed:', err);
-      }
-      // Delete ALL sibling invite rows for this user+room (one existed
-      // per device). The accepted one is consumed; the rest are stale.
-      await deleteInvitesForUserInRoom(invite.room_id, userId);
+      await deleteInvite(invite.id);
       onDone();
     } catch (e) {
-      setError(errorMessage(e));
+      setError(describeError(e));
     } finally {
       setBusy(false);
     }
@@ -463,14 +847,14 @@ function InviteCard({
       await deleteInvite(invite.id);
       onDone();
     } catch (e) {
-      setError(errorMessage(e));
+      setError(describeError(e));
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="rounded border border-blue-200 bg-blue-50 p-3 text-sm dark:border-blue-900 dark:bg-blue-950">
+    <div className="rounded-2xl border border-blue-300/60 bg-blue-50/70 p-4 text-sm shadow-lg backdrop-blur-md dark:border-blue-800/40 dark:bg-blue-950/40">
       <div>
         Invite to room{' '}
         <code className="font-mono text-xs">{invite.room_id.slice(0, 8)}</code>{' '}
@@ -504,22 +888,17 @@ function CreateRoomForm({
   onCreated,
 }: {
   userId: string;
-  device: DeviceKeyBundle;
+  device: EnrolledDevice;
   rooms: RoomRow[];
   onCreated: () => void;
 }) {
   const [kind, setKind] = useState<'pair' | 'group'>('pair');
   const [parentId, setParentId] = useState<string>('');
-  const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
-    if (rooms.length >= 100) {
-      setError('Room limit reached — leave a room before creating a new one.');
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
@@ -529,25 +908,19 @@ function CreateRoomForm({
         createdBy: userId,
       });
       const roomKey = await generateRoomKey(room.current_generation);
+      // wrapRoomKeyForAllMyDevices: wraps for every active device on my
+      // account (so I can open this room from anywhere) and uploads to
+      // server-side key_backup if a backup key is available.
       await wrapRoomKeyForAllMyDevices({
         roomId: room.id,
         userId,
-        roomKey,
-        signerDevice: device,
+        roomKey: { key: roomKey.key, generation: room.current_generation },
+        signerDevice: device.deviceBundle,
       });
-      if (name.trim()) {
-        const enc = await encryptRoomName({ name, roomId: room.id, roomKey });
-        await renameRoom({
-          roomId: room.id,
-          nameCiphertext: enc.ciphertext,
-          nameNonce: enc.nonce,
-        });
-      }
       onCreated();
       setParentId('');
-      setName('');
     } catch (e) {
-      setError(errorMessage(e));
+      setError(describeError(e));
     } finally {
       setBusy(false);
     }
@@ -556,20 +929,11 @@ function CreateRoomForm({
   return (
     <form
       onSubmit={create}
-      className="space-y-3 rounded border border-neutral-200 p-4 dark:border-neutral-800"
+      className="space-y-3 rounded-2xl border border-white/60 bg-white/60 p-5 shadow-lg backdrop-blur-md dark:border-white/10 dark:bg-neutral-900/50"
     >
-      <h2 className="text-base font-semibold">Create room</h2>
-      <div>
-        <label className="text-xs text-neutral-500">name (optional, encrypted)</label>
-        <input
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          maxLength={120}
-          placeholder="e.g. dinner planning"
-          className="mt-1 block w-full rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-900"
-        />
-      </div>
+      <h2 className="text-[10px] uppercase tracking-[0.2em] text-neutral-500">
+        Create room
+      </h2>
       <div className="flex gap-3 text-sm">
         <label className="flex items-center gap-1">
           <input
@@ -623,13 +987,13 @@ function InviteForm({
   userId,
   device,
   rooms,
-  names,
+  roomNames,
   onInvited,
 }: {
   userId: string;
-  device: DeviceKeyBundle;
+  device: EnrolledDevice;
   rooms: RoomRow[];
-  names: Map<string, string>;
+  roomNames: Record<string, string>;
   onInvited: () => void;
 }) {
   const [roomId, setRoomId] = useState(rooms[0]?.id ?? '');
@@ -637,56 +1001,6 @@ function InviteForm({
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [fullness, setFullness] = useState<Map<string, boolean>>(new Map());
-
-  // For each room, check whether it's already at capacity (only meaningful
-  // for kind='pair' — groups have no cap in this prototype). A room counts
-  // as "full" if it already has 2 distinct user_ids across members + pending
-  // invites — matching the DB trigger (0007) which dedupes by user_id. Since
-  // 0015 a single user has one row per device, so counting rows would flag a
-  // pair with one multi-device user as full.
-  useEffect(() => {
-    if (!userId || rooms.length === 0) {
-      setFullness(new Map());
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      const supabase = getSupabase();
-      const entries = await Promise.all(
-        rooms.map(async (r): Promise<[string, boolean]> => {
-          if (r.kind !== 'pair') return [r.id, false];
-          const [members, invites] = await Promise.all([
-            supabase
-              .from('room_members')
-              .select('user_id')
-              .eq('room_id', r.id)
-              .eq('generation', r.current_generation),
-            supabase
-              .from('room_invites')
-              .select('invited_user_id')
-              .eq('room_id', r.id),
-          ]);
-          const users = new Set<string>();
-          for (const row of (members.data ?? []) as { user_id: string }[]) {
-            users.add(row.user_id);
-          }
-          for (const row of (invites.data ?? []) as { invited_user_id: string }[]) {
-            users.add(row.invited_user_id);
-          }
-          return [r.id, users.size >= 2];
-        }),
-      );
-      if (cancelled) return;
-      setFullness(new Map(entries));
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [userId, rooms]);
-
-  const currentRoom = rooms.find((r) => r.id === roomId);
-  const currentRoomFull = currentRoom ? fullness.get(currentRoom.id) ?? false : false;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -697,74 +1011,39 @@ function InviteForm({
       if (!roomId || !inviteeId) throw new Error('pick a room and enter a user id');
       const room = rooms.find((r) => r.id === roomId);
       if (!room) throw new Error('room not found');
-      if (room.kind === 'pair' && fullness.get(room.id)) {
-        throw new Error(
-          'this pair room already has two people — pair rooms are capped at 2',
-        );
+      // Per-device invite: enumerate the invitee's active signed devices,
+      // seal the room key + sign an envelope per device, write one
+      // room_invites row per target. Invitee accepts from any device.
+      const invitedDevices = await fetchPublicDevices(inviteeId);
+      if (invitedDevices.length === 0) {
+        throw new Error('that user has no active signed devices');
       }
-      // Fetch + verify invitee's UMK pub and device list. Pick the most
-      // recently created active device as the invite target. Later, that
-      // device will rewrap for the invitee's other devices on accept.
-      const inviteeUmk = await fetchUserMasterKeyPub(inviteeId);
-      if (!inviteeUmk) throw new Error('that user has no published UMK');
-      let inviteeSskPub2: Uint8Array | undefined;
-      if (inviteeUmk.sskPub && inviteeUmk.sskCrossSignature) {
-        try {
-          const { verifySskCrossSignature } = await import('@/lib/e2ee-core');
-          await verifySskCrossSignature(inviteeUmk.ed25519PublicKey, inviteeUmk.sskPub, inviteeUmk.sskCrossSignature);
-          inviteeSskPub2 = inviteeUmk.sskPub;
-        } catch { /* fall back */ }
-      }
-      const inviteeDevices = await fetchPublicDevices(inviteeId);
-      const activeDevices: PublicDevice[] = [];
-      for (const d of inviteeDevices) {
-        try {
-          await verifyPublicDeviceChain(d, inviteeUmk.ed25519PublicKey, inviteeSskPub2);
-          activeDevices.push(d);
-        } catch {
-          // skip revoked/invalid devices
-        }
-      }
-      if (activeDevices.length === 0) {
-        throw new Error('invitee has no active signed devices');
-      }
-
-      const tofuContact = {
-        ed25519PublicKey: inviteeUmk.ed25519PublicKey,
-        x25519PublicKey: activeDevices[0].x25519PublicKey,
-        selfSignature: new Uint8Array(0),
-      };
-      const tofu = await observeContact(inviteeId, tofuContact);
-      if (tofu.status === 'changed') {
-        throw new Error(
-          'invitee\'s UMK has changed since you last saw it — acknowledge the key change before inviting',
-        );
-      }
-
-      const roomKey = await verifyAndUnwrapMyRoomKey({
+      const myWrapped = await getMyWrappedRoomKey({
         roomId,
-        userId,
-        device,
+        deviceId: device.deviceBundle.deviceId,
         generation: room.current_generation,
       });
-      if (!roomKey) throw new Error('you are not a current-generation member of that room');
-      // Matrix-style: wrap for EVERY active device the invitee has, so
-      // they can accept from any device — not just whichever one we pick.
+      if (!myWrapped) throw new Error('this device is not a current-generation member of that room');
+      const roomKey = await unwrapRoomKey(
+        { wrapped: myWrapped, generation: room.current_generation },
+        device.deviceBundle.x25519PublicKey,
+        device.deviceBundle.x25519PrivateKey,
+      );
       await sendInviteToAllDevices({
         roomId,
         generation: room.current_generation,
-        roomKey,
+        roomKey: { key: roomKey.key, generation: room.current_generation },
         invitedUserId: inviteeId,
-        invitedActiveDevices: activeDevices,
+        invitedActiveDevices: invitedDevices,
         inviterUserId: userId,
-        inviterDevice: device,
-        expiresAtMs: Date.now() + 60 * 60 * 24 * 7 * 1000,
+        inviterDevice: device.deviceBundle,
+        expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000,
       });
       setStatus('Invite sent.');
       setInviteeId('');
       onInvited();
     } catch (e) {
-      setError(errorMessage(e));
+      setError(describeError(e));
     } finally {
       setBusy(false);
     }
@@ -773,9 +1052,11 @@ function InviteForm({
   return (
     <form
       onSubmit={submit}
-      className="space-y-3 rounded border border-neutral-200 p-4 dark:border-neutral-800"
+      className="space-y-3 rounded-2xl border border-white/60 bg-white/60 p-5 shadow-lg backdrop-blur-md dark:border-white/10 dark:bg-neutral-900/50"
     >
-      <h2 className="text-base font-semibold">Invite someone</h2>
+      <h2 className="text-[10px] uppercase tracking-[0.2em] text-neutral-500">
+        Invite someone
+      </h2>
       <div>
         <label className="text-xs text-neutral-500">room</label>
         <select
@@ -784,26 +1065,17 @@ function InviteForm({
           className="mt-1 block w-full rounded border border-neutral-300 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-900"
         >
           {rooms.map((r) => {
-            const full = fullness.get(r.id) ?? false;
-            const customName = names.get(r.id);
-            const head = customName
-              ? `${customName} · ${r.id.slice(0, 8)}`
-              : r.id.slice(0, 8);
-            const base = `${head} · ${r.kind} · gen ${r.current_generation}`;
-            const label = full ? `${base} · full` : base;
+            const name = roomNames[r.id];
+            const label = name
+              ? `${name} · ${r.kind}`
+              : `Room ${r.id.slice(0, 8)} · ${r.kind}`;
             return (
-              <option key={r.id} value={r.id} disabled={full}>
+              <option key={r.id} value={r.id}>
                 {label}
               </option>
             );
           })}
         </select>
-        {currentRoomFull && (
-          <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
-            Pair rooms are capped at 2 people. Delete this one and create a
-            new room, or pick a different room to invite to.
-          </p>
-        )}
       </div>
       <div>
         <label className="text-xs text-neutral-500">
@@ -819,7 +1091,7 @@ function InviteForm({
       </div>
       <button
         type="submit"
-        disabled={busy || currentRoomFull}
+        disabled={busy}
         className="rounded bg-neutral-900 px-3 py-1.5 text-sm text-white disabled:opacity-50 dark:bg-white dark:text-neutral-900"
       >
         {busy ? 'sending…' : 'send invite'}
