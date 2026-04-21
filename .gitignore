@@ -41,5 +41,6 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# claude code local settings
+# claude code local state (per-dev permissions + scheduler lockfile)
 .claude/settings.local.json
+.claude/*.lock
