@@ -61,6 +61,20 @@ interface ActionState {
   /** Active affection marks targeted at me that haven't been
    *  received/retracted yet. */
   myAffections: Record<string, { senderId: string; kind: string; ts: number }>;
+  /** Safe Space entries whose lifecycle I may still need to act on. Mirrors
+   *  the narrow slice of `SafeSpace`'s Entry state the Action log cares about:
+   *  "is this unlocked", "has the receiver flagged ready", "has everyone
+   *  resolved", "is it deleted". Keyed by entryId. */
+  icebreakers: Record<string, {
+    authorId: string;
+    createdTs: number;
+    unlocked: boolean;
+    readyToTalks: Record<string, number>;
+    resolutions: Record<string, number>;
+    deleted: boolean;
+  }>;
+  /** Room-wide time-out signal (mirrors SafeSpace's TimeOutState). */
+  timeOut: { activeUntilTs: number; startedTs: number; endTs: number };
 }
 
 function emptyState(): ActionState {
@@ -69,6 +83,8 @@ function emptyState(): ActionState {
     mindReader: {},
     wishlistByAuthor: {},
     myAffections: {},
+    icebreakers: {},
+    timeOut: { activeUntilTs: 0, startedTs: 0, endTs: 0 },
   };
 }
 
@@ -178,6 +194,67 @@ function useActionState(): ActionState {
         case 'affection_retract':
           delete state.myAffections[ev.affectionId];
           break;
+
+        // ------ Safe Space ------
+        // Mirrors SafeSpace.tsx's reducer but keeps only the fields the
+        // Action log needs. The delete gate is author-only, same as the
+        // component's reducer.
+        case 'icebreaker_post':
+          if (!state.icebreakers[ev.entryId]) {
+            state.icebreakers[ev.entryId] = {
+              authorId: rec.senderId,
+              createdTs: ev.ts,
+              unlocked: false,
+              readyToTalks: {},
+              resolutions: {},
+              deleted: false,
+            };
+          }
+          break;
+        case 'icebreaker_unlock': {
+          const e = state.icebreakers[ev.entryId];
+          if (e) e.unlocked = true;
+          break;
+        }
+        case 'icebreaker_ready_to_talk': {
+          const e = state.icebreakers[ev.entryId];
+          if (!e) break;
+          if (rec.senderId === e.authorId) break;
+          const prior = e.readyToTalks[rec.senderId] ?? 0;
+          if (ev.ts > prior) e.readyToTalks[rec.senderId] = ev.ts;
+          break;
+        }
+        case 'icebreaker_resolve': {
+          const e = state.icebreakers[ev.entryId];
+          if (!e) break;
+          const prior = e.resolutions[rec.senderId] ?? 0;
+          if (ev.ts > prior) e.resolutions[rec.senderId] = ev.ts;
+          break;
+        }
+        case 'icebreaker_delete': {
+          const e = state.icebreakers[ev.entryId];
+          if (!e) break;
+          if (rec.senderId !== e.authorId) break;
+          e.deleted = true;
+          break;
+        }
+
+        case 'time_out_start': {
+          if (ev.ts > state.timeOut.startedTs) {
+            state.timeOut = {
+              activeUntilTs: ev.ts + ev.durationSeconds * 1000,
+              startedTs: ev.ts,
+              endTs: state.timeOut.endTs,
+            };
+          }
+          break;
+        }
+        case 'time_out_end': {
+          if (ev.ts > state.timeOut.endTs) {
+            state.timeOut = { ...state.timeOut, endTs: ev.ts };
+          }
+          break;
+        }
       }
 
       // Recompute wishlistByAuthor from the latest snapshot of
@@ -344,6 +421,82 @@ function useActionItems(): ActionItem[] {
         count,
         href: `/rooms/${room.id}?open=wishlist`,
         priority: 50,
+      });
+    }
+
+    // ---- 7. Active time-out — highest visibility. Shows the live countdown
+    //         so the partner knows when the pause ends. ----
+    const toActive =
+      action.timeOut.activeUntilTs > now &&
+      action.timeOut.endTs < action.timeOut.startedTs;
+    if (toActive) {
+      items.push({
+        id: 'safe-space-timeout',
+        emoji: '⏸️',
+        text: 'Time-out active — Safe Space is paused',
+        countdown: formatCountdown(action.timeOut.activeUntilTs - now),
+        href: `/rooms/${room.id}/safe-space`,
+        priority: 3,
+      });
+    }
+
+    // ---- 8. Safe Space entries needing my attention. Three shapes, in
+    //         ascending intrusiveness:
+    //         (a) partner's entry locked, awaiting my OTP to unlock
+    //         (b) unlocked and I haven't flagged ready/resolved
+    //         (c) entry I authored, unlocked, partner hasn't resolved —
+    //             low-priority nudge (useful for rooms where the author
+    //             is also waiting on closure) ----
+    const lockedWaitingForMe = Object.entries(action.icebreakers).filter(
+      ([, e]) =>
+        !e.deleted &&
+        !e.unlocked &&
+        e.authorId !== myUserId &&
+        memberSet.has(e.authorId),
+    );
+    if (lockedWaitingForMe.length > 0) {
+      const [, first] = lockedWaitingForMe[0];
+      const name = firstWord(fmtDisplayName(first.authorId, displayNames, myUserId, null));
+      items.push({
+        id: 'safe-space-locked',
+        emoji: '🛡️',
+        text:
+          lockedWaitingForMe.length === 1
+            ? `${name} posted in Safe Space — unlock when ready`
+            : `${lockedWaitingForMe.length} Safe Space posts to unlock`,
+        count: lockedWaitingForMe.length > 1 ? lockedWaitingForMe.length : undefined,
+        href: `/rooms/${room.id}/safe-space`,
+        priority: 7,
+      });
+    }
+
+    const unlockedNeedingMe = Object.entries(action.icebreakers).filter(
+      ([, e]) => {
+        if (e.deleted) return false;
+        if (!e.unlocked) return false;
+        if (e.resolutions[myUserId]) return false;
+        // Non-authors: surface until I've marked ready-to-talk AND resolved.
+        if (e.authorId !== myUserId) {
+          return !e.readyToTalks[myUserId] || !e.resolutions[myUserId];
+        }
+        // Authors: surface only while no one else has resolved — otherwise
+        // "I haven't clicked resolve yet" would nag the author every session.
+        return false;
+      },
+    );
+    if (unlockedNeedingMe.length > 0) {
+      const [, first] = unlockedNeedingMe[0];
+      const name = firstWord(fmtDisplayName(first.authorId, displayNames, myUserId, null));
+      items.push({
+        id: 'safe-space-unlocked',
+        emoji: '🫶',
+        text:
+          unlockedNeedingMe.length === 1
+            ? `${name}'s Safe Space post is waiting on you`
+            : `${unlockedNeedingMe.length} Safe Space posts need closure`,
+        count: unlockedNeedingMe.length > 1 ? unlockedNeedingMe.length : undefined,
+        href: `/rooms/${room.id}/safe-space`,
+        priority: 8,
       });
     }
 

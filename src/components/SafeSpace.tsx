@@ -21,6 +21,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { displayName } from '@/lib/domain/displayName';
 import { describeError } from '@/lib/domain/errors';
 import { useMemberMoods } from '@/lib/domain/memberMood';
+import { uniqueMembers } from '@/lib/domain/members';
 import { HelpIcon } from './HelpIcon';
 import { useRoom, useRoomProjection } from './RoomProvider';
 
@@ -66,6 +67,8 @@ interface Entry {
   acks: Record<string, number>;
   readyToTalks: Record<string, number>;   // non-author signals they've processed
   resolutions: Record<string, number>;
+  /** Author-only tombstone. Non-zero = entry soft-deleted at that ts. */
+  deletedTs: number;
 }
 
 interface TimeOutState {
@@ -111,7 +114,24 @@ export function SafeSpace({
               acks: {},
               readyToTalks: {},
               resolutions: {},
+              deletedTs: 0,
             },
+          },
+        };
+      }
+      case 'icebreaker_delete': {
+        // Author-only soft-delete. Ignore deletes from anyone but the
+        // original author — a non-author signing a delete for someone
+        // else's entry must not tombstone it.
+        const e = acc.entries[ev.entryId];
+        if (!e) return acc;
+        if (uid !== e.authorId) return acc;
+        if (e.deletedTs >= ev.ts) return acc;
+        return {
+          ...acc,
+          entries: {
+            ...acc.entries,
+            [ev.entryId]: { ...e, deletedTs: ev.ts },
           },
         };
       }
@@ -210,9 +230,7 @@ export function SafeSpace({
   const currentMemberIds = useMemo(
     () =>
       room
-        ? members
-            .filter((m) => m.generation === room.current_generation)
-            .map((m) => m.user_id)
+        ? uniqueMembers(members, room.current_generation).map((m) => m.user_id)
         : [],
     [members, room],
   );
@@ -242,6 +260,7 @@ export function SafeSpace({
     const a: Entry[] = [];
     const r: Entry[] = [];
     for (const e of Object.values(state.entries)) {
+      if (e.deletedTs) continue;
       const allResolved =
         currentMemberIds.length > 0 &&
         currentMemberIds.every((uid) => e.resolutions[uid]);
@@ -555,6 +574,25 @@ function EntryCard({
     }
   }
 
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  async function deleteEntry() {
+    setBusy(true);
+    setError(null);
+    try {
+      await appendEvent({
+        type: 'icebreaker_delete',
+        entryId: entry.entryId,
+        ts: Date.now(),
+      });
+      // No local cleanup — reducer drops it on the next projection pass.
+    } catch (e) {
+      setError(describeError(e));
+    } finally {
+      setBusy(false);
+      setConfirmingDelete(false);
+    }
+  }
+
   return (
     // Ghost bubble: no fill, hue-matched glowing border. Hue comes from the
     // author's current vibe (drained=warm reds, lifted=pinks, mid=lavender),
@@ -667,6 +705,45 @@ function EntryCard({
         </div>
       )}
 
+      {/* Author-only delete — available at any phase (posted/unlocked). Sits
+          below the primary actions so it's discoverable but not the first
+          thing the author sees. Two-step confirm avoids fat-finger removal
+          of a sensitive entry. */}
+      {isAuthor && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {!confirmingDelete ? (
+            <button
+              onClick={() => setConfirmingDelete(true)}
+              disabled={busy}
+              className="rounded-full border border-white/15 bg-transparent px-3 py-1.5 text-[11px] italic text-slate-300/70 transition-colors hover:border-rose-300/50 hover:text-rose-200 disabled:opacity-50"
+            >
+              delete this entry
+            </button>
+          ) : (
+            <>
+              <span className="text-[11px] italic text-slate-300/85">
+                remove this entry for everyone?
+              </span>
+              <button
+                onClick={() => setConfirmingDelete(false)}
+                disabled={busy}
+                autoFocus
+                className="rounded-full border border-white/20 bg-white/5 px-3 py-1.5 text-[11px] text-slate-100 transition-all hover:bg-white/10 disabled:opacity-50"
+              >
+                keep it
+              </button>
+              <button
+                onClick={() => void deleteEntry()}
+                disabled={busy}
+                className="rounded-full bg-rose-500/85 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition-all hover:bg-rose-500 active:scale-[0.97] disabled:opacity-50"
+              >
+                {busy ? 'deleting…' : 'yes, delete'}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       {error && <p className="mt-1 text-xs text-red-600">{error}</p>}
     </li>
   );
@@ -685,6 +762,25 @@ function ResolvedCard({
   displayNames: Record<string, string>;
   authorHue: number;
 }) {
+  const { appendEvent } = useRoom();
+  const isAuthor = entry.authorId === myUserId;
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  async function deleteEntry() {
+    setBusy(true);
+    try {
+      await appendEvent({
+        type: 'icebreaker_delete',
+        entryId: entry.entryId,
+        ts: Date.now(),
+      });
+    } finally {
+      setBusy(false);
+      setConfirmingDelete(false);
+    }
+  }
+
   return (
     // Resolved entries: ghost bubble too, but more muted — half the glow,
     // softer border. They've been worked through, they don't need to shout.
@@ -704,6 +800,40 @@ function ResolvedCard({
       <p className="mt-1 whitespace-pre-wrap break-words text-xs">
         {entry.content}
       </p>
+      {isAuthor && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {!confirmingDelete ? (
+            <button
+              onClick={() => setConfirmingDelete(true)}
+              disabled={busy}
+              className="rounded-full border border-white/15 bg-transparent px-3 py-1 text-[10px] italic text-slate-300/60 transition-colors hover:border-rose-300/50 hover:text-rose-200 disabled:opacity-50"
+            >
+              delete
+            </button>
+          ) : (
+            <>
+              <span className="text-[10px] italic text-slate-300/80">
+                remove for everyone?
+              </span>
+              <button
+                onClick={() => setConfirmingDelete(false)}
+                disabled={busy}
+                autoFocus
+                className="rounded-full border border-white/20 bg-white/5 px-3 py-1 text-[10px] text-slate-100 transition-all hover:bg-white/10 disabled:opacity-50"
+              >
+                keep it
+              </button>
+              <button
+                onClick={() => void deleteEntry()}
+                disabled={busy}
+                className="rounded-full bg-rose-500/85 px-3 py-1 text-[10px] font-semibold text-white shadow-sm transition-all hover:bg-rose-500 active:scale-[0.97] disabled:opacity-50"
+              >
+                {busy ? 'deleting…' : 'yes'}
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </li>
   );
 }

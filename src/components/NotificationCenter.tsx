@@ -5,11 +5,14 @@
  *
  * Counts badge = number of sections currently flagged unread (not raw
  * event count — one nudge per section is enough). Clicking an entry
- * scrolls the corresponding feature card into view and marks that section
- * read. A "mark all as read" action clears every section's red dot.
+ * routes to the matching feature (via `?open=<feature>` on the room
+ * page, or the dedicated sub-route for safe_space) and marks that
+ * section read. A "mark all as read" action clears every section's
+ * red dot.
  */
 
 import { useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { describeEventForToast } from '@/lib/domain/notifications';
 import { displayName } from '@/lib/domain/displayName';
 import {
@@ -20,12 +23,24 @@ import {
 } from '@/lib/domain/unread';
 import { useRoom } from './RoomProvider';
 
+function hrefForSection(section: SectionId, roomId: string): string {
+  switch (section) {
+    case 'safe_space':
+      return `/rooms/${roomId}/safe-space`;
+    case 'messages':
+      return `/rooms/${roomId}`;
+    default:
+      return `/rooms/${roomId}?open=${section}`;
+  }
+}
+
 export function NotificationCenter() {
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const { unread, markViewed, markAllViewed, lastViewed } = useUnreadBySection();
   const recent = useRecentPartnerEvents(30);
-  const { displayNames, myUserId } = useRoom();
+  const { displayNames, myUserId, room } = useRoom();
+  const router = useRouter();
 
   useEffect(() => {
     if (!open) return;
@@ -49,11 +64,8 @@ export function NotificationCenter() {
   function jumpTo(section: SectionId) {
     markViewed(section);
     setOpen(false);
-    // Defer so the dropdown has a tick to close before we scroll.
-    queueMicrotask(() => {
-      const el = document.querySelector(`[data-section="${section}"]`);
-      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    });
+    if (!room) return;
+    router.push(hrefForSection(section, room.id));
   }
 
   return (

@@ -96,6 +96,7 @@ export function describeEventForToast(
     case 'mind_reader_delete':
     case 'icebreaker_ack':
     case 'icebreaker_unlock':
+    case 'icebreaker_delete':
     case 'display_name_set':
       return null;
     default:

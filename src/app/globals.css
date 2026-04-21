@@ -1,6 +1,16 @@
 @import "tailwindcss";
 
 /*
+ * Detach the `dark:` Tailwind variant from OS preference. Tailwind v4
+ * defaults `dark:` to `@media (prefers-color-scheme: dark)`, which
+ * meant every macOS/iOS user in night mode got obsidian surfaces
+ * whether they picked it in the app or not. Re-binding the variant
+ * to our own `html[data-theme="obsidian"]` attribute (which the
+ * in-app ThemeToggle writes) makes light/dark a pure app choice.
+ */
+@custom-variant dark (&:where(html[data-theme="obsidian"], html[data-theme="obsidian"] *));
+
+/*
  * Warm Obsidian / Ember at Dusk palette. Tokens defined in
  * src/lib/design/tokens.ts for JS; CSS vars mirror them so Tailwind
  * utilities and legacy bg-white/dark-mode selectors render in the
@@ -14,6 +24,7 @@
   --brass:      #9A7A3E;
   --ink-dim:    #6B5D51;
   --ink-faint:  #A99A8A;
+  color-scheme: light;
 }
 
 @theme inline {
@@ -39,6 +50,7 @@ html[data-theme="obsidian"] {
   --brass:      #A8B5C4; /* moon */
   --ink-dim:    #8A7E70;
   --ink-faint:  #574E44;
+  color-scheme: dark;
 }
 
 /*

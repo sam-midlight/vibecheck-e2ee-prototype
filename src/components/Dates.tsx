@@ -207,9 +207,7 @@ export function Dates() {
   const currentMemberIds = useMemo(
     () =>
       room
-        ? members
-            .filter((m) => m.generation === room.current_generation)
-            .map((m) => m.user_id)
+        ? uniqueMembers(members, room.current_generation).map((m) => m.user_id)
         : [],
     [members, room],
   );

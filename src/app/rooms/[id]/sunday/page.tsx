@@ -23,6 +23,7 @@ import {
   NEED_EMOJI,
   NEED_LABEL,
 } from '@/lib/domain/loveTank';
+import { uniqueMembers } from '@/lib/domain/members';
 import {
   formatReportDate,
   generateWeekReport,
@@ -51,9 +52,7 @@ function ReportInner() {
   const currentMemberIds = useMemo(
     () =>
       room
-        ? members
-            .filter((m) => m.generation === room.current_generation)
-            .map((m) => m.user_id)
+        ? uniqueMembers(members, room.current_generation).map((m) => m.user_id)
         : [],
     [room, members],
   );

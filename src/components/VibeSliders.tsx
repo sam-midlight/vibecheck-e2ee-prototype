@@ -696,9 +696,14 @@ function SliderRow({
 
       {myCurrentNote && (
         <div className="mt-2 flex items-start justify-between gap-2 rounded-xl border border-sky-200/70 bg-white/80 px-2 py-1 text-xs shadow-sm backdrop-blur-md dark:border-sky-800/50 dark:bg-neutral-900/70">
-          <span className="italic text-sky-900/80 dark:text-sky-100">
-            &ldquo;{myCurrentNote}&rdquo;
-          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-[9px] uppercase tracking-[0.18em] text-sky-900/50 dark:text-sky-100/60">
+              you said
+            </p>
+            <span className="italic text-sky-900/80 dark:text-sky-100">
+              &ldquo;{myCurrentNote}&rdquo;
+            </span>
+          </div>
           <button
             type="button"
             onClick={() => void commitNote('')}
@@ -745,10 +750,14 @@ function SliderRow({
             polarity === 'inverted' ? 100 - v.value : v.value;
           const partnerInWarning = partnerAdjusted <= 25;
           if (!v.note && !partnerInWarning) return null;
+          const partnerFirstName = fmtDisplayName(uid, displayNames, myUserId, null).split(' ')[0];
           return (
             <div key={`partner-${uid}`} className="mt-1 space-y-1">
               {v.note && (
                 <>
+                  <p className="text-[9px] uppercase tracking-[0.18em] text-sky-900/50 dark:text-sky-100/60">
+                    {partnerFirstName} said
+                  </p>
                   <p className="text-xs italic text-sky-900/70 dark:text-sky-100">
                     &ldquo;{v.note}&rdquo;
                   </p>

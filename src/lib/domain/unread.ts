@@ -47,6 +47,7 @@ export const SECTION_EVENT_TYPES: Record<SectionId, readonly string[]> = {
     'icebreaker_ready_to_talk',
     'icebreaker_ack',
     'icebreaker_resolve',
+    'icebreaker_delete',
     'time_out_start',
     'time_out_end',
   ],

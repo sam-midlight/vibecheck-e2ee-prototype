@@ -341,6 +341,15 @@ export const IcebreakerResolveEventSchema = z.object({
   ts: z.number(),
 });
 
+// Author-only tombstone: soft-deletes a prior safe-space post. The
+// reducer drops any entry whose authorId matches a delete event's
+// senderId. Mirrors the message_delete / mind_reader_delete pattern.
+export const IcebreakerDeleteEventSchema = z.object({
+  type: z.literal('icebreaker_delete'),
+  entryId: z.string().uuid(),
+  ts: z.number(),
+});
+
 export const TimeOutStartEventSchema = z.object({
   type: z.literal('time_out_start'),
   durationSeconds: z.number().int().positive().max(60 * 60 * 24),
@@ -747,6 +756,7 @@ export const RoomEventSchema = z.discriminatedUnion('type', [
   IcebreakerAckEventSchema,
   IcebreakerReadyToTalkEventSchema,
   IcebreakerResolveEventSchema,
+  IcebreakerDeleteEventSchema,
   TimeOutStartEventSchema,
   TimeOutEndEventSchema,
   RoomRenameEventSchema,

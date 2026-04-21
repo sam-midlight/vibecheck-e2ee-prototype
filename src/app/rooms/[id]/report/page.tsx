@@ -22,6 +22,7 @@ import {
   type RoomEventRecord,
 } from '@/components/RoomProvider';
 import { displayName } from '@/lib/domain/displayName';
+import { uniqueMembers } from '@/lib/domain/members';
 
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -46,9 +47,7 @@ function ReportInner({ roomId }: { roomId: string }) {
   const memberIds = useMemo(
     () =>
       room
-        ? members
-            .filter((m) => m.generation === room.current_generation)
-            .map((m) => m.user_id)
+        ? uniqueMembers(members, room.current_generation).map((m) => m.user_id)
         : [],
     [members, room],
   );
