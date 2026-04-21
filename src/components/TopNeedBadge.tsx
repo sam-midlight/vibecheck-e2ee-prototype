@@ -156,7 +156,7 @@ export function MyTopNeedBadge() {
         ts: rec.event.ts,
       },
     };
-  }, {});
+  }, {}, []);
 
   if (!myUserId || !room) return null;
 

@@ -120,5 +120,6 @@ export function useVaultUnread(dateId: string): VaultUnread {
       return next;
     },
     { posts: 0, memories: 0, spins: 0, total: 0, lastActivityTs: 0 },
+    [dateId, myUserId, lastSeen],
   );
 }

@@ -172,7 +172,7 @@ export function DateVault({ dateId }: { dateId: string }) {
         };
     }
     return acc;
-  }, null);
+  }, null, [dateId]);
 
   const memberRows = useMemo(
     () => (room ? uniqueMembers(members, room.current_generation) : []),
@@ -946,7 +946,7 @@ function WallOfIntent({
       return acc.filter((p) => p.postId !== ev.postId);
     }
     return acc;
-  }, []);
+  }, [], [dateId]);
 
   const sorted = useMemo(
     () => [...posts].sort((a, b) => b.ts - a.ts),

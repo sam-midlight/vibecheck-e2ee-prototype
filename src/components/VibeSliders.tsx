@@ -188,7 +188,7 @@ export function VibeSliders({
       };
     }
     return acc;
-  }, { defs: {}, values: {} });
+  }, { defs: {}, values: {} }, []);
 
   // A slider is "live" if its latest define is newer than its latest
   // delete. Sort by FIRST definedTs (immutable) — editing keeps order.

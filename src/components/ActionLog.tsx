@@ -194,6 +194,7 @@ function useActionState(): ActionState {
       return state as ActionState;
     },
     emptyState(),
+    [myUserId],
   );
 }
 

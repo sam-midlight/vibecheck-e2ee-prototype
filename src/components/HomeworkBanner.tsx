@@ -47,6 +47,7 @@ export function HomeworkBanner() {
       return { text: rec.event.text, ts: rec.event.ts, senderId: rec.senderId };
     },
     null,
+    [],
   );
 
   const [editing, setEditing] = useState(false);

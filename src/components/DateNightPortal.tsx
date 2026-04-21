@@ -158,6 +158,7 @@ function usePortalState(): PortalState {
       } as PortalState;
     },
     { upcoming: [], matchesNoSchedule: [] },
+    [memberIds],
   );
 }
 

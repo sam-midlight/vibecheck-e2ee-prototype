@@ -696,16 +696,20 @@ export function RoomProvider({
 /**
  * Reduce the room's event stream into a feature-specific projection.
  * Returns the fold of `reducer` over all known events in chronological order.
+ *
+ * `deps` are the reducer's closure captures — anything outside `acc` and
+ * `rec` that the reducer reads. Pass `[]` for pure reducers. Without this,
+ * inline `reducer` / `initial` literals change identity every render and
+ * invalidate the memo, defeating the whole purpose of projection caching.
  */
 export function useRoomProjection<T>(
   reducer: (state: T, event: RoomEventRecord) => T,
   initial: T,
+  deps: ReadonlyArray<unknown>,
 ): T {
   const { events } = useRoom();
-  return useMemo(
-    () => events.reduce((acc, rec) => reducer(acc, rec), initial),
-    [events, reducer, initial],
-  );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  return useMemo(() => events.reduce(reducer, initial), [events, ...deps]);
 }
 
 // ---------------------------------------------------------------------------

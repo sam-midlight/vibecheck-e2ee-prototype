@@ -138,6 +138,7 @@ export function LoveTank() {
       };
     },
     {},
+    [],
   );
 
   const currentGenMembers = useMemo(

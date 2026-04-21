@@ -81,7 +81,7 @@ export function AffectionWidget() {
       return acc;
     }
     return acc;
-  }, []);
+  }, [], []);
   // Two-pass: index sends, then walk receives in chrono order.
   const bankResolved = useRoomProjection<{
     sends: Map<string, RoomEventRecord>;
@@ -114,6 +114,7 @@ export function AffectionWidget() {
       return acc;
     },
     { sends: new Map(), received: [] },
+    [myUserId],
   );
   void bank; // unused first pass kept above to document the rejected approach
 

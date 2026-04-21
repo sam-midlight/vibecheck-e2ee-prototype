@@ -205,7 +205,7 @@ export function SafeSpace({
   }, {
     entries: {},
     timeOut: { activeUntilTs: 0, startedTs: 0, endTs: 0 },
-  });
+  }, []);
 
   const currentMemberIds = useMemo(
     () =>

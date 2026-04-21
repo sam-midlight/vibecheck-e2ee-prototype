@@ -116,7 +116,7 @@ export function MindReader() {
       default:
         return acc;
     }
-  }, {});
+  }, {}, []);
 
   const { active, solved } = useMemo(() => {
     const a: Game[] = [];

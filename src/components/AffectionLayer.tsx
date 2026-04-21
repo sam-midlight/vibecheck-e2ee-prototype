@@ -62,6 +62,7 @@ export function AffectionLayer() {
       return acc;
     },
     {} as Record<string, ActiveAffection>,
+    [],
   );
 
   const list = useMemo(() => Object.values(active), [active]);

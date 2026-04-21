@@ -121,7 +121,7 @@ export function Roulette({
       return acc.filter((s) => s.sliceId !== ev.sliceId);
     }
     return acc;
-  }, []);
+  }, [], [isDateNight, isVaultScoped, dateId]);
 
   // Keep only the most recent spin event — prior spins are history we don't
   // need to replay.
@@ -143,7 +143,7 @@ export function Roulette({
       ts: rec.event.ts,
       triggeredBy: rec.senderId,
     };
-  }, null);
+  }, null, [isDateNight, isVaultScoped, dateId]);
 
   // Local rotation accumulator. Never normalized — CSS handles unbounded
   // rotation values fine, and keeping a growing value means sequential spins

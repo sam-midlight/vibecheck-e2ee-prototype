@@ -47,7 +47,7 @@ export function VibeOracleBanner() {
     if (rec.event.type !== 'homework_set') return acc;
     if (acc && acc.ts > rec.event.ts) return acc;
     return { text: rec.event.text, ts: rec.event.ts };
-  }, null);
+  }, null, []);
   const intentionText = intention?.text.trim() ?? '';
 
   useEffect(() => {

@@ -46,7 +46,7 @@ export function Wishlist() {
 
   const state = useRoomProjection<WishlistState>((acc, rec) => {
     return reduceWishlist(acc, rec.event, rec.senderId);
-  }, {});
+  }, {}, []);
 
   const items = useMemo(
     () =>

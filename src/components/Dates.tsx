@@ -202,7 +202,7 @@ export function Dates() {
       default:
         return acc;
     }
-  }, {});
+  }, {}, []);
 
   const currentMemberIds = useMemo(
     () =>

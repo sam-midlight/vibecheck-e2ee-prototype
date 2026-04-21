@@ -72,7 +72,7 @@ export function Gratitude() {
   const feed = useRoomProjection<RoomEventRecord[]>((acc, rec) => {
     if (rec.event.type !== 'gratitude_send') return acc;
     return [...acc, rec];
-  }, []);
+  }, [], []);
 
   const sorted = useMemo(
     () => [...feed].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),

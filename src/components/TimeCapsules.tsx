@@ -80,7 +80,7 @@ export function TimeCapsules() {
       });
     }
     return acc;
-  }, []);
+  }, [], []);
 
   // `now` ticks once a second. Effects that depend on now run through the
   // countdown + locked-→-unlocked transition cleanly.
