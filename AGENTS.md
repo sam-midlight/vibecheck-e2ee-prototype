@@ -66,9 +66,14 @@ Each user has **five distinct key types**. Mixing them up is the most common way
 
 **Reference UX (feel free to rewrite in the consuming app's design system):**
 - `src/app/page.tsx` (magic-link landing)
-- `src/app/rooms/**` (rooms list, detail, invite forms, member list, `[id]/call/` for video)
+- `src/app/onboarding/page.tsx` (first-time name + create-room/accept-invite step)
+- `src/app/rooms/**` (rooms list, detail, invite forms, member list, `[id]/call/` for video, plus per-feature sub-routes: `date-night/`, `dates/[dateId]/`, `safe-space/`, `sunday/`, `report/`)
+- `src/app/invites/page.tsx` (pending-invites inbox)
+- `src/app/about/page.tsx` (user-facing tour + plain-language privacy explainer)
 - `src/app/status/page.tsx` (diagnostic dashboard — recommended to port as a regression harness, style is yours)
 - `src/app/settings/page.tsx` (settings — reuse the handlers, rewrite the presentation)
+- `src/app/loaders/page.tsx` (internal loader-variant gallery — drop entirely if not useful)
+- Per-feature components (`Dates`, `DateVault`, `SafeSpace`, `SafeSpaceLantern`, `LoveTank`, `Gratitude`, `Wishlist`, `MindReader`, `TimeCapsules`, `MemoryBank`, `MemoryJar`, `Roulette`, `BribeForm`, `MemberVibePopover`, `OrbActionMenu`, `FeatureLauncher`, `FeatureSheet`, `HomeworkBanner`, `ConfettiBurst`, `DateGeneratorWidget`, `DateNightPortal`, …) — claymorphic UX skin over the foundation. Rewrite freely; **do not re-implement crypto inside them** — they should call into `src/lib/e2ee-core/` + `src/lib/bootstrap.ts` for any blob/key operation.
 
 ## 5. Pointers for deeper questions
 

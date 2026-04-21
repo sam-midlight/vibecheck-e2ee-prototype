@@ -114,16 +114,34 @@ src/
 │   ├── auth/callback/page.tsx            Identity bootstrap, approval,
 │   │                                     recovery, unlock, enforce-PIN gate
 │   ├── api/dev/magic-link/route.ts       ⚠ TEMP dev shortcut
+│   ├── onboarding/page.tsx               First-time name capture +
+│   │                                     create-room / accept-invite step
 │   ├── rooms/page.tsx                    Rooms list + create + invite
 │   ├── rooms/[id]/page.tsx               Room detail, messages, rotate,
-│   │                                     in-room invite, nicknames
+│   │                                     in-room invite, nicknames, plus
+│   │                                     feature surfaces (dates, safe
+│   │                                     space, love tank, gratitude, …)
 │   ├── rooms/[id]/call/                  E2EE video call (LiveKit SFrame)
+│   ├── rooms/[id]/{date-night,dates/
+│   │   [dateId],safe-space,sunday,
+│   │   report}/                          Per-feature sub-routes
+│   ├── invites/page.tsx                  Pending-invites inbox
+│   ├── about/page.tsx                    User-facing tour + privacy explainer
 │   ├── settings/page.tsx                 Safety number, recovery phrase,
 │   │                                     device list + revoke, PIN-lock,
-│   │                                     SAS verification launch
-│   └── status/page.tsx                   Diagnostic dashboard
-├── components/                           AppShell, PinSetupModal,
-│                                         RecoveryPhraseModal, ...
+│   │                                     SAS verification launch, dev mode
+│   ├── status/page.tsx                   Diagnostic dashboard (dev-mode only)
+│   └── loaders/page.tsx                  Internal loader-variant gallery
+├── components/                           Foundation security UI (AppShell,
+│                                         PinSetupModal, RecoveryPhraseModal,
+│                                         PromoteDeviceModal, VerifyContact-
+│                                         Modal, IncomingCallToast, KeyChange-
+│                                         Banner, PendingApprovalBanner, …)
+│                                         + reference feature UX (Dates,
+│                                         DateVault, SafeSpace, LoveTank,
+│                                         Gratitude, Wishlist, MindReader,
+│                                         TimeCapsules, MemoryBank, Memory-
+│                                         Jar, Roulette, FeatureLauncher, …)
 ├── lib/
 │   ├── e2ee-core/                        ★ Pure crypto — copy verbatim
 │   │   ├── device.ts                     MSK + DeviceKeyBundle + certs
