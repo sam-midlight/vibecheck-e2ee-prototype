@@ -216,9 +216,9 @@ npm run dev                   # http://localhost:3000
 
 Three layers, each documented under `docs/`:
 
-- **`docs/test-catalog.md`** — one-sentence-per-test reference for every script in `scripts/test-*.ts`, organized by the invariant defended. **79 tests** covering crypto primitives, RLS, Megolm ratchet behaviour, room-key rotation, identity/cross-signing, PIN-lock, video-call key wrap, and the per-feature attribution canaries from the Phase 4 ports.
+- **`docs/test-catalog.md`** — one-sentence-per-test reference for every script in `scripts/test-*.ts`, organized by the invariant defended. **86 tests** covering crypto primitives, RLS, Megolm ratchet behaviour, room-key rotation, identity/cross-signing, PIN-lock, video-call key wrap, and the per-feature attribution canaries from the Phase 4 ports.
 - **`docs/integration-tests.md`** — the same suite organized as a 7-stage progression from happy-path through adversarial cases up to feature-layer event invariants.
-- **`docs/mutation-testing-plan.md`** — **16 mutations** that deliberately weaken security-critical code. The runner (`scripts/run-mutations.ts`) applies each, confirms the kill-list tests fail, restores, and confirms they pass again. A test that doesn't catch the mutation it's supposed to catch is a coverage gap.
+- **`docs/mutation-testing-plan.md`** — **21 mutations** that deliberately weaken security-critical code. The runner (`scripts/run-mutations.ts`) applies each, confirms the kill-list tests fail, restores, and confirms they pass again. A test that doesn't catch the mutation it's supposed to catch is a coverage gap.
 
 ```bash
 # Run a single test

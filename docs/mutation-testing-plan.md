@@ -560,6 +560,171 @@ export async function verifyCrossSigningChain(params: {
 
 ---
 
+### M17 — v1 blob outer signature check bypassed (legacy read-path)
+
+**File:** `src/lib/e2ee-core/blob.ts`
+
+**Find:**
+```ts
+    const sigOk = await verifyMessage(
+      concatBytes(blob.nonce, blob.ciphertext),
+      blob.signature,
+      senderEd25519PublicKey,
+    );
+    if (!sigOk) {
+      throw new CryptoError('sender signature invalid', 'SIGNATURE_INVALID');
+    }
+```
+
+**Replace:**
+```ts
+    const sigOk = await verifyMessage(
+      concatBytes(blob.nonce, blob.ciphertext),
+      blob.signature,
+      senderEd25519PublicKey,
+    );
+    if (!sigOk) {
+      /* M17: v1 outer signature check disabled */
+      void sigOk;
+    }
+```
+
+**Effect:** Legacy v1 blobs (outer sig column, MSK-signed) bypass the sig check — a forged v1 row would be accepted. Orthogonal to M08/M16 which cover v3/v4 inner-sig paths.
+
+**Must kill:**
+- `test-blob-sender-verification-v1.ts` — impostor-pub case fires Vulnerability; flipped-byte case also kills.
+
+**Survives:** `test-happy-path.ts` (v4 path, untouched).
+
+---
+
+### M18 — v2 blob inner signature check bypassed (legacy read-path)
+
+**File:** `src/lib/e2ee-core/blob.ts`
+
+**Find:**
+```ts
+        if (!sigOk) {
+          throw new CryptoError('sender signature invalid', 'SIGNATURE_INVALID');
+        }
+```
+
+**Replace:**
+```ts
+        if (!sigOk) {
+          /* M18: v2 inner signature check disabled */
+          void sigOk;
+        }
+```
+
+*(Matches the 8-space-indent `'sender signature invalid'` block, unique to the v2 branch — v3 uses `'sender device signature invalid'`, v4 prefixes with `'v4 '`, v1 is 4-space-indent.)*
+
+**Effect:** Legacy v2 envelopes (MSK-signed, sealed inside AEAD) bypass the inner sig check. An attacker who AEAD-reseals a forged payload under a captured v2 blob is accepted.
+
+**Must kill:**
+- `test-blob-sender-verification-v2.ts` — impostor-MSK, impostor-device-pub, and AEAD-resealed-forged-payload cases all fire Vulnerability.
+
+**Survives:** `test-happy-path.ts`.
+
+---
+
+### M19 — Invite envelope signature verification bypassed entirely
+
+**File:** `src/lib/e2ee-core/membership.ts`
+
+**Find:**
+```ts
+export async function verifyInviteEnvelope(
+  fields: InviteEnvelopeFields,
+  signature: Bytes,
+  inviterDeviceEd25519PublicKey: Bytes,
+): Promise<void> {
+  const msg = await canonicalInviteMessage(fields);
+  await verifyMessageOrThrow(msg, signature, inviterDeviceEd25519PublicKey);
+}
+```
+
+**Replace:**
+```ts
+export async function verifyInviteEnvelope(
+  fields: InviteEnvelopeFields,
+  signature: Bytes,
+  inviterDeviceEd25519PublicKey: Bytes,
+): Promise<void> {
+  /* M19: invite envelope signature verification bypassed */
+  void fields; void signature; void inviterDeviceEd25519PublicKey;
+}
+```
+
+**Effect:** Every service-role-injected invite is accepted — the client-side last-line-of-defence against RLS regressions is gone.
+
+**Must kill:**
+- `test-invite-signature-injection.ts` — Case A (empty-sig) fires first; all 5 tampering vectors would equally fail.
+
+**Survives:** `test-happy-path.ts`.
+
+---
+
+### M20 — roomId dropped from canonical invite message (per-branch: room replay)
+
+**File:** `src/lib/e2ee-core/membership.ts`
+
+**Find:**
+```ts
+  return concatBytes(
+    INVITE_DOMAIN,
+    await uuidBytes(f.roomId),
+    u32BE(f.generation),
+```
+
+**Replace:**
+```ts
+  return concatBytes(
+    INVITE_DOMAIN,
+    /* M20: f.roomId removed from canonical — cross-room sig replay works */
+    u32BE(f.generation),
+```
+
+**Effect:** The canonical invite message no longer binds `roomId`. A valid signature for one room's invite can be replayed as a different room's invite. Both sign-time and verify-time are uniformly affected, so honest end-to-end invites still round-trip — only the cross-room replay attack slips through.
+
+**Must kill:**
+- `test-invite-signature-injection.ts` — Case C (valid-sig-different-fields) specifically fires Vulnerability; Cases A/B (bad sigs), D (wrong inviter pub), E (tampered expiry) still fail honestly. Per-branch targeting confirms Case C is specifically sensitive to `roomId` binding.
+
+**Survives:** `test-happy-path.ts`, `test-invite-accept-flow.ts` (positive baseline — honest end-to-end still round-trips under uniform canonical change).
+
+---
+
+### M21 — expiresAtMs dropped from canonical invite message (per-branch: tampered exp)
+
+**File:** `src/lib/e2ee-core/membership.ts`
+
+**Find:**
+```ts
+    await uuidBytes(f.inviterUserId),
+    await uuidBytes(f.inviterDeviceId),
+    u64BE(f.expiresAtMs),
+  );
+}
+```
+
+**Replace:**
+```ts
+    await uuidBytes(f.inviterUserId),
+    await uuidBytes(f.inviterDeviceId),
+    /* M21: f.expiresAtMs removed from canonical — post-sign exp tampering accepted */
+  );
+}
+```
+
+**Effect:** The expiry is no longer signed. A service-role attacker with access to an honest invite row can extend its expiry arbitrarily after the fact.
+
+**Must kill:**
+- `test-invite-signature-injection.ts` — Case E (tampered-expires-at) specifically fires Vulnerability; all other cases still fail honestly.
+
+**Survives:** `test-happy-path.ts`, `test-invite-accept-flow.ts`.
+
+---
+
 ### M15 — AppShell PIN-guard redirect target changed
 
 **File:** `src/components/AppShell.tsx`
@@ -607,8 +772,13 @@ export async function verifyCrossSigningChain(params: {
 | M14 | AppShell guard runs before `setChecking(false)` (guard moved after) | T67 |
 | M15 | AppShell PIN-guard redirect target is `/auth/callback` (target changed to `/rooms`) | T67 |
 | M16 | v3 sender attribution block enforces both device-lookup AND signature | T56, T72, T73, T74, T75, T76 |
+| M17 | v1 blob outer signature (legacy read-path) is verified | test-blob-sender-verification-v1.ts |
+| M18 | v2 blob inner signature (legacy read-path) is verified | test-blob-sender-verification-v2.ts |
+| M19 | Invite envelope signature is verified (client-side RLS-regression defence) | test-invite-signature-injection.ts |
+| M20 | Canonical invite binding includes `roomId` (per-branch: cross-room replay) | test-invite-signature-injection.ts Case C |
+| M21 | Canonical invite binding includes `expiresAtMs` (per-branch: post-sign exp tampering) | test-invite-signature-injection.ts Case E |
 
-**16 mutations total** — 12 cryptographic (M01–M12), 3 source-structural for the AppShell mandatory-PIN guard (M13–M15), and 1 (M16) for the v3 sender-attribution invariant exercised by the per-feature attribution canaries.
+**21 mutations total** — 12 cryptographic (M01–M12), 3 source-structural for the AppShell mandatory-PIN guard (M13–M15), 1 (M16) for the v3 sender-attribution invariant exercised by the per-feature attribution canaries, 2 (M17–M18) for legacy v1/v2 blob read-path sigs, and 3 (M19–M21) for invite-envelope verification (M19 single-point; M20–M21 per-branch canonical-field binding).
 
 ---
 
@@ -674,7 +844,7 @@ Three of the Phase 4 feature-layer tests assert and *document* that a particular
 ## Running the Mutations
 
 ```bash
-# Run all 16 code mutations
+# Run all 21 code mutations
 npx tsx --env-file=.env.local scripts/run-mutations.ts
 
 # Run a single mutation by ID

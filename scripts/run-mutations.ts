@@ -462,6 +462,129 @@ const MUTATIONS: Mutation[] = [
     ],
     survives: ['test-happy-path.ts'],
   },
+
+  // ── M17 ────────────────────────────────────────────────────────────────────
+  {
+    id: 'M17',
+    description: 'v1 blob outer signature check bypassed (legacy read-path)',
+    steps: [{
+      file: 'src/lib/e2ee-core/blob.ts',
+      find:
+`    const sigOk = await verifyMessage(
+      concatBytes(blob.nonce, blob.ciphertext),
+      blob.signature,
+      senderEd25519PublicKey,
+    );
+    if (!sigOk) {
+      throw new CryptoError('sender signature invalid', 'SIGNATURE_INVALID');
+    }`,
+      replace:
+`    const sigOk = await verifyMessage(
+      concatBytes(blob.nonce, blob.ciphertext),
+      blob.signature,
+      senderEd25519PublicKey,
+    );
+    if (!sigOk) {
+      /* M17: v1 outer signature check disabled */
+      void sigOk;
+    }`,
+    }],
+    kills: ['test-blob-sender-verification-v1.ts'],
+    survives: ['test-happy-path.ts'],
+  },
+
+  // ── M18 ────────────────────────────────────────────────────────────────────
+  {
+    id: 'M18',
+    description: 'v2 blob inner signature check bypassed (legacy read-path)',
+    steps: [{
+      file: 'src/lib/e2ee-core/blob.ts',
+      find:
+`        if (!sigOk) {
+          throw new CryptoError('sender signature invalid', 'SIGNATURE_INVALID');
+        }`,
+      replace:
+`        if (!sigOk) {
+          /* M18: v2 inner signature check disabled */
+          void sigOk;
+        }`,
+    }],
+    kills: ['test-blob-sender-verification-v2.ts'],
+    survives: ['test-happy-path.ts'],
+  },
+
+  // ── M19 ────────────────────────────────────────────────────────────────────
+  {
+    id: 'M19',
+    description: 'Invite envelope signature verification bypassed entirely',
+    steps: [{
+      file: 'src/lib/e2ee-core/membership.ts',
+      find:
+`export async function verifyInviteEnvelope(
+  fields: InviteEnvelopeFields,
+  signature: Bytes,
+  inviterDeviceEd25519PublicKey: Bytes,
+): Promise<void> {
+  const msg = await canonicalInviteMessage(fields);
+  await verifyMessageOrThrow(msg, signature, inviterDeviceEd25519PublicKey);
+}`,
+      replace:
+`export async function verifyInviteEnvelope(
+  fields: InviteEnvelopeFields,
+  signature: Bytes,
+  inviterDeviceEd25519PublicKey: Bytes,
+): Promise<void> {
+  /* M19: invite envelope signature verification bypassed */
+  void fields; void signature; void inviterDeviceEd25519PublicKey;
+}`,
+    }],
+    kills: ['test-invite-signature-injection.ts'],
+    survives: ['test-happy-path.ts'],
+  },
+
+  // ── M20 ────────────────────────────────────────────────────────────────────
+  {
+    id: 'M20',
+    description: 'roomId dropped from canonical invite message (per-branch: room replay)',
+    steps: [{
+      file: 'src/lib/e2ee-core/membership.ts',
+      find:
+`  return concatBytes(
+    INVITE_DOMAIN,
+    await uuidBytes(f.roomId),
+    u32BE(f.generation),`,
+      replace:
+`  return concatBytes(
+    INVITE_DOMAIN,
+    /* M20: f.roomId removed from canonical — cross-room sig replay works */
+    u32BE(f.generation),`,
+    }],
+    kills: ['test-invite-signature-injection.ts'],
+    survives: ['test-happy-path.ts'],
+  },
+
+  // ── M21 ────────────────────────────────────────────────────────────────────
+  {
+    id: 'M21',
+    description: 'expiresAtMs dropped from canonical invite message (per-branch: tampered exp)',
+    steps: [{
+      file: 'src/lib/e2ee-core/membership.ts',
+      find:
+`    await uuidBytes(f.inviterUserId),
+    await uuidBytes(f.inviterDeviceId),
+    u64BE(f.expiresAtMs),
+  );
+}`,
+      replace:
+`    await uuidBytes(f.inviterUserId),
+    await uuidBytes(f.inviterDeviceId),
+    /* M21: f.expiresAtMs removed from canonical — post-sign exp tampering accepted */
+  );
+}`,
+    }],
+    kills: ['test-invite-signature-injection.ts'],
+    survives: ['test-happy-path.ts'],
+  },
 ];
 
 // ---------------------------------------------------------------------------

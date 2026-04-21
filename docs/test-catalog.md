@@ -2,7 +2,7 @@
 
 A one-sentence-per-test reference to every script in `scripts/test-*.ts`, organized by the invariant each test defends. Use this as the "what is this test asserting?" lookup when triaging a failure or reasoning about coverage.
 
-**79 tests total.** All run against a live Supabase project:
+**86 tests total.** All run against a live Supabase project:
 
 ```
 npx tsx --env-file=.env.local scripts/<test-file>.ts
@@ -38,6 +38,8 @@ The five-key hierarchy (MSK/SSK/USK/DeviceEd/DeviceX) and the signatures that ch
 |---|---|
 | test-msk-rotation.ts | New MSK+SSK+USK with fresh cross-sigs; device cert re-signed under new SSK; old blobs still decrypt (room key unchanged). |
 | test-msk-rotation-cascade.ts | Ghost-device scenario across 3 rooms: MSK rotation re-signs only the trusted device; each room is rotated excluding the ghost; the ghost's old cert no longer chains to the new SSK. |
+| test-msk-rotation-orchestrator.ts | `rotateAllRoomsIAdmin` scope: Alice admins R1+R2 and joined R3 via Bob — after MSK rotation the cascade bumps R1/R2 only, leaves R3 at its original gen; creator-only RPC rejects Alice attempting a direct `kick_and_rotate` on R3; `identity_epoch` bumped and dev1 revocation persisted. |
+| test-msk-rotation-revocation-bundle.ts | DevicePicker-unchecked path: rotating MSK with `devicesToRevoke=[dev1]` atomically writes dev0's new-SSK-signed issuance cert AND dev1's new-SSK-signed revocation row; dev1's revocation verifies under the new chain but not the old; `filterActiveDevices` keeps only dev0 (`verifyPublicDevice` on dev1 rejects via CERT_INVALID or DEVICE_REVOKED — issuance cert for revoked devices is intentionally not reissued, so the cert check fails first). |
 | test-cert-chain-verification.ts | MSK→SSK cross-sig, SSK→device cert (v2), and v1 fallback all verify; revocation path breaks chain; tampered sigs throw CERT_INVALID. |
 | test-usk-cross-sign.ts | Post-SAS USK signs peer's MSK pub; four negative cases (wrong key, wrong msk, wrong timestamp, wrong signed-pub) all throw CERT_INVALID. |
 | test-sas-mac.ts | Full SAS protocol end-to-end: commitment/reveal, X25519 shared secret, 7-emoji derivation, HMAC exchange; commitment mismatch detected, MITM-substituted ephemeral produces diverging emoji, tampered MAC + cross-identity MAC both rejected. |
@@ -45,6 +47,8 @@ The five-key hierarchy (MSK/SSK/USK/DeviceEd/DeviceX) and the signatures that ch
 | test-revocation.ts | Post-revocation forward secrecy: revoked device is kicked and rotated out, new room key wrapped only for active devices, revoked device has no gen-N+1 wrap. |
 | test-spoofed-identity.ts | Eve's attempt to insert a device row under Alice's user_id is blocked by RLS; her self-signed cert fails `verifyDeviceIssuance` against Alice's real SSK. |
 | test-blob-sender-verification.ts | `decryptBlob` with the correct sender device-ed pub succeeds; with an impostor pub it throws SIGNATURE_INVALID (even though AEAD decryption would have succeeded — the envelope's inner signature catches attribution forgery). |
+| test-blob-sender-verification-v1.ts | Legacy v1 read-path: outer `blobs.signature` covering `nonce \|\| ciphertext` and MSK-signed. Correct user-root pub decrypts (returns `senderUserId/DeviceId = null`); impostor pub, flipped sig byte, missing signature column, and missing pub all reject. Guards the never-otherwise-exercised v1 branch in `decryptBlob` against silent short-circuit. |
+| test-blob-sender-verification-v2.ts | Legacy v2 read-path: MSK-signed inner envelope sig sealed inside the AEAD. Correct pub decrypts; impostor MSK, impostor device pub, missing pub, and AEAD-resealed forged payload all reject. |
 | test-corrupted-membership-sig.ts | `room_members.wrap_signature` with one byte flipped fails `verifyMembershipWrap` at the client; the original verifies; wrong signer pub also fails. |
 | test-identity-epoch-staleness.ts | After MSK rotation bumps `identities.identity_epoch`, an approval request carrying the old epoch is deleted by `verify_approval_code` (returns false). |
 | test-approval-epoch-positive.ts | Positive counterpart: a fresh approval request written at the new epoch verifies successfully — confirms the epoch check isn't over-zealous. |
@@ -86,6 +90,7 @@ Per-sender-per-room ratchets with forward secrecy within a generation. These tes
 | test-out-of-order.ts | Out-of-order delivery (message 2 arrives before 0 and 1) — non-advancing derive works in any order; advancing cursor's retrograde guard holds. |
 | test-advance-cursor-efficiency.ts | Advancing variant produces identical keys to re-deriving from the earlier snapshot; `nextSnapshot.startIndex === targetIndex + 1`. |
 | test-pre-megolm-transition.ts | A room can hold both v3 (flat-key) and v4 (Megolm) blobs; router-style `decryptBlob` handles both; gen-2 flat key does not decrypt gen-1 v3 blob; cross-session key fails AEAD. |
+| test-megolm-rotation-on-gen-bump.ts | Session isolation across `kick_and_rotate`: Alice's gen-1 outbound session is sealed to Bob and used for a gen-1 blob; post-rotation, Alice creates a distinct gen-2 session (unique `(room_id, sender_device_id, generation)` admits both rows; duplicate same-gen rejected); kicked Bob's gen-1 snapshot cannot derive gen-2 keys (different `session_id`); historical gen-1 remains decryptable from its snapshot. |
 
 ## 5. Key sharing, forwards, snapshots
 
@@ -127,6 +132,7 @@ Invariants enforced by Postgres itself. Client-side bugs can't bypass these.
 | test-invite-accept-flow.ts | Happy-path invite accept: Alice invites Bob, Bob verifies envelope signature + unwraps, inserts `room_members`, decrypts Alice's message; Carol cannot re-use the same invite. |
 | test-concurrent-invite-accept.ts | Two of Bob's devices race to accept the same invite — PK `(room_id, device_id, generation)` ensures exactly one succeeds. |
 | test-call-rpc-ownership-gate.ts | Migration 0041 defence: `start_call` / `rotate_call_key` reject envelopes where `device_id` doesn't belong to `target_user_id`, and where `target_user_id` is not a current-gen room member; rotation rolls back atomically. |
+| test-invite-signature-injection.ts | Last-line-of-defence against service-role (or RLS-regression) invite injection: with RLS bypassed, 5 tampering vectors (empty sig, random sig, valid sig bound to a different `roomId`, sig by a different inviter, tampered `expires_at_ms` after honest sign) all rejected by `verifyInviteEnvelope`; honest service-role insert still verifies. |
 
 ## 8. Adversarial: tamper, replay, malformed input
 
@@ -194,4 +200,4 @@ Tests scoped to a specific feature event type rather than the underlying primiti
 
 **`CORRUPT_LOCAL_STATE` is not a distinct error code.** Storage corruption is indistinguishable from a wrong key at the AEAD layer — both surface as `DECRYPT_FAILED`. Callers should treat any `CryptoError` during decrypt as a signal to refetch the session snapshot from the server.
 
-**Mutation testing.** `scripts/run-mutations.ts` applies 12 code-level weakenings and confirms the matching kill-list tests detect each. See `docs/mutation-testing-plan.md` for the per-mutation mapping and the list of invariants that a pure TypeScript mutation cannot weaken (AEAD primitives and RLS policies — the latter would require a Supabase branch).
+**Mutation testing.** `scripts/run-mutations.ts` applies 21 code-level weakenings and confirms the matching kill-list tests detect each. See `docs/mutation-testing-plan.md` for the per-mutation mapping and the list of invariants that a pure TypeScript mutation cannot weaken (AEAD primitives and RLS policies — the latter would require a Supabase branch).

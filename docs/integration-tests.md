@@ -143,6 +143,19 @@ Tests that scope to a specific Phase-4-ported feature event. They split into two
 | T78 | test-bribe-author-attribution.ts | Same forgery rejection for `bribe` — Bob cannot spend hearts "as Alice" to drain her balance or to force-reveal a `mind_reader` thought while attributing the solve to someone else. |
 | T79 | test-wishlist-author-attribution.ts | Same forgery rejection for `wishlist_add` — Bob cannot inject items into Alice's wishlist (and by extension cannot forge `wishlist_claim` / `wishlist_delete` events on her items, since they share the same envelope-attribution mechanism). |
 
+## Stage 8 — Coverage-Gap Backfills (T80–T85)
+
+Tests written to close specific gaps identified by a targeted audit: legacy blob read-paths that were never directly exercised, the invite-envelope client-side rejection flow under a service-role adversary, Megolm session rotation across `kick_and_rotate`, and the MSK-rotation orchestrator/revocation-bundle invariants that no prior test reached. Each was paired with a new mutation entry (M17–M21) in `docs/mutation-testing-plan.md` to prove the test has teeth.
+
+| # | File | What it covers |
+|---|------|----------------|
+| T80 | test-blob-sender-verification-v1.ts | Legacy v1 read-path (outer `blobs.signature` column, MSK-signed over `nonce \|\| ciphertext`): correct user-root pub decrypts with `senderUserId/DeviceId = null`; impostor pub, flipped sig byte, missing signature, and missing pub all reject. Exercises the v1 branch in `decryptBlob` that no other test touches — without this, M17 (disabling v1 sig verify) would have been uncaught. |
+| T81 | test-blob-sender-verification-v2.ts | Legacy v2 read-path (MSK-signed inner envelope sig sealed inside the AEAD): correct pub decrypts; impostor MSK, impostor device pub, missing pub, and AEAD-resealed forged payload all reject. Closes the v2 equivalent of M17 (paired with M18). |
+| T82 | test-invite-signature-injection.ts | Last-line-of-defence against service-role (or RLS-regression) invite injection: 5 tampering vectors written with `service_role` bypassing RLS (empty sig, random sig, sig bound to a different `roomId`, sig by a different inviter, tampered `expires_at_ms` after an honest sign) all rejected by `verifyInviteEnvelope`; honest service-role insert still verifies. Paired against M19 (bypass the check entirely), M20 (drop `roomId` from canonical binding), M21 (drop `expiresAtMs` from canonical binding). |
+| T83 | test-megolm-rotation-on-gen-bump.ts | Session isolation across `kick_and_rotate`: Alice's gen-1 outbound session is used for a gen-1 blob and sealed to Bob; post-rotation Alice creates a distinct gen-2 session (unique `(room_id, sender_device_id, generation)` admits both rows; duplicate same-gen rejected); kicked Bob's gen-1 snapshot cannot derive gen-2 keys; historical gen-1 still decryptable from its snapshot. |
+| T84 | test-msk-rotation-orchestrator.ts | `rotateAllRoomsIAdmin` scope: Alice admins R1+R2, joined R3 via Bob — MSK rotation cascade bumps R1/R2 only, leaves R3 at its original gen. Defence-in-depth: creator-only `kick_and_rotate` RPC rejects Alice on R3. `identity_epoch` bumped and dev1 revocation persisted. |
+| T85 | test-msk-rotation-revocation-bundle.ts | DevicePicker-unchecked atomic commit: rotating MSK with `devicesToRevoke=[dev1]` writes dev0's new-SSK-signed issuance cert AND dev1's new-SSK-signed revocation row in one batch; the revocation verifies under the new chain but not the old (confirms it's not stranded under a replaced SSK); `filterActiveDevices` keeps only dev0. `verifyPublicDevice(dev1)` rejects via CERT_INVALID or DEVICE_REVOKED — revoked devices' issuance certs are intentionally not reissued, so the cert check fails before the verifier reaches the revocation block; the test accepts either code as a definitive rejection. |
+
 ---
 
 ## Notes
