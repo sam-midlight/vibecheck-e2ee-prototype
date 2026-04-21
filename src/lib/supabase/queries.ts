@@ -758,18 +758,6 @@ export async function deleteRoom(roomId: string): Promise<void> {
   if (error) throw error;
 }
 
-export async function bumpRoomGeneration(
-  roomId: string,
-  newGeneration: number,
-): Promise<void> {
-  const supabase = getSupabase();
-  const { error } = await supabase
-    .from('rooms')
-    .update({ current_generation: newGeneration })
-    .eq('id', roomId);
-  if (error) throw error;
-}
-
 /**
  * Atomic kick + rotate. Calls the `kick_and_rotate` SECURITY DEFINER RPC,
  * which:
