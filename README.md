@@ -2,6 +2,8 @@
 
 A standalone real-time rooms/messaging + video-calling app built on a **zero-knowledge, per-device E2EE foundation**. Next.js 16 + Supabase + `libsodium-wrappers-sumo` + LiveKit. The crypto core (`src/lib/e2ee-core/`), LiveKit adapter (`src/lib/livekit/`), bootstrap glue (`src/lib/bootstrap.ts`), and migrations are designed to be **lifted wholesale into any downstream E2EE app** — Matrix-aligned cross-signing and per-sender Megolm ratchet on a Supabase backend, ready to reuse.
 
+The reference UX layered on top is now a **fully-fleshed-out couples / shared-space app**: per-room features for Dates, Date Night, Safe Space, Love Tank, Gratitude, Wishlist, Mind Reader, Time Capsules, Memory Bank/Jar, Bribes, Roulette, Sunday rituals, and homework-style nudges — every event still flows through the same encrypted-blob primitive, so the foundation is exercised end-to-end. Treat the feature components as a worked example: rewrite the look-and-feel for your app, but read them first to see what calling into `e2ee-core` looks like in practice.
+
 - **Agent onboarding (read first if you're an AI):** `AGENTS.md`
 - **e2ee-core API reference:** `src/lib/e2ee-core/README.md`
 
@@ -138,10 +140,15 @@ src/
 │                                         Modal, IncomingCallToast, KeyChange-
 │                                         Banner, PendingApprovalBanner, …)
 │                                         + reference feature UX (Dates,
-│                                         DateVault, SafeSpace, LoveTank,
-│                                         Gratitude, Wishlist, MindReader,
-│                                         TimeCapsules, MemoryBank, Memory-
-│                                         Jar, Roulette, FeatureLauncher, …)
+│                                         DateVault, SafeSpace, SafeSpace-
+│                                         Lantern, LoveTank, Gratitude,
+│                                         Wishlist, MindReader, TimeCapsules,
+│                                         MemoryBank, MemoryJar, Roulette,
+│                                         BribeForm, MemberVibePopover,
+│                                         OrbActionMenu, FeatureLauncher,
+│                                         FeatureSheet, HomeworkBanner,
+│                                         ConfettiBurst, DateGeneratorWidget,
+│                                         DateNightPortal, …)
 ├── lib/
 │   ├── e2ee-core/                        ★ Pure crypto — copy verbatim
 │   │   ├── device.ts                     MSK + DeviceKeyBundle + certs
@@ -203,6 +210,26 @@ npm run dev                   # http://localhost:3000
 7. Settings → "Your safety number" matches between the two browsers.
 8. Settings → verify contact via SAS emoji flow.
 9. Kick a member → `rooms.current_generation` bumps.
+10. Open any feature surface (Dates, Safe Space, Love Tank, Wishlist, …) → write something → confirm in the Supabase Table Editor that the corresponding `blobs` row is opaque ciphertext, not readable JSON.
+
+## Testing
+
+Three layers, each documented under `docs/`:
+
+- **`docs/test-catalog.md`** — one-sentence-per-test reference for every script in `scripts/test-*.ts`, organized by the invariant defended. **79 tests** covering crypto primitives, RLS, Megolm ratchet behaviour, room-key rotation, identity/cross-signing, PIN-lock, video-call key wrap, and the per-feature attribution canaries from the Phase 4 ports.
+- **`docs/integration-tests.md`** — the same suite organized as a 7-stage progression from happy-path through adversarial cases up to feature-layer event invariants.
+- **`docs/mutation-testing-plan.md`** — **16 mutations** that deliberately weaken security-critical code. The runner (`scripts/run-mutations.ts`) applies each, confirms the kill-list tests fail, restores, and confirms they pass again. A test that doesn't catch the mutation it's supposed to catch is a coverage gap.
+
+```bash
+# Run a single test
+npx tsx --env-file=.env.local scripts/test-happy-path.ts
+
+# Run all mutations end-to-end (~15 min)
+npx tsx --env-file=.env.local scripts/run-mutations.ts
+
+# Run a single mutation by id
+npx tsx --env-file=.env.local scripts/run-mutations.ts --only M16
+```
 
 ## Deploying to Vercel (test/preview only today)
 
