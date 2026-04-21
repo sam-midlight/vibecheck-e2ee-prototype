@@ -29,6 +29,7 @@ import {
   encryptBlob,
   observeContact,
   unwrapRoomKey,
+  type PublicDevice,
   type RoomKey,
 } from '@/lib/e2ee-core';
 import { loadEnrolledDevice, type EnrolledDevice } from '@/lib/bootstrap';
@@ -153,6 +154,24 @@ export function RoomProvider({
   const [error, setError] = useState<string | null>(null);
   const roomKeyRef = useRef<RoomKey | null>(null);
 
+  // Cache fetchPublicDevices results per-sender for the RoomProvider's
+  // lifetime. Without this, every decoded blob hits
+  // /devices?user_id=eq.X separately — a room with 200 messages from 1
+  // partner fires 200 identical fetches during cold load. Stored as
+  // Promise<> so concurrent decoders in the same mergeBlobs burst share
+  // one in-flight fetch instead of racing.
+  //
+  // Safety: device_ed25519_pub / device_x25519_pub are INSERT-only per
+  // device_id (see queries.ts#enrollDevice); the public keys never change
+  // for a given deviceId. Revocation doesn't alter the pub either — it
+  // only adds a revocation signature row. So serving from cache is never
+  // wrong for signature verification. Invalidation is needed only for
+  // *new* devices enrolled mid-session, handled by the miss-and-refetch
+  // below.
+  const deviceKeyCacheRef = useRef<Map<string, Promise<PublicDevice[]>>>(
+    new Map(),
+  );
+
   const load = useCallback(
     async (
       uid: string,
@@ -221,7 +240,9 @@ export function RoomProvider({
       opts: { replace?: boolean } = {},
     ) => {
       const decoded = await Promise.all(
-        rows.map((row) => decodeBlobToEvent(row, rk, device, uid)),
+        rows.map((row) =>
+          decodeBlobToEvent(row, rk, device, uid, deviceKeyCacheRef.current),
+        ),
       );
       const nextEvents: RoomEventRecord[] = [];
       const nextFailures: RoomBlobFailure[] = [];
@@ -299,7 +320,13 @@ export function RoomProvider({
       if (!rk) return;
       if (row.sender_id !== myUserId) {
         try {
-          const decoded = await decodeBlobToEvent(row, rk, myDevice, myUserId);
+          const decoded = await decodeBlobToEvent(
+            row,
+            rk,
+            myDevice,
+            myUserId,
+            deviceKeyCacheRef.current,
+          );
           if (decoded.kind === 'event') {
             const partnerName = fmtDisplayName(
               decoded.record.senderId,
@@ -699,6 +726,7 @@ async function decodeBlobToEvent(
   rk: RoomKey,
   viewerDevice: EnrolledDevice,
   viewerUserId: string,
+  deviceKeyCache: Map<string, Promise<PublicDevice[]>>,
 ): Promise<DecodeResult> {
   try {
     const blob = await decodeBlobRow(row);
@@ -713,13 +741,32 @@ async function decodeBlobToEvent(
         },
       };
     }
-    // Per-device sender resolver: fetches the sender's device list once
-    // per sender, caches by (userId, deviceId).
+    // Per-device sender resolver. Uses the RoomProvider-scoped
+    // deviceKeyCache so a cold load of N blobs from K distinct senders
+    // fires K fetches, not N. Storing Promises (not arrays) means an
+    // initial mergeBlobs burst shares one in-flight fetch per sender.
+    // On a miss (deviceId not in the cached list), we invalidate and
+    // refetch once — covers the "partner enrolled a new device during
+    // this session" case.
     const senderUserId = row.sender_id;
     let viewerSenderEd: Uint8Array | undefined;
     if (senderUserId === viewerUserId) {
       viewerSenderEd = viewerDevice.deviceBundle.ed25519PublicKey;
     }
+    const loadUserDevices = (userId: string): Promise<PublicDevice[]> => {
+      const cached = deviceKeyCache.get(userId);
+      if (cached) return cached;
+      const pending = fetchPublicDevices(userId);
+      deviceKeyCache.set(userId, pending);
+      // Drop the entry if the fetch rejects so the next call retries
+      // instead of re-awaiting a poisoned promise.
+      pending.catch(() => {
+        if (deviceKeyCache.get(userId) === pending) {
+          deviceKeyCache.delete(userId);
+        }
+      });
+      return pending;
+    };
     const resolveSenderDeviceEd25519Pub = async (
       userId: string,
       deviceId: string,
@@ -728,8 +775,15 @@ async function decodeBlobToEvent(
         return viewerDevice.deviceBundle.ed25519PublicKey;
       }
       try {
-        const devices = await fetchPublicDevices(userId);
-        const match = devices.find((d) => d.deviceId === deviceId);
+        let devices = await loadUserDevices(userId);
+        let match = devices.find((d) => d.deviceId === deviceId);
+        if (!match) {
+          // Miss — cached list may predate a newly-enrolled device.
+          // Invalidate and refetch once.
+          deviceKeyCache.delete(userId);
+          devices = await loadUserDevices(userId);
+          match = devices.find((d) => d.deviceId === deviceId);
+        }
         return match?.ed25519PublicKey ?? null;
       } catch {
         return null;
