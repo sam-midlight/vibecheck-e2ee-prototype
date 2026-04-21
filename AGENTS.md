@@ -48,10 +48,6 @@ Each user has **five distinct key types**. Mixing them up is the most common way
 - **`devices_read_all` must stay public.** Peers need to read each other's device_pubs to wrap room keys. Write policies stay owner-only.
 - **`megolm_session_shares` inserts are signer-locked.** Migration `0048` replaces the historical `WITH CHECK (true)` with two valid branches: (A) signer is the session's authoritative sender device, or (B) signer is a co-device of the recipient (forward path). Branch A relies on `UNIQUE(session_id)` on `megolm_sessions` (also added in 0048) — without that, an attacker could pre-insert a parallel session row to satisfy A for any session_id. Receive sites (`bootstrap.ts` responder fallback, `CallChatPanel.tsx` resolveMegolm + initial hydration) **must** call `verifySessionShare`, then cross-check `snapshot.senderDeviceId === megolm_sessions.sender_device_id` (and `toBase64(snapshot.sessionId) === expected sessionId`) before `putInboundSession`. Plain unseal-and-trust is the bug class 0048 closes — do not regress it.
 
-### Temporary dev shortcut (remove before real deploy)
-
-- `src/app/api/dev/magic-link/route.ts` is **unguarded**: any caller can mint a sign-in link for any email. Intentional for friends-testing. Before any real-audience deploy: delete the route + revert `MagicLinkForm.tsx` to call `supabase.auth.signInWithOtp`.
-
 ## 4. The foundation vs. reference-UX split
 
 **Foundation (copy verbatim into any consuming app):**

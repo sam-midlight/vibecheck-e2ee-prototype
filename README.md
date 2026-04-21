@@ -115,7 +115,6 @@ src/
 │   ├── page.tsx                          Landing + magic-link form
 │   ├── auth/callback/page.tsx            Identity bootstrap, approval,
 │   │                                     recovery, unlock, enforce-PIN gate
-│   ├── api/dev/magic-link/route.ts       ⚠ TEMP dev shortcut
 │   ├── onboarding/page.tsx               First-time name capture +
 │   │                                     create-room / accept-invite step
 │   ├── rooms/page.tsx                    Rooms list + create + invite
@@ -192,7 +191,7 @@ npm run dev                   # http://localhost:3000
 ### Supabase setup (one-time)
 
 1. Create a project at [supabase.com](https://supabase.com).
-2. Settings → API → copy URL + anon key to `.env.local`. For the dev magic-link shortcut, also copy `service_role` to `SUPABASE_SERVICE_ROLE_KEY` — server-only env var, never bundle to browser.
+2. Settings → API → copy URL + anon key to `.env.local`.
 3. Auth → Providers → enable Email.
 4. Auth → URL Configuration → add `http://localhost:3000/auth/callback` to redirect allow-list.
 5. SQL Editor → apply each file in `supabase/migrations/` in order. (Or use `supabase db push`.)
@@ -236,8 +235,6 @@ npx tsx --env-file=.env.local scripts/run-mutations.ts --only M16
 1. Push to GitHub.
 2. Import on Vercel; set env vars.
 3. Deploy. Add the `*.vercel.app/auth/callback` URL to Supabase redirect allow-list.
-
-**⚠ `src/app/api/dev/magic-link/route.ts` is an unguarded server endpoint** that generates magic links for any email via service-role key. Intentional for today's friends-testing. **Before any real-audience deploy**: delete that file and revert `src/components/MagicLinkForm.tsx` to `supabase.auth.signInWithOtp`.
 
 ## Known limitations
 
