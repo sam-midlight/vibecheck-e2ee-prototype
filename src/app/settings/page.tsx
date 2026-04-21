@@ -543,8 +543,7 @@ function SettingsInner() {
       )}
 
       <p className="pt-2 text-center font-mono text-[10px] text-neutral-500 dark:text-neutral-500">
-        {process.env.NEXT_PUBLIC_BUILD_TIME} (UTC+10) [build{' '}
-        {process.env.NEXT_PUBLIC_BUILD_NUMBER}]
+        {process.env.NEXT_PUBLIC_BUILD_TIME} (UTC+10)  {process.env.NEXT_PUBLIC_GIT_SHA}
       </p>
 
       {/* Modals -------------------------------------------------------- */}
