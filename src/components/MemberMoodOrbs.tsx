@@ -27,13 +27,14 @@ import {
 import { FeatureSheet } from './FeatureSheet';
 import { LoveTank } from './LoveTank';
 import { OrbActionMenu } from './OrbActionMenu';
-import { useRoom } from './RoomProvider';
+import { useRoomCore, useRoomPresence } from './RoomProvider';
 
 const ORB_PX = 40;
 
 export function MemberMoodOrbs() {
   const moods = useMemberMoods();
-  const { myUserId, onlineUserIds } = useRoom();
+  const { myUserId } = useRoomCore();
+  const { onlineUserIds } = useRoomPresence();
   const [activeUid, setActiveUid] = useState<string | null>(null);
   // Self-tap shortcut: tapping your own breathing mood orb opens Love Tank.
   // Tapping a partner orb pops their action planets immediately — Sam

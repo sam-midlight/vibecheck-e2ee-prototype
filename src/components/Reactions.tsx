@@ -15,12 +15,13 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { useRoom } from './RoomProvider';
+import { useRoomCore, useRoomEvents } from './RoomProvider';
 
 const QUICK_REACTIONS: string[] = ['❤️', '👍', '🫂', '👀', '😂', '😮'];
 
 export function ReactionBar({ targetId }: { targetId: string }) {
-  const { reactionsByTarget, myUserId, appendEvent } = useRoom();
+  const { reactionsByTarget } = useRoomEvents();
+  const { myUserId, appendEvent } = useRoomCore();
   const summaries = reactionsByTarget[targetId] ?? [];
   const [pickerOpen, setPickerOpen] = useState(false);
   const [busy, setBusy] = useState(false);

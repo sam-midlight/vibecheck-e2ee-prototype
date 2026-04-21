@@ -18,13 +18,14 @@ import { FeatureSheet } from './FeatureSheet';
 import { Label } from './design/Label';
 import { LoveTank } from './LoveTank';
 import { useDesignMode } from './design/useDesignMode';
-import { useRoom } from './RoomProvider';
+import { useRoomCore, useRoomEvents } from './RoomProvider';
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 export function LoveTankWidget() {
   const { t } = useDesignMode();
-  const { events, myUserId } = useRoom();
+  const { events } = useRoomEvents();
+  const { myUserId } = useRoomCore();
   const [open, setOpen] = useState(false);
 
   // Project the event stream into:

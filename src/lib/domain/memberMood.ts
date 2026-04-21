@@ -19,7 +19,7 @@
  */
 
 import { useMemo } from 'react';
-import { useRoom } from '@/components/RoomProvider';
+import { useRoomCore, useRoomEvents } from '@/components/RoomProvider';
 import { displayName as fmtDisplayName } from './displayName';
 import { uniqueMembers } from './members';
 
@@ -110,7 +110,8 @@ export function tierLabel(tier: MoodTier): string {
 }
 
 export function useMemberMoods(): MemberMood[] {
-  const { events, members, room, myUserId, displayNames, memberEmojis } = useRoom();
+  const { events } = useRoomEvents();
+  const { members, room, myUserId, displayNames, memberEmojis } = useRoomCore();
 
   return useMemo<MemberMood[]>(() => {
     if (!room) return [];

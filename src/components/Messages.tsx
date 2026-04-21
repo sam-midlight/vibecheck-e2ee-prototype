@@ -6,7 +6,8 @@ import { displayName } from '@/lib/domain/displayName';
 import { describeError } from '@/lib/domain/errors';
 import { ReactionBar } from './Reactions';
 import {
-  useRoom,
+  useRoomCore,
+  useRoomEvents,
   type RoomEventRecord,
   type RoomBlobFailure,
 } from './RoomProvider';
@@ -23,7 +24,8 @@ import {
 import type { RoomEvent } from '@/lib/domain/events';
 
 export function Messages() {
-  const { events, failures, myUserId, displayNames, memberEmojis } = useRoom();
+  const { events, failures } = useRoomEvents();
+  const { myUserId, displayNames, memberEmojis } = useRoomCore();
 
   const { messages, deletedIds } = useMemo(() => {
     const deletes = new Map<string, string>();
@@ -135,7 +137,7 @@ function MessageRow({
    *  on the sender's side) and whether we show a timestamp below. */
   isLastInGroup: boolean;
 }) {
-  const { appendEvent } = useRoom();
+  const { appendEvent } = useRoomCore();
   const [deleting, setDeleting] = useState(false);
 
   if (rec.event.type !== 'message') return null;
@@ -310,7 +312,7 @@ function ImageAttachment({
 }: {
   header: NonNullable<Extract<RoomEvent, { type: 'message' }>['attachment']>;
 }) {
-  const { room, roomKey } = useRoom();
+  const { room, roomKey } = useRoomCore();
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -394,7 +396,7 @@ function FailureRow({
 }
 
 function Composer() {
-  const { room, roomKey, appendEvent } = useRoom();
+  const { room, roomKey, appendEvent } = useRoomCore();
   const [text, setText] = useState('');
   const [pickedFile, setPickedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
