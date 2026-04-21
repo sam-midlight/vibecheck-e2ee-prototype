@@ -82,7 +82,11 @@ export interface RoomBlobFailure {
   error: string;
 }
 
-interface RoomContextValue {
+/**
+ * Core room identity + glue. Changes rarely (on load, on MSK rotation,
+ * on realtime connection state transitions). Safe for every consumer.
+ */
+export interface RoomCoreValue {
   loading: boolean;
   error: string | null;
   room: RoomRow | null;
@@ -90,18 +94,10 @@ interface RoomContextValue {
   members: RoomMemberRow[];
   myUserId: string | null;
   myDevice: EnrolledDevice | null;
-  events: RoomEventRecord[];
-  failures: RoomBlobFailure[];
   /** Latest display name each sender has set for themselves (blank = cleared). */
   displayNames: Record<string, string>;
   /** Latest emoji avatar each sender has chosen for this room. */
   memberEmojis: Record<string, string>;
-  /**
-   * Active reactions grouped by target record id. Each entry is
-   * `{ emoji, userIds }` with userIds in stable sender order. Empty array
-   * (or missing key) means no active reactions for that target.
-   */
-  reactionsByTarget: Record<string, ReactionSummary[]>;
   /**
    * Supabase realtime channel status for the room's blob subscription.
    * 'SUBSCRIBED' when the live feed is connected; 'CLOSED' / 'TIMED_OUT'
@@ -110,6 +106,32 @@ interface RoomContextValue {
    * arrived yet" apart from "my connection dropped".
    */
   realtimeStatus: string;
+  appendEvent: (event: RoomEvent) => Promise<void>;
+  reload: () => Promise<void>;
+}
+
+/**
+ * Decrypted event stream. Changes on every insert/realtime delta — the
+ * hot path. Consumers that don't reduce events should avoid this context
+ * to skip unnecessary re-renders.
+ */
+export interface RoomEventsValue {
+  events: RoomEventRecord[];
+  failures: RoomBlobFailure[];
+  /**
+   * Active reactions grouped by target record id. Each entry is
+   * `{ emoji, userIds }` with userIds in stable sender order. Empty array
+   * (or missing key) means no active reactions for that target.
+   */
+  reactionsByTarget: Record<string, ReactionSummary[]>;
+}
+
+/**
+ * Presence: which users are currently viewing this room. Changes on a
+ * separate cadence from events (on channel join/leave), so isolating it
+ * keeps presence-only indicators out of the hot-path render graph.
+ */
+export interface RoomPresenceValue {
   /**
    * User ids currently connected to this room's presence channel — i.e.,
    * actively looking at the room right now. Powers the "in the room" green
@@ -117,21 +139,54 @@ interface RoomContextValue {
    * server only sees "user X present in room Y at time Z" — no content.
    */
   onlineUserIds: Set<string>;
-  appendEvent: (event: RoomEvent) => Promise<void>;
-  reload: () => Promise<void>;
 }
+
+/** Back-compat union: everything `useRoom()` used to return. */
+export interface RoomContextValue
+  extends RoomCoreValue,
+    RoomEventsValue,
+    RoomPresenceValue {}
 
 export interface ReactionSummary {
   emoji: string;
   userIds: string[];
 }
 
-const RoomContext = createContext<RoomContextValue | null>(null);
+const RoomCoreContext = createContext<RoomCoreValue | null>(null);
+const RoomEventsContext = createContext<RoomEventsValue | null>(null);
+const RoomPresenceContext = createContext<RoomPresenceValue | null>(null);
 
-export function useRoom(): RoomContextValue {
-  const ctx = useContext(RoomContext);
-  if (!ctx) throw new Error('useRoom must be called inside <RoomProvider>');
+export function useRoomCore(): RoomCoreValue {
+  const ctx = useContext(RoomCoreContext);
+  if (!ctx) throw new Error('useRoomCore must be called inside <RoomProvider>');
   return ctx;
+}
+
+export function useRoomEvents(): RoomEventsValue {
+  const ctx = useContext(RoomEventsContext);
+  if (!ctx) throw new Error('useRoomEvents must be called inside <RoomProvider>');
+  return ctx;
+}
+
+export function useRoomPresence(): RoomPresenceValue {
+  const ctx = useContext(RoomPresenceContext);
+  if (!ctx) throw new Error('useRoomPresence must be called inside <RoomProvider>');
+  return ctx;
+}
+
+/**
+ * Back-compat shim. Prefer the focused hooks (`useRoomCore`,
+ * `useRoomEvents`, `useRoomPresence`) — they avoid re-renders when
+ * unrelated slices change.
+ */
+export function useRoom(): RoomContextValue {
+  const core = useRoomCore();
+  const events = useRoomEvents();
+  const presence = useRoomPresence();
+  return useMemo(
+    () => ({ ...core, ...events, ...presence }),
+    [core, events, presence],
+  );
 }
 
 export function RoomProvider({
@@ -660,7 +715,7 @@ export function RoomProvider({
     });
   }, [loading, room, myUserId, roomKey, myDevice, events, appendEvent]);
 
-  const value = useMemo<RoomContextValue>(
+  const coreValue = useMemo<RoomCoreValue>(
     () => ({
       loading,
       error,
@@ -669,27 +724,37 @@ export function RoomProvider({
       members,
       myUserId,
       myDevice,
-      events,
-      failures,
       displayNames,
       memberEmojis,
-      reactionsByTarget,
       realtimeStatus,
-      onlineUserIds,
       appendEvent,
       reload,
     }),
-    [loading, error, room, roomKey, members, myUserId, myDevice, events, failures, displayNames, memberEmojis, reactionsByTarget, realtimeStatus, onlineUserIds, appendEvent, reload],
+    [loading, error, room, roomKey, members, myUserId, myDevice, displayNames, memberEmojis, realtimeStatus, appendEvent, reload],
+  );
+
+  const eventsValue = useMemo<RoomEventsValue>(
+    () => ({ events, failures, reactionsByTarget }),
+    [events, failures, reactionsByTarget],
+  );
+
+  const presenceValue = useMemo<RoomPresenceValue>(
+    () => ({ onlineUserIds }),
+    [onlineUserIds],
   );
 
   return (
-    <RoomContext.Provider value={value}>
-      <HeartbeatLayer>
-        {children}
-        <AffectionLayer />
-        <LiveEventNotifier />
-      </HeartbeatLayer>
-    </RoomContext.Provider>
+    <RoomCoreContext.Provider value={coreValue}>
+      <RoomEventsContext.Provider value={eventsValue}>
+        <RoomPresenceContext.Provider value={presenceValue}>
+          <HeartbeatLayer>
+            {children}
+            <AffectionLayer />
+            <LiveEventNotifier />
+          </HeartbeatLayer>
+        </RoomPresenceContext.Provider>
+      </RoomEventsContext.Provider>
+    </RoomCoreContext.Provider>
   );
 }
 
@@ -707,7 +772,8 @@ export function useRoomProjection<T>(
   initial: T,
   deps: ReadonlyArray<unknown>,
 ): T {
-  const { events } = useRoom();
+  // Subscribe to events only — presence changes shouldn't refold.
+  const { events } = useRoomEvents();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   return useMemo(() => events.reduce(reducer, initial), [events, ...deps]);
 }
