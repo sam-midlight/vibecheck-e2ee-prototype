@@ -2,7 +2,7 @@
 
 A one-sentence-per-test reference to every script in `scripts/test-*.ts`, organized by the invariant each test defends. Use this as the "what is this test asserting?" lookup when triaging a failure or reasoning about coverage.
 
-**71 tests total.** All run against a live Supabase project:
+**79 tests total.** All run against a live Supabase project:
 
 ```
 npx tsx --env-file=.env.local scripts/<test-file>.ts
@@ -166,6 +166,21 @@ Tests that assert over the source text itself — used when the regression would
 | File | Asserts |
 |---|---|
 | test-appshell-pin-gate.ts | `AppShell.tsx` calls `hasWrappedIdentity` in the auth-success branch and redirects to `/auth/callback` when missing — enforcing the "PIN-lock is mandatory, not opt-in" invariant that a URL-bar bypass of the callback page would otherwise break. |
+
+## 12. Feature-layer event invariants (Phase 4 ports)
+
+Tests scoped to a specific feature event type rather than the underlying primitive. Two flavors: per-feature **author-attribution** canaries (forged sender rejected at SIGNATURE_INVALID; honest event verifies) and **UX-only-gate documentation** (assert the data layer leaks "secret" UX fields, since enforcement lives in the renderer — flips to a real check if the feature is ever cryptographically hardened).
+
+| File | Asserts |
+|---|---|
+| test-time-capsule-unlock-gate.ts | Documents that `time_capsule_post.unlockAt` is UI-only: a member decrypts a future-locked capsule and reads its message immediately. PASSES today; flip if you ever bind unlockAt into AEAD AD + withhold a per-capsule key. |
+| test-safespace-otp-gate.ts | Documents that `icebreaker_post.otp` is UI-only: a member decrypts the post and reads the 4-digit OTP straight from the payload, no `icebreaker_unlock` event needed. PASSES today; flip if Safe Space ever derives a per-entry key from the OTP. |
+| test-datevault-membership-gate.ts | Real RLS invariant: non-member of the room cannot read `date_post` blobs. Bonus: a member can decrypt every date_post regardless of `dateId` — per-date sub-scoping is a renderer filter, not a crypto isolation. |
+| test-lovetank-author-attribution.ts | Forged `love_tank_set` (Bob signs, claims sender=Alice) → SIGNATURE_INVALID via the production-style resolver. Honest event from Bob decrypts with attribution to Bob. |
+| test-gratitude-author-attribution.ts | Same forgery rejection for `gratitude_send` — confirms the `to:` recipient field round-trips and the sender claim cannot be impersonated to fabricate "Alice thanked you" notes or skew heart-balance bookkeeping. |
+| test-mindreader-author-attribution.ts | Same forgery rejection for `mind_reader_post` — Bob cannot publish a game claiming Alice authored it (which would let him "solve" it himself for credit). |
+| test-bribe-author-attribution.ts | Same forgery rejection for `bribe` — Bob cannot spend hearts "as Alice" to drain her balance or force-reveal a mind_reader game while attributing the solve elsewhere. |
+| test-wishlist-author-attribution.ts | Same forgery rejection for `wishlist_add` — Bob cannot inject items into Alice's wishlist or claim/delete entries on her behalf. |
 
 ---
 

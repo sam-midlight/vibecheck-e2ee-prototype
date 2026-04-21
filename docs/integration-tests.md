@@ -128,6 +128,21 @@ Tests that fill gaps left by Stages 1–4: cryptographic paths exercised only th
 | T70 | test-pre-megolm-transition.ts | Mixed v3 (flat-key) + v4 (Megolm) blobs in the same room both decrypt via the router-style `decryptBlob`. Negative cases: gen-2 flat key rejects gen-1 v3 blob; a confused Megolm resolver returning S1's key for S2's sessionId fails AEAD. Enforces CLAUDE.md's "pre-Megolm rooms transition lazily on next generation bump." |
 | T71 | test-megolm-counter-monotonic.ts | Migration 0042 BEFORE-UPDATE trigger on `megolm_sessions`: a sender UPDATEing `message_count = 0` while keeping the same `session_id` is rejected with `check_violation` — closes the direct-UPDATE bypass of the 0029 200-cap. Legitimate rotation (new `session_id` + `message_count = 0`) still succeeds, and 0029's AFTER-INSERT increment still fires on blob insert. |
 
+## Stage 7 — Feature-Layer Event Invariants (T72–T79)
+
+Tests that scope to a specific Phase-4-ported feature event. They split into two flavors: **author-attribution canaries** (forged sender rejected at the SIGNATURE_INVALID layer; honest event verifies — paired against the same primitive T56 tests, but per feature so a future schema regression surfaces under the relevant feature name) and **UX-only-gate documentation** (assert the data layer leaks the "secret" UX field, since enforcement lives in the renderer; if you ever harden the feature cryptographically, the test must be flipped).
+
+| # | File | What it covers |
+|---|------|----------------|
+| T72 | test-time-capsule-unlock-gate.ts | UX-only gate: `time_capsule_post.unlockAt` is plaintext inside the encrypted payload — Bob decrypts a future-locked capsule and reads its message immediately. PASSES today (intentional per `events.ts` Time Capsules section); flip if unlockAt ever becomes AAD-bound + the per-capsule key is withheld until the unlock time. |
+| T73 | test-safespace-otp-gate.ts | UX-only gate: `icebreaker_post.otp` is plaintext inside the encrypted payload — Bob reads the 4-digit OTP with no `icebreaker_unlock` event present. PASSES today (intentional per `events.ts` Safe Space section); flip if Safe Space is ever hardened to derive a per-entry key from the OTP. |
+| T74 | test-datevault-membership-gate.ts | Real RLS invariant: a non-room-member (Eve) cannot SELECT `date_post` blobs or `room_members` rows in a room she's not in. Bonus assertion documents the UX-only sub-scoping: a room member decrypts every `date_post` regardless of `dateId` — per-date isolation is a renderer filter, not a crypto primitive. |
+| T75 | test-lovetank-author-attribution.ts | Forged `love_tank_set` (Bob signs but stamps envelope with senderUserId=Alice) → the production-style resolver looks up Alice's published devices, doesn't find Bob's deviceId, returns null, and `decryptBlob` throws SIGNATURE_INVALID. Honest Bob event still decrypts with attribution to Bob. |
+| T76 | test-gratitude-author-attribution.ts | Same forgery rejection for `gratitude_send` — confirms the `to:` recipient field round-trips and the sender claim cannot be impersonated to fabricate "Alice thanked you" notes or game the heart-balance ledger. |
+| T77 | test-mindreader-author-attribution.ts | Same forgery rejection for `mind_reader_post` — Bob cannot publish a game claiming Alice authored it (which would let him "solve" it himself for credit on the leaderboard). |
+| T78 | test-bribe-author-attribution.ts | Same forgery rejection for `bribe` — Bob cannot spend hearts "as Alice" to drain her balance or to force-reveal a `mind_reader` thought while attributing the solve to someone else. |
+| T79 | test-wishlist-author-attribution.ts | Same forgery rejection for `wishlist_add` — Bob cannot inject items into Alice's wishlist (and by extension cannot forge `wishlist_claim` / `wishlist_delete` events on her items, since they share the same envelope-attribution mechanism). |
+
 ---
 
 ## Notes
