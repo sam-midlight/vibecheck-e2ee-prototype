@@ -49,6 +49,7 @@ import {
   sealSessionSnapshot,
   signSessionShare,
   unsealSessionSnapshot,
+  verifySessionShare,
   getOutboundSession,
   putOutboundSession,
   shouldRotateSession,
@@ -1371,6 +1372,12 @@ export async function respondToKeyForwardRequests(
   }
   if (requests.length === 0) return { fulfilled: 0 };
 
+  // Fetch our own device IDs once. Used to authorize the signer of any
+  // server-fetched share before we trust + forward its contents (Branch B
+  // of migration 0048's RLS policy: signer is one of my co-devices).
+  const myDevices = await listDevices(userId).catch(() => []);
+  const myDeviceIdSet = new Set(myDevices.map((d) => d.id));
+
   let fulfilled = 0;
   for (const req of requests) {
     // Skip our own requests — we can't forward to ourselves.
@@ -1418,16 +1425,57 @@ export async function respondToKeyForwardRequests(
               recipientDeviceId: device.deviceId,
             });
             if (share) {
-              const sealed = await fromBase64(share.sealed_snapshot);
-              snapshot = await unsealSessionSnapshot(
-                sealed,
-                device.x25519PublicKey,
-                device.x25519PrivateKey,
-              );
-              await putInboundSession(req.session_id, sessionInfo.sender_device_id, snapshot);
+              // Authorize the signer (defense in depth — RLS 0048 already
+              // enforces this at insert time, but a service-role insert or
+              // future migration could bypass it). Two valid identities:
+              //   (A) session's authoritative sender device, OR
+              //   (B) one of my own co-devices (forward path).
+              const signerOk =
+                share.signer_device_id === sessionInfo.sender_device_id ||
+                myDeviceIdSet.has(share.signer_device_id);
+              if (signerOk) {
+                const signerPubs = await fetchDeviceEd25519PubsByIds([
+                  share.signer_device_id,
+                ]);
+                const signerPub = signerPubs.get(share.signer_device_id);
+                if (signerPub) {
+                  const sealed = await fromBase64(share.sealed_snapshot);
+                  await verifySessionShare({
+                    sessionId: await fromBase64(req.session_id),
+                    recipientDeviceId: device.deviceId,
+                    sealedSnapshot: sealed,
+                    signerDeviceId: share.signer_device_id,
+                    signature: await fromBase64(share.share_signature),
+                    signerEd25519Pub: signerPub,
+                  });
+                  const candidate = await unsealSessionSnapshot(
+                    sealed,
+                    device.x25519PublicKey,
+                    device.x25519PrivateKey,
+                  );
+                  // Cross-check the snapshot's claimed identity against the
+                  // authoritative megolm_sessions row (UNIQUE(session_id) on
+                  // megolm_sessions, added in 0048, makes sender_device_id
+                  // single-valued). Catches a forwarder who substitutes their
+                  // own session's snapshot under someone else's session_id.
+                  const snapSidB64 = await toBase64(candidate.sessionId);
+                  if (
+                    snapSidB64 === req.session_id &&
+                    candidate.senderDeviceId === sessionInfo.sender_device_id
+                  ) {
+                    snapshot = candidate;
+                    await putInboundSession(
+                      req.session_id,
+                      sessionInfo.sender_device_id,
+                      snapshot,
+                    );
+                  }
+                }
+              }
             }
           } catch {
-            // share not available — skip
+            // share not available, signature invalid, signer unauthorized,
+            // or snapshot identity mismatch — skip
           }
         }
       }

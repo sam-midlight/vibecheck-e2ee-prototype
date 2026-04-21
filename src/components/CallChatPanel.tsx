@@ -23,10 +23,12 @@ import {
   putInboundSession,
   putOutboundSession,
   ratchetAndDerive,
+  toBase64,
   unsealSessionSnapshot,
   unwrapRoomKey,
   verifyMembershipWrap,
   verifyPublicDevice,
+  verifySessionShare,
   type DeviceKeyBundle,
   type RoomKey,
 } from '@/lib/e2ee-core';
@@ -34,10 +36,12 @@ import { ensureFreshSession } from '@/lib/bootstrap';
 import {
   decodeBlobRow,
   fetchDeviceEd25519PubsByIds,
+  fetchMegolmSessionInfo,
   fetchPublicDevices,
   fetchUserMasterKeyPub,
   insertBlob,
   listBlobs,
+  listDevices,
   listMegolmSharesForDevice,
   listMyRoomKeyRows,
   subscribeBlobs,
@@ -75,6 +79,14 @@ export function CallChatPanel({ roomId, userId, device }: Props) {
   const keysByGenRef = useRef<Map<number, RoomKey>>(new Map());
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const deviceEdCacheRef = useRef<Map<string, Uint8Array | null>>(new Map());
+  // sessionId(b64) -> authoritative sender_device_id from megolm_sessions.
+  // Used by share-verification paths to cross-check that an unsealed snapshot
+  // really belongs to the session it claims (catches forwarder substitution).
+  const sessionSenderRef = useRef<Map<string, string>>(new Map());
+  // My own device IDs — for authorizing share signers as Branch B
+  // (co-device forward). RLS 0048 enforces this at insert; client re-checks
+  // for defense in depth (service-role insert / future migration mistakes).
+  const myDeviceIdsRef = useRef<Set<string>>(new Set());
 
   const resolveSenderEd = useCallback(
     async (senderUserId: string, senderDeviceId: string): Promise<Uint8Array | null> => {
@@ -122,20 +134,54 @@ export function CallChatPanel({ roomId, userId, device }: Props) {
 
   const resolveMegolm = useCallback(
     async (sessionIdB64: string, messageIndex: number): Promise<Uint8Array | null> => {
+      // Resolve the session's authoritative sender_device_id. Cached via the
+      // initial-hydration pass; on miss (e.g. a session that arrived after
+      // hydration) fetch fresh and memoize.
+      let authoritativeSender = sessionSenderRef.current.get(sessionIdB64);
+      if (!authoritativeSender) {
+        const info = await fetchMegolmSessionInfo(sessionIdB64).catch(() => null);
+        if (!info) return null;
+        authoritativeSender = info.sender_device_id;
+        sessionSenderRef.current.set(sessionIdB64, authoritativeSender);
+      }
       const shares = await listMegolmSharesForDevice({
         roomId,
         recipientDeviceId: device.deviceId,
       });
       for (const share of shares) {
         if (share.session_id !== sessionIdB64) continue;
+        // Authorize signer: session sender OR one of my co-devices.
+        const signerOk =
+          share.signer_device_id === authoritativeSender ||
+          myDeviceIdsRef.current.has(share.signer_device_id);
+        if (!signerOk) continue;
         try {
+          const signerPubs = await fetchDeviceEd25519PubsByIds([share.signer_device_id]);
+          const signerPub = signerPubs.get(share.signer_device_id);
+          if (!signerPub) continue;
           const sealed = await fromBase64(share.sealed_snapshot);
+          await verifySessionShare({
+            sessionId: await fromBase64(sessionIdB64),
+            recipientDeviceId: device.deviceId,
+            sealedSnapshot: sealed,
+            signerDeviceId: share.signer_device_id,
+            signature: await fromBase64(share.share_signature),
+            signerEd25519Pub: signerPub,
+          });
           const snap = await unsealSessionSnapshot(
             sealed,
             device.x25519PublicKey,
             device.x25519PrivateKey,
           );
-          await putInboundSession(sessionIdB64, snap.senderDeviceId, snap);
+          // Cross-check the snapshot's claimed identity against the
+          // authoritative megolm_sessions row.
+          if (
+            (await toBase64(snap.sessionId)) !== sessionIdB64 ||
+            snap.senderDeviceId !== authoritativeSender
+          ) {
+            continue;
+          }
+          await putInboundSession(sessionIdB64, authoritativeSender, snap);
           if (messageIndex >= snap.startIndex) {
             const mk = await deriveMessageKeyAtIndex(snap, messageIndex);
             return mk.key;
@@ -231,19 +277,66 @@ export function CallChatPanel({ roomId, userId, device }: Props) {
         keysByGenRef.current = byGen;
         roomKeyRef.current = byGen.get(maxGen) ?? null;
 
+        // Pre-warm caches needed by share verification (resolveMegolm reuses
+        // both refs on cache miss for sessions arriving after hydration).
+        const myDevs = await listDevices(userId).catch(() => []);
+        myDeviceIdsRef.current = new Set(myDevs.map((d) => d.id));
+
         const shares = await listMegolmSharesForDevice({
           roomId,
           recipientDeviceId: device.deviceId,
         });
+        // Resolve each share's authoritative session sender up-front. Cache for
+        // resolveMegolm reuse. Sessions without a megolm_sessions row (pre-0027
+        // orphans) cannot be hydrated through this path because their RLS
+        // Branch A check fails — and Branch B forwards have a row with our
+        // co-device as sender, so they DO appear here.
+        const uniqueSessionIds = [...new Set(shares.map((s) => s.session_id))];
+        const sessionInfos = await Promise.all(
+          uniqueSessionIds.map((sid) =>
+            fetchMegolmSessionInfo(sid).catch(() => null),
+          ),
+        );
+        for (let i = 0; i < uniqueSessionIds.length; i++) {
+          const info = sessionInfos[i];
+          if (info) sessionSenderRef.current.set(uniqueSessionIds[i], info.sender_device_id);
+        }
+
+        // Resolve all unique signer pubs in one query.
+        const signerIds = [...new Set(shares.map((s) => s.signer_device_id))];
+        const sharePubs = await fetchDeviceEd25519PubsByIds(signerIds);
+
         for (const share of shares) {
+          const authoritativeSender = sessionSenderRef.current.get(share.session_id);
+          if (!authoritativeSender) continue;
+          const signerOk =
+            share.signer_device_id === authoritativeSender ||
+            myDeviceIdsRef.current.has(share.signer_device_id);
+          if (!signerOk) continue;
+          const signerPub = sharePubs.get(share.signer_device_id);
+          if (!signerPub) continue;
           try {
             const sealed = await fromBase64(share.sealed_snapshot);
+            await verifySessionShare({
+              sessionId: await fromBase64(share.session_id),
+              recipientDeviceId: device.deviceId,
+              sealedSnapshot: sealed,
+              signerDeviceId: share.signer_device_id,
+              signature: await fromBase64(share.share_signature),
+              signerEd25519Pub: signerPub,
+            });
             const snap = await unsealSessionSnapshot(
               sealed,
               device.x25519PublicKey,
               device.x25519PrivateKey,
             );
-            await putInboundSession(share.session_id, snap.senderDeviceId, snap);
+            if (
+              (await toBase64(snap.sessionId)) !== share.session_id ||
+              snap.senderDeviceId !== authoritativeSender
+            ) {
+              continue;
+            }
+            await putInboundSession(share.session_id, authoritativeSender, snap);
           } catch { /* skip */ }
         }
 
@@ -262,7 +355,7 @@ export function CallChatPanel({ roomId, userId, device }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [roomId, device, decode]);
+  }, [roomId, device, decode, userId]);
 
   useEffect(() => {
     const unsub = subscribeBlobs(roomId, (row) => {
