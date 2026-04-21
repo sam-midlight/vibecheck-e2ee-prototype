@@ -503,6 +503,63 @@ export async function verifyCrossSigningChain(params: {
 
 ---
 
+### M16 — v3 sender attribution block bypassed entirely
+
+**File:** `src/lib/e2ee-core/blob.ts`
+
+**Find:**
+```ts
+      const devicePub = await resolveSenderDeviceEd25519Pub(parsed.s, parsed.sd);
+      if (!devicePub) {
+        throw new CryptoError(
+          `sender device ${parsed.sd} not found (or not trusted)`,
+          'SIGNATURE_INVALID',
+        );
+      }
+      const innerPayloadBytes = stringToBytes(JSON.stringify(parsed.p));
+      try {
+        const sigOk = await verifyMessage(
+          await buildInnerSigMessage(
+            BLOB_DOMAIN_V3,
+            roomId,
+            blob.generation,
+            blob.nonce,
+            innerPayloadBytes,
+          ),
+          await fromBase64(parsed.sig),
+          devicePub,
+        );
+        if (!sigOk) {
+          throw new CryptoError('sender device signature invalid', 'SIGNATURE_INVALID');
+        }
+      } finally {
+        sodium.memzero(innerPayloadBytes);
+      }
+```
+
+**Replace:**
+```ts
+      /* M16: v3 sender attribution checks bypassed entirely.
+         Resolver still called for side-effect parity, but neither the
+         device-lookup nor the signature is enforced — any forged sender
+         flows through. */
+      void (await resolveSenderDeviceEd25519Pub(parsed.s, parsed.sd));
+```
+
+**Why a separate mutation from M08:** The per-feature attribution tests (`test-{lovetank,gratitude,mindreader,bribe,wishlist}-author-attribution.ts`) construct a forgery where the *claimed sender* is Alice but the *deviceId* is Bob's. The in-test resolver, mirroring the production resolver in `RoomProvider.tsx`, looks up Alice's devices and returns `null` for an unknown deviceId. Decryption fails at the *device-not-found* branch (line 437), **before** ever reaching the signature check that M08 weakens (line 456). M08 alone cannot reach this code path; the only single-step mutation that lets the forgery flow through is one that bypasses the entire attribution block.
+
+**Must kill:**
+- `test-lovetank-author-attribution.ts` — T72: forged `tank_set` (Bob signs, claims Alice) must throw SIGNATURE_INVALID; bypassed block returns it as Alice's.
+- `test-gratitude-author-attribution.ts` — T73: forged `gratitude_post`.
+- `test-mindreader-author-attribution.ts` — T74: forged `mind_reader_solve`.
+- `test-bribe-author-attribution.ts` — T75: forged `bribe`.
+- `test-wishlist-author-attribution.ts` — T76: forged `wishlist_add`.
+- `test-blob-sender-verification.ts` — T56: also killed (overlap with M08; both mutations independently catch the impostor-pub case).
+
+**Survives:** `test-happy-path.ts` (legit sender flows through anyway).
+
+---
+
 ### M15 — AppShell PIN-guard redirect target changed
 
 **File:** `src/components/AppShell.tsx`
@@ -549,8 +606,9 @@ export async function verifyCrossSigningChain(params: {
 | M13 | AppShell enforces mandatory-PIN guard (guard removed) | T67 |
 | M14 | AppShell guard runs before `setChecking(false)` (guard moved after) | T67 |
 | M15 | AppShell PIN-guard redirect target is `/auth/callback` (target changed to `/rooms`) | T67 |
+| M16 | v3 sender attribution block enforces both device-lookup AND signature | T56, T72, T73, T74, T75, T76 |
 
-**15 mutations total** — 12 cryptographic (M01–M12) plus 3 source-structural (M13–M15) covering the AppShell mandatory-PIN guard.
+**16 mutations total** — 12 cryptographic (M01–M12), 3 source-structural for the AppShell mandatory-PIN guard (M13–M15), and 1 (M16) for the v3 sender-attribution invariant exercised by the per-feature attribution canaries.
 
 ---
 
@@ -601,12 +659,22 @@ These tests verify behaviour enforced by Postgres RLS policies, triggers, and RP
 
 Positive-case tests (`test-happy-path.ts`, `test-late-joiner.ts`, etc.) confirm that legitimate flows succeed. They don't assert that something is *rejected*, so there is no security guard to remove. Their value is regression detection, not adversarial testing.
 
+### Documented "intentional gap" tests (UX-enforced, no crypto guard exists)
+
+Three of the Phase 4 feature-layer tests assert and *document* that a particular gate is UI-enforced rather than cryptographic. They PASS today precisely because no source-level guard exists to weaken — flipping them to FAIL is the codification of a future hardening, not a mutation.
+
+| Test | Documented gap |
+|------|-----------------|
+| T77 (test-time-capsule-unlock-gate.ts) | `unlockAt` lives in plaintext payload; any current member can decrypt the blob the moment it lands. No source guard to remove — making it mutation-testable would require first binding `unlockAt` into AEAD AD and gating a second key on the unlock time. |
+| T78 (test-safespace-otp-gate.ts) | The 4-digit OTP rides inside the encrypted payload; any current member can read it on decrypt without the partner re-entering it. Hardening path: derive a per-entry key from the OTP and only ship the wrap when re-entered. |
+| T79 (test-datevault-membership-gate.ts) — sub-scoping half | The vault is `date_post` events scoped by `dateId`; the per-date isolation is a renderer filter, not a separate room key. The test's *outsider-blocked* half is covered by the existing T11 RLS test (and would be killed by dropping the `blobs` SELECT policy on a Supabase branch). |
+
 ---
 
 ## Running the Mutations
 
 ```bash
-# Run all 12 code mutations
+# Run all 16 code mutations
 npx tsx --env-file=.env.local scripts/run-mutations.ts
 
 # Run a single mutation by ID

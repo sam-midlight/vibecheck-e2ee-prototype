@@ -409,6 +409,59 @@ const MUTATIONS: Mutation[] = [
     kills: ['test-appshell-pin-gate.ts'],
     survives: ['test-happy-path.ts'],
   },
+
+  // ── M16 ────────────────────────────────────────────────────────────────────
+  {
+    id: 'M16',
+    description: 'v3 sender attribution block bypassed — forged sender accepted',
+    steps: [{
+      file: 'src/lib/e2ee-core/blob.ts',
+      find:
+`      const devicePub = await resolveSenderDeviceEd25519Pub(parsed.s, parsed.sd);
+      if (!devicePub) {
+        throw new CryptoError(
+          \`sender device \${parsed.sd} not found (or not trusted)\`,
+          'SIGNATURE_INVALID',
+        );
+      }
+      const innerPayloadBytes = stringToBytes(JSON.stringify(parsed.p));
+      try {
+        const sigOk = await verifyMessage(
+          await buildInnerSigMessage(
+            BLOB_DOMAIN_V3,
+            roomId,
+            blob.generation,
+            blob.nonce,
+            innerPayloadBytes,
+          ),
+          await fromBase64(parsed.sig),
+          devicePub,
+        );
+        if (!sigOk) {
+          throw new CryptoError('sender device signature invalid', 'SIGNATURE_INVALID');
+        }
+      } finally {
+        sodium.memzero(innerPayloadBytes);
+      }`,
+      replace:
+`      /* M16: v3 sender attribution checks bypassed entirely.
+         Resolver still called for side-effect parity, but neither the
+         device-lookup nor the signature is enforced — any forged sender
+         flows through. */
+      void (await resolveSenderDeviceEd25519Pub(parsed.s, parsed.sd));`,
+    }],
+    kills: [
+      'test-lovetank-author-attribution.ts',
+      'test-gratitude-author-attribution.ts',
+      'test-mindreader-author-attribution.ts',
+      'test-bribe-author-attribution.ts',
+      'test-wishlist-author-attribution.ts',
+      // Also kills the impostor-pub case in test-blob-sender-verification.ts
+      // (overlap with M08 — both mutations independently catch this).
+      'test-blob-sender-verification.ts',
+    ],
+    survives: ['test-happy-path.ts'],
+  },
 ];
 
 // ---------------------------------------------------------------------------
