@@ -9,9 +9,19 @@
  *   - subscribe to realtime and merge new blobs into state
  *   - expose `appendEvent(event)` that encrypts + signs + inserts
  *
- * Feature components consume this via `useRoom()` and reduce the `events`
- * list into their own state with `useRoomProjection()`. No feature component
- * should touch the Supabase client directly.
+ * Consumption API — three focused contexts so unrelated slice changes
+ * don't fan out to every subscriber:
+ *   - `useRoomCore()`     — identity, members, roomKey, displayNames,
+ *                            appendEvent, reload (low-churn)
+ *   - `useRoomEvents()`   — events, failures, reactionsByTarget (hot path)
+ *   - `useRoomPresence()` — onlineUserIds (separate cadence from events)
+ *
+ * `useRoom()` is a back-compat shim returning the union of all three;
+ * prefer the focused hooks in new code. `useRoomProjection()` reduces
+ * the event stream into a feature-specific state — pass explicit deps
+ * for any closure captures so the memo stays stable.
+ *
+ * No feature component should touch the Supabase client directly.
  */
 
 import {
