@@ -542,6 +542,11 @@ function SettingsInner() {
         </p>
       )}
 
+      <p className="pt-2 text-center font-mono text-[10px] text-neutral-500 dark:text-neutral-500">
+        {process.env.NEXT_PUBLIC_BUILD_TIME} (UTC+10) [build{' '}
+        {process.env.NEXT_PUBLIC_BUILD_NUMBER}]
+      </p>
+
       {/* Modals -------------------------------------------------------- */}
       {showRecovery && umk && (
         <RecoveryPhraseModal
